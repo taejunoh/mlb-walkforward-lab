@@ -1,0 +1,71 @@
+{
+  "schema": "MLB_OPERATIONS_CHECK_V1",
+  "triggered_at_utc": "2026-09-30T18:27:22Z",
+  "checked_at_utc": "2026-09-30T18:27:22Z",
+  "official_status_observed_at_utc": "2026-09-30T18:20:50Z",
+  "local_date": "2026-09-30",
+  "timezone": "America/New_York",
+  "status": "NEW_MISSED_PREGAME_CUTOFF_WITHOUT_PREDICTION",
+  "schedule": {
+    "source_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&startDate=2026-09-29&endDate=2026-10-01&fields=totalGames,dates,date,games,gamePk,gameType,gameDate,status,abstractGameState,detailedState,codedGameState,teams,away,home,team,id,name",
+    "observed_at_utc": "2026-09-30T18:20:50Z",
+    "score_free": true,
+    "payload": {
+      "games": [
+        {"gamePk": 849841, "gameType": "F", "gameDate": "2026-09-30T18:00:00Z", "status": "In Progress", "away": "PHI", "home": "ATL"},
+        {"gamePk": 849846, "gameType": "F", "gameDate": "2026-09-30T21:00:00Z", "status": "Pre-Game", "away": "CWS", "home": "HOU"},
+        {"gamePk": 849848, "gameType": "F", "gameDate": "2026-10-01T00:00:00Z", "status": "Scheduled", "away": "BOS", "home": "NYY"},
+        {"gamePk": 849842, "gameType": "F", "gameDate": "2026-10-01T02:00:00Z", "status": "Scheduled", "away": "CHC", "home": "SD"}
+      ]
+    }
+  },
+  "observations": {
+    "official_game_count": 4,
+    "current_status_counts": {"in_progress": 1, "pre_game": 1, "scheduled": 2},
+    "scheduled_cutoffs_elapsed_without_prediction": 1,
+    "new_missed_game_pks": [849841],
+    "remaining_future_cutoffs": 3,
+    "actual_first_pitch_verified": false,
+    "actual_first_pitch_time_utc": null,
+    "new_coverage_reviews": 1,
+    "coverage_review_paths": [
+      "reports/daily_review/2026-09-30/no_pregame_prediction_review.json",
+      "reports/daily_review/2026-09-30/no_pregame_prediction_review.md"
+    ],
+    "matching_model_process_count": 0,
+    "research_report_namespace": "ABSENT",
+    "research_flow_namespace": "ABSENT",
+    "poststart_report_namespace": "ABSENT",
+    "regular_flow_receipt_counts_unchanged": {"2026-09-16": 4, "2026-09-23": 16, "2026-09-24": 4}
+  },
+  "actions": {
+    "model_runs": 0,
+    "poststart_runs": 0,
+    "new_model_reports": 0,
+    "new_primary_claims": 0,
+    "new_settlements": 0,
+    "new_validation_samples": 0,
+    "source_code_modified": false,
+    "source_guards_changed": false,
+    "known_source_failures_retried": false,
+    "scores_or_winners_requested": false
+  },
+  "blockers_preserved": [
+    {"code": "RESEARCH_SCHEDULE_DUPLICATE_COVERAGE_GAME_PK", "evidence": "reports/daily_review/2026-09-30/postseason-live-activation-attempt-20260930T1521Z.json"},
+    {"code": "POSTSTART_HISTORY_SOURCE_BINDING_CARDINALITY_MISMATCH", "evidence": "reports/daily_review/2026-09-30/reconstruction-preparation/input-contract-blocker.json"}
+  ],
+  "notification": {
+    "decision": "NOTIFY",
+    "reason": "A new scheduled cutoff elapsed with no saved pregame prediction for PHI@ATL (849841); this is a material coverage change. The observed schedule status is In Progress, but no actual first-pitch timestamp is known.",
+    "warning_kind": "MISSED_PREGAME_CUTOFF",
+    "warning_game_pk": 849841
+  },
+  "comparison": {
+    "previous_record": "reports/daily_review/2026-09-30/operations-check-20260930T175003Z.json",
+    "state_change": {"game_pk": 849841, "previous": "Warmup", "current": "In Progress"},
+    "game_849846_current": "Pre-Game",
+    "artifact_inventory": "Research report/audit namespaces remain absent; only this coverage review was added."
+  },
+  "coverage_review": "reports/daily_review/2026-09-30/no_pregame_prediction_review.json",
+  "next_check": "Continue monitoring the remaining three scheduled cutoffs; do not repeat an unchanged source failure or backfill a missed pregame claim."
+}

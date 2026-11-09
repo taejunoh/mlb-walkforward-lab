@@ -4,8 +4,10 @@
 
 Allow the frozen internal moneyline model to evaluate upcoming postseason games
 for research and to accumulate genuine pregame predictions for later validation.
-The user approved ML first, with totals deferred. This written design awaits
-review; no implementation or activation is claimed by this document.
+The user approved ML first, with totals deferred, and on 2026-09-30 explicitly
+approved implementing and testing this existing design without intermediate
+approval pauses. That approval does not claim implementation completion or
+authorize automatic adoption by the recurring heartbeat.
 
 An available probability is not a validated postseason probability. Every output
 must state `RESEARCH_ONLY`, `POSTSEASON_OUT_OF_DOMAIN`, and
@@ -208,7 +210,8 @@ Work only under `/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venu
 Preserve all pre-existing dirty, staged and untracked files. No Documents access,
 sudo, push, merge, PR, privileged/custody/production operations, or access to the
 prohibited temporary manifest. No public-network run may generate a retroactive
-pregame claim. Code implementation starts only after written-spec and plan review.
+pregame claim. The existing design is approved; the orchestrator reviews the
+implementation plan and proceeds without another intermediate user approval.
 
 ## Acceptance criteria
 

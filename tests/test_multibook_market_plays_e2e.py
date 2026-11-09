@@ -50,10 +50,24 @@ class MultibookMarketPlaysCliTests(unittest.TestCase):
         self.assertEqual(stdout, expected.as_posix() + "\n")
         self.assertEqual(stderr, "")
 
-    def test_board_cli_requires_exactly_five_outcomes(self) -> None:
+    def test_board_cli_accepts_one_outcome_for_v2(self) -> None:
         argv = [
             "admit-board", "--root", ".", "--schedule-receipt", "input/schedule.json",
-            "--capture-outcome", "a", "b", "c", "d",
+            "--capture-outcome", "a",
+        ]
+        with patch.object(board, "normalize_market_board", return_value=object()) as normalize, patch.object(
+            board, "persist_market_board", return_value=(Path("board.json"), Path("board.sha256"))
+        ):
+            status, stdout, stderr = self._invoke(board.main, argv)
+        self.assertEqual(status, 0)
+        self.assertEqual(stdout, "board.json\n")
+        self.assertEqual(stderr, "")
+        normalize.assert_called_once()
+
+    def test_board_cli_rejects_more_than_five_outcomes(self) -> None:
+        argv = [
+            "admit-board", "--root", ".", "--schedule-receipt", "input/schedule.json",
+            "--capture-outcome", "a", "b", "c", "d", "e", "f",
         ]
         status, _, _ = self._invoke(board.main, argv)
         self.assertEqual(status, 2)

@@ -28,7 +28,7 @@ from .multibook_market_board import MarketBoardAuthority, MarketBoardGame
 
 
 MAX_QUOTE_AGE_NS = 300 * 1_000_000_000
-MIN_BOOK_COVERAGE = 3
+MIN_BOOK_COVERAGE = 1
 MIN_COMPLETENESS = Fraction("0.50")
 MIN_PRICE_MARGIN = Fraction("0.05")
 _BOOK_ORDER = MappingProxyType({book: index for index, book in enumerate(EXPECTED_BOOKS)})
@@ -202,7 +202,7 @@ def evaluate_moneylines(
         fresh, had_stale = _fresh_quotes(board_game, game.predicted_side, evaluated_at_ns)
         coverage = len({quote.book_id for quote in fresh})
         # Stale evidence is diagnostic only when removing it leaves the
-        # market below the three-book gate; three fresh books remain playable.
+        # market below the minimum coverage gate; fresh quotes at the gate remain playable.
         if had_stale and coverage < MIN_BOOK_COVERAGE:
             reasons.add("STALE_PRICE")
         if coverage == 0:

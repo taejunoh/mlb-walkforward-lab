@@ -1,0 +1,14 @@
+{
+  "query": {
+    "as_of_date": "2026-08-30",
+    "attempt_outcome": "STATCAST_ROW_CAP_SPLIT_REQUIRED",
+    "attempt_payload_sha256": "503c90db6c95de3e70e7f1072aa9cc5f4f44ab04ab2c103dfc42bc729e85b8c5",
+    "schedule_coverage_sha256": "43a52b8d3847b69135d60f8edd6918c555babab9ca7d20ee73654def7ac60dea",
+    "url": "https://baseballsavant.mlb.com/statcast_search/csv?all=true&type=details&player_type=batter&game_date_gt=2026-05-09&game_date_lt=2026-05-16&hfGT=R%7C&group_by=name-year&sort_col=pitches&player_event_sort=api_p_release_speed&sort_order=desc&min_pitches=0"
+  },
+  "retrieved_at_utc": "2026-08-31T16:17:51.522642+00:00",
+  "row_count": 25001,
+  "schema_version": 1,
+  "sha256": "503c90db6c95de3e70e7f1072aa9cc5f4f44ab04ab2c103dfc42bc729e85b8c5",
+  "source": "baseball_savant_statcast_attempt"
+}

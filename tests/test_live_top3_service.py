@@ -323,6 +323,7 @@ def _slate(
     *,
     participants: dict[int, PregameParticipants] | None = None,
     participant_durable: str = "2025-05-01T12:00:01Z",
+    initial_exclusion_reasons: Mapping[int, tuple[str, ...]] | None = None,
 ) -> LiveSlateObservation:
     pks = tuple(sorted(int(game["game_pk"]) for game in games))
     observed = participants or {game_pk: _participants(game_pk) for game_pk in pks}
@@ -336,7 +337,13 @@ def _slate(
         )
         for game_pk in sorted(observed)
     )
-    return LiveSlateObservation(TARGET, games, observed, tuple(bindings))
+    return LiveSlateObservation(
+        TARGET,
+        games,
+        observed,
+        tuple(bindings),
+        initial_exclusion_reasons or {},
+    )
 
 
 def _final(game: dict[str, object], index: int = 0, **changes: object):
@@ -444,6 +451,7 @@ def _build(
     scorer=None,
     card=None,
     history=None,
+    trace_sink=None,
 ):
     career, career_bindings = _career_inputs()
     with mock.patch.object(
@@ -462,10 +470,74 @@ def _build(
             career_bf_bindings=career_bindings,
             command_inputs=_command_inputs(),
             execution_times=_times(),
+            trace_sink=trace_sink,
         )
 
 
 class LiveTop3ServiceTests(unittest.TestCase):
+    def test_initial_exclusion_skips_final_observer_and_feature_trace(self):
+        games = (
+            _game(1, status="Warmup"),
+            _game(2, status="Warmup", start="2025-05-01T20:00:00Z"),
+        )
+        slate = _slate(
+            games,
+            participants={2: _participants(2)},
+            initial_exclusion_reasons={
+                1: ("OBSERVATION_AT_OR_AFTER_START",),
+            },
+        )
+        calls: list[tuple[int, str]] = []
+
+        def observe(game_pk, target_date):
+            calls.append((game_pk, target_date))
+            if game_pk == 1:
+                raise AssertionError("initially excluded game must not be observed")
+            return _final(games[1], game_pk)
+
+        trace_sink: list[dict[str, object]] = []
+        result = _build(
+            slate,
+            observe,
+            feature_builder=mock.Mock(side_effect=_raw),
+            trace_sink=trace_sink,
+        )
+
+        self.assertEqual(calls, [(2, TARGET)])
+        self.assertEqual(
+            result["excluded_games"][0]["reason_codes"],
+            ["OBSERVATION_AT_OR_AFTER_START"],
+        )
+        self.assertEqual(
+            [row["game_pk"] for row in result["preliminary_top3"]], [2]
+        )
+        self.assertNotIn(1, [row["game_pk"] for row in trace_sink])
+
+    def test_warmup_final_schedule_remains_excluded_when_any_relevant_receipt_is_at_start(self):
+        games = (
+            _game(1, status="Warmup"),
+            _game(2, status="Warmup", start="2025-05-01T19:00:00Z"),
+        )
+        slate = _slate(
+            games,
+            participant_durable="2025-05-01T19:00:00Z",
+        )
+        feature = mock.Mock(side_effect=_raw)
+
+        result = _build(slate, _final_observer(games), feature_builder=feature)
+
+        self.assertEqual(feature.call_count, 0)
+        self.assertEqual(result["preliminary_top3"], [])
+        self.assertEqual(
+            [row["game_pk"] for row in result["excluded_games"]], [1, 2]
+        )
+        self.assertTrue(
+            all(
+                "OBSERVATION_AT_OR_AFTER_START" in row["reason_codes"]
+                for row in result["excluded_games"]
+            )
+        )
+
     def test_missing_participant_pitchers_are_unscored_with_missing_evidence(self):
         game = _game(1)
         participant = _participants(

@@ -60,6 +60,7 @@ def _parser() -> argparse.ArgumentParser:
         "--model-card", type=Path, default=Path("audit/v5_1_bt/model_card.json")
     )
     parser.add_argument("--json-only", action="store_true")
+    parser.add_argument("--competition-scope", choices=("regular-season", "postseason-research-v1"), default="regular-season")
     return parser
 
 
@@ -161,8 +162,13 @@ def run_daily_top3(
     *,
     fetcher=fetch_live_http,
     utc_clock=utc_now,
+    competition_scope: str = "regular-season",
 ) -> tuple[dict[str, object], Path, Path]:
     """Capture, score, and validate one fresh research-only live slate."""
+    if competition_scope == "postseason-research-v1":
+        return _run_postseason_research(root, target_date, model_card_path, fetcher=fetcher, utc_clock=utc_clock)
+    if competition_scope != "regular-season":
+        raise IntegrityError("competition scope differs")
     target_date = validate_target_date(target_date)
     root_path, _, card_relative = _root_and_card_path(root, model_card_path)
     execution_times = ExecutionTimes.capture(utc_clock)
@@ -265,6 +271,77 @@ def run_daily_top3(
             )
         trusted.assert_bound()
         return validated, json_path, markdown_path
+
+
+def _run_postseason_research(root, target_date, model_card_path, *, fetcher, utc_clock):
+    from .competition_policy import POSTSEASON_ML_RESEARCH_V1
+    from .postseason_research_service import build_postseason_research_run
+    from .postseason_research_contracts import build_postseason_trace, load_postseason_research
+    target_date = validate_target_date(target_date)
+    root_path, _, card_relative = _root_and_card_path(root, model_card_path)
+    times = ExecutionTimes.capture(utc_clock)
+    policy = POSTSEASON_ML_RESEARCH_V1
+    with open_trusted_root(root_path) as trusted:
+        card = _bound_call(trusted, _load_bound_model_card, trusted, card_relative)
+        history = _bound_call(trusted, build_live_history, root_path, target_date, card,
+                              fetcher=fetcher, expected_root_binding=trusted.binding, competition_policy=policy)
+        slate = _bound_call(trusted, observe_live_slate, root_path, target_date,
+                            fetcher=fetcher, expected_root_binding=trusted.binding, competition_policy=policy)
+        saved = MappingProxyType({int(game["game_pk"]): game for game in slate.games})
+        if len(saved) != len(slate.games):
+            raise IntegrityError("research slate identity differs")
+        career, career_bindings = _bound_call(trusted, load_live_career_bf, root_path, target_date,
+            _observed_pitcher_ids(slate), fetcher=fetcher, expected_root_binding=trusted.binding, competition_policy=policy)
+        def observe_final(pk, requested_date):
+            if requested_date != target_date or pk not in saved:
+                raise IntegrityError("research final request differs")
+            return _bound_call(trusted, observe_final_game_schedule, root_path, requested_date, saved[pk],
+                fetcher=fetcher, expected_root_binding=trusted.binding, competition_policy=policy)
+        trace_rows = []
+        payload = _bound_call(trusted, build_postseason_research_run, slate=slate, history=history, card=card,
+            final_schedule_observer=observe_final, career_bf_by_pitcher=career, career_bf_bindings=career_bindings,
+            command_inputs={"date": target_date, "model_card": card_relative, "competition_scope": "postseason-research-v1"},
+            execution_times=times, trace_sink=trace_rows)
+        stamp = payload["executed_at_utc"].replace("-", "").replace(":", "").replace(".", "")
+        base = Path("reports/postseason_ml_research") / target_date / f"{stamp}-{payload['content_sha256'][:16]}.json"
+        trace = build_postseason_trace(primary_report_relative=base.as_posix(), report=payload, games=trace_rows)
+        artifacts = ((base, canonical_json_bytes(payload)),
+                     (base.with_suffix(".md"), render_postseason_research_markdown(payload)),
+                     (base.with_suffix(".trace.json"), canonical_json_bytes(trace)))
+        import hashlib
+        snapshots = []
+        for relative, contents in artifacts:
+            for output, raw in ((relative, contents), (relative.with_suffix(relative.suffix + ".sha256"), f"{hashlib.sha256(contents).hexdigest()}\n".encode())):
+                current = read_regular_snapshot(trusted, output, "postseason research artifact", missing_ok=True)
+                if current is None:
+                    current = write_exclusive(trusted, output, raw, "postseason research artifact")
+                elif current.contents != raw:
+                    raise FileExistsError("postseason research artifact identity conflicts")
+                snapshots.append(current)
+        for snapshot in snapshots:
+            rebind_regular_snapshot(trusted, snapshot, "postseason research artifact")
+        _bound_call(trusted, load_postseason_research, root_path, base.with_suffix(".trace.json"))
+        return payload, root_path / base, root_path / base.with_suffix(".md")
+
+
+def render_postseason_research_markdown(payload):
+    from .postseason_research_contracts import validate_postseason_report
+    safe = validate_postseason_report(payload)
+    rows = []
+    for row in safe["games"]:
+        rows.append((row["game_pk"], row["game_type"], f'{row["away_team"]} at {row["home_team"]}', row["state"],
+                     "unavailable" if row["predicted_winner"] is None else row["predicted_winner"],
+                     "unavailable" if row["p_home"] is None else f'{row["p_home"]:.6f}',
+                     "unavailable" if row["pick_probability"] is None else f'{row["pick_probability"]:.1%}',
+                     row["scheduled_start_utc"], ", ".join(row["reason_codes"])))
+    sections = ["# MLB Postseason ML Research", "", "RESEARCH_ONLY · POSTSEASON_OUT_OF_DOMAIN · NOT_POSTSEASON_VALIDATED", "",
+                "PASS — POSTSEASON_NOT_VALIDATED", "", "Market: NOT_EVALUATED", "Totals: NOT_EVALUATED — POSTSEASON_TOTALS_NOT_SUPPORTED", "",
+                f'Target date: {safe["target_date"]}; D−1 cutoff: {safe["history_cutoff_date"]}',
+                "VERIFIED means input readiness only, not postseason validity.",
+                "Career BF and league ERA retain REGULAR_SEASON populations. Recent history uses same-season R/F/D/L/W through D−1; frozen windows are unchanged.", "",
+                _markdown_table(("Game", "Type", "Matchup", "State", "Model winner", "P(home)", "Pick probability", "Start UTC", "Reasons"), rows), "", "## Warnings", ""]
+    sections.extend(f"- {_escape_table(warning)}" for warning in safe["warnings"])
+    return ("\n".join(sections) + "\n").encode()
 
 
 def _escape_table(value: object) -> str:
@@ -835,11 +912,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     """CLI exit policy: integrity 2, operations 1, interrupts 130, success 0."""
     try:
         args = parse_args(argv)
-        payload, json_path, markdown_path = run_daily_top3(
-            args.root, args.date, args.model_card
-        )
+        kwargs = {} if args.competition_scope == "regular-season" else {"competition_scope": args.competition_scope}
+        payload, json_path, markdown_path = run_daily_top3(args.root, args.date, args.model_card, **kwargs)
         if args.json_only:
             sys.stdout.write(canonical_json_bytes(payload).decode("utf-8"))
+        elif args.competition_scope == "postseason-research-v1":
+            print("RESEARCH_ONLY · POSTSEASON_OUT_OF_DOMAIN · NOT_POSTSEASON_VALIDATED")
+            print("PASS — POSTSEASON_NOT_VALIDATED")
+            print(f"Full slate: {len(payload['games'])}")
+            print(f"JSON report: {json_path.absolute()}")
+            print(f"Markdown report: {markdown_path.absolute()}")
         else:
             print(f"Verified Top 3: {len(payload['verified_top3'])}")
             print(f"Preliminary Top 3: {len(payload['preliminary_top3'])}")

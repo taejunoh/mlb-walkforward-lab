@@ -2604,7 +2604,7 @@ class IntegrationAcceptanceTests(HermeticAuthorityTestCase):
         """Write a complete local authority chain without running the model."""
         trace, raw = SecurePersistenceTests._authority(root)
         raw_value = SecurePersistenceTests._raw_value(root, raw)
-        captured_at = datetime.now(timezone.utc).replace(microsecond=0)
+        captured_at = datetime(2026, 9, 1, 22, 59, tzinfo=timezone.utc)
         raw_value["captured_at_utc"] = captured_at.strftime("%Y-%m-%dT%H:%M:%SZ")
         raw = SecurePersistenceTests._write_raw(root, raw_value)
         # Keep the CLI success path independent of the wall clock while retaining
@@ -2655,7 +2655,7 @@ class IntegrationAcceptanceTests(HermeticAuthorityTestCase):
                 if path.is_file()
             }
 
-            clock = datetime.now(timezone.utc).replace(microsecond=0)
+            clock = datetime(2026, 9, 1, 22, 59, 30, tzinfo=timezone.utc)
             with patch.object(overlay_module, "utc_now", return_value=clock), patch("sys.stdout") as stdout, patch("sys.stderr") as stderr:
                 stdout.write = unittest.mock.Mock()  # type: ignore[method-assign]
                 stderr.write = unittest.mock.Mock()  # type: ignore[method-assign]
@@ -2720,6 +2720,43 @@ class IntegrationAcceptanceTests(HermeticAuthorityTestCase):
                 or path.startswith("reports/experimental_daily_totals_overlay/")
                 for path in new_files
             ))
+
+    def test_frozen_overlay_rejects_resealed_excluded_model_game_before_forecast_access(self) -> None:
+        """The frozen September 1 authority remains all-projected-only."""
+        from mlb_backtest.daily_totals_market_overlay import load_and_validate_model_authority
+
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            trace, _ = self._make_exact_authority_fixture(root)
+
+            def exclude_first_game(report: dict[str, object]) -> None:
+                original = report["games"][0]
+                assert isinstance(original, dict)
+                game = {
+                    "game_pk": original["game_pk"],
+                    "official_date": original["official_date"],
+                    "scheduled_start_utc": original["scheduled_start_utc"],
+                    "away_team_id": original["away_team_id"],
+                    "home_team_id": original["home_team_id"],
+                    "venue_id": original["venue_id"],
+                    "status": "EXCLUDED",
+                    "source_status": "In Progress",
+                    "source_observed_at_utc": "2026-09-01T23:00:00Z",
+                    "reason": "PREGAME_STATUS_NOT_ACCEPTED",
+                    "source_digest": report["live_source"]["payload_sha256"],
+                    "data_quality_flags": [
+                        "ADMITTED_SCHEDULE",
+                        "EXCLUDED",
+                        "PREGAME_STATUS_NOT_ACCEPTED",
+                    ],
+                }
+                report["games"][0] = game
+
+            SecurePersistenceTests._rewrite_model_report(
+                root, trace, exclude_first_game
+            )
+            with self.assertRaisesRegex(ValueError, "fixed model game projection differs"):
+                load_and_validate_model_authority(root, trace)
 
     def test_reverse_order_raw_capture_is_admitted_and_overlay_keeps_sealed_order(self) -> None:
         """Raw capture order is independent; comparison follows sealed report order."""
@@ -2789,9 +2826,10 @@ print("isolated import: PASS")
         with TemporaryDirectory(dir=Path.cwd()) as temporary:
             root = Path(temporary)
             trace, raw = self._make_exact_authority_fixture(root)
+            clock = datetime(2026, 9, 1, 22, 59, 30, tzinfo=timezone.utc)
             snapshot = overlay.admit_draftkings_snapshot(
                 root, trace, raw,
-                comparison_clock=lambda: datetime.now(timezone.utc),
+                comparison_clock=lambda: clock,
             )
             real_writer = overlay._existing_or_write
             calls = 0
@@ -2804,6 +2842,7 @@ print("isolated import: PASS")
                 return real_writer(*args, **kwargs)
 
             with patch.object(overlay, "_existing_or_write", side_effect=fail_after_first), \
+                    patch.object(overlay, "utc_now", return_value=clock), \
                     patch("sys.stdout") as stdout, patch("sys.stderr") as stderr:
                 stdout.write = unittest.mock.Mock()  # type: ignore[method-assign]
                 stderr.write = unittest.mock.Mock()  # type: ignore[method-assign]

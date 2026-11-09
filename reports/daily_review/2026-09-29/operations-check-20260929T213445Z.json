@@ -1,0 +1,55 @@
+{
+  "schema": "MLB_DAILY_OPERATIONS_CHECK_V1",
+  "automation_id": "mlb",
+  "triggered_at_utc": "2026-09-29T21:34:45.674Z",
+  "execution_clock_at_start_utc": "2026-09-29T21:35:16Z",
+  "local_date": "2026-09-29",
+  "timezone": "America/New_York",
+  "previous_check": "reports/daily_review/2026-09-29/operations-check-20260929T210445Z.json",
+  "schedule_observed_at_utc": "2026-09-29T21:35:45Z",
+  "schedule_source": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&startDate=2026-09-29&endDate=2026-09-30&fields=dates,date,games,gamePk,gameType,gameDate,status,abstractGameState,detailedState,codedGameState,teams,away,home,team,id,name",
+  "schedule_collection": "Read-only official StatsAPI GET succeeded through curl after web tool URL-access error; score/outcome fields were not requested.",
+  "games": [
+    {"date":"2026-09-29","game_pk":849845,"game_type":"F","away_id":143,"away":"PHI","home_id":144,"home":"ATL","start_utc":"2026-09-29T18:00:00Z","start_edt":"14:00","official_status":"Final","record_status":"NO_PREGAME_PREDICTION","reason":"FINAL_AND_UNSUPPORTED_GAME_TYPE"},
+    {"date":"2026-09-29","game_pk":849849,"game_type":"F","away_id":145,"away":"CWS","home_id":117,"home":"HOU","start_utc":"2026-09-29T21:00:00Z","start_edt":"17:00","official_status":"In Progress","record_status":"NO_PREGAME_PREDICTION","reason":"GAME_STARTED_AND_UNSUPPORTED_GAME_TYPE"},
+    {"date":"2026-09-29","game_pk":849851,"game_type":"F","away_id":111,"away":"BOS","home_id":147,"home":"NYY","start_utc":"2026-09-30T00:00:00Z","start_edt":"20:00","official_status":"Pre-Game","record_status":"BLOCKED_UNSUPPORTED_GAME_TYPE"},
+    {"date":"2026-09-29","game_pk":849843,"game_type":"F","away_id":112,"away":"CHC","home_id":135,"home":"SD","start_utc":"2026-09-30T02:00:00Z","start_edt":"22:00","official_status":"Pre-Game","record_status":"BLOCKED_UNSUPPORTED_GAME_TYPE"},
+    {"date":"2026-09-30","game_pk":849841,"game_type":"F","away_id":143,"away":"PHI","home_id":144,"home":"ATL","start_utc":"2026-09-30T18:00:00Z","start_edt":"14:00","official_status":"Scheduled","record_status":"BLOCKED_UNSUPPORTED_GAME_TYPE"},
+    {"date":"2026-09-30","game_pk":849846,"game_type":"F","away_id":145,"away":"CWS","home_id":117,"home":"HOU","start_utc":"2026-09-30T21:00:00Z","start_edt":"17:00","official_status":"Scheduled","record_status":"BLOCKED_UNSUPPORTED_GAME_TYPE"},
+    {"date":"2026-09-30","game_pk":849848,"game_type":"F","away_id":111,"away":"BOS","home_id":147,"home":"NYY","start_utc":"2026-10-01T00:00:00Z","start_edt":"20:00","official_status":"Scheduled","record_status":"BLOCKED_UNSUPPORTED_GAME_TYPE"},
+    {"date":"2026-09-30","game_pk":849842,"game_type":"F","away_id":112,"away":"CHC","home_id":135,"home":"SD","start_utc":"2026-10-01T02:00:00Z","start_edt":"22:00","official_status":"Scheduled","record_status":"BLOCKED_UNSUPPORTED_GAME_TYPE"}
+  ],
+  "observed_status_changes": [
+    {"game_pk":849849,"from":"Warmup","to":"In Progress","changes_pregame_eligibility":false},
+    {"game_pk":849843,"from":"Scheduled","to":"Pre-Game","changes_model_support":false}
+  ],
+  "execution": {
+    "matching_daily_top3_totals_flow_processes_observed": 0,
+    "sep25_through_sep30_model_totals_flow_directories": "ABSENT",
+    "new_model_runs": 0,
+    "new_primary_claims": 0,
+    "new_settlements": 0,
+    "new_missing_prediction_deadlines": 0,
+    "source_sha256_unchanged_from_previous_check": {
+      "mlb_backtest/live_sources.py": "36cec4b0039d9b175da3e3b9831fe177884c46779e3fe56ddaae7e22b63e87a1",
+      "mlb_backtest/live_features.py": "8194cd44599777baf28522c3995423c175126e81c2065504dad7544232b6bcc5",
+      "mlb_backtest/experimental_totals_sources.py": "f6fcf5c12538495db06e5549b1e9c341657ed1599b4db773d648b8f8fd6eeac9"
+    },
+    "full_history_statcast_lineup_and_market_collection": "NOT_EVALUATED_UNCHANGED_UNSUPPORTED_GAME_TYPE",
+    "sep30_d_minus_one_all_final": false
+  },
+  "preserved_settlement_receipts_sha256_verified": [
+    {"path":"audit/prospective_ml_daily_flow/2026-09-24/62aa20b134c83dd19f12413f269d3614bdab22dca311104a52a0dd7f6f748c46.json","sha256":"62aa20b134c83dd19f12413f269d3614bdab22dca311104a52a0dd7f6f748c46"},
+    {"path":"audit/prospective_ml_daily_flow/2026-09-24/919ae756f84b2da8fe52de29e5ed72aa29fef36ce9e82ebb7fe0be13e4f7bac9.json","sha256":"919ae756f84b2da8fe52de29e5ed72aa29fef36ce9e82ebb7fe0be13e4f7bac9"}
+  ],
+  "settlement_action": "No new eligible pregame receipt or newly Final stored prediction; retain the preceding full status validation and do not rerun completed postgame collectors.",
+  "known_sep23_game_824785_failure": "PRESERVED_NOT_RETRIED",
+  "postseason_implementation": "DESIGN_ONLY_NOT_ACTIVATED",
+  "notifiable_material_change": false,
+  "notification_suppressed_reason": "Known support blocker unchanged, no new failure, no new elapsed pregame deadline and no new completed processing requiring notification.",
+  "next_check": "Next nominal 30-minute heartbeat. Check source support, schedule and new receipts; do not rerun unchanged unsupported models or known failures.",
+  "source_code_modified": false,
+  "model_refit_performed": false,
+  "historical_prediction_backfill_performed": false,
+  "automation_deleted": false
+}

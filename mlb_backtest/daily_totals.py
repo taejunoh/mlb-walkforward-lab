@@ -37,6 +37,7 @@ from .secure_fs import (
     rebind_regular_snapshot,
     write_exclusive,
 )
+from .sources import OUT_OF_RANGE_UNPLAYED_STATUSES
 
 
 MODEL_SCHEMA = "PROVISIONAL_DAILY_TOTALS_MODEL_V1"
@@ -44,13 +45,7 @@ REPORT_SCHEMA = "PROVISIONAL_DAILY_TOTALS_V1"
 STATUS_LABELS = ["RESEARCH ONLY", "ONE-SEASON PROVISIONAL", "NOT BET-VALIDATED"]
 _MODEL_ROOT = Path("audit/experimental_daily_totals/model")
 _REPORT_ROOT = Path("reports/experimental_daily_totals")
-_WINDOWS = {
-    "warmup_start": "2026-03-25",
-    "warmup_end": "2026-05-31",
-    "development_start": "2026-06-01",
-    "development_end": "2026-07-31",
-    "final_start": "2026-08-01",
-    "final_end": "2026-08-31",
+_WINDOW_PARAMETERS = {
     "league_days": 30,
     "venue_days": 60,
     "team_shrinkage_games": 10,
@@ -95,6 +90,9 @@ _PROJECTED_GAME_KEYS = frozenset(
 _UNPROJECTED_GAME_KEYS = frozenset(
     {"game_pk", "official_date", "scheduled_start_utc", "away_team_id", "home_team_id", "venue_id", "status", "reason", "feature_cutoff", "source_digest", "data_quality_flags"}
 )
+_EXCLUDED_GAME_KEYS = frozenset(
+    {"game_pk", "official_date", "scheduled_start_utc", "away_team_id", "home_team_id", "venue_id", "status", "source_status", "reason", "source_observed_at_utc", "source_digest", "data_quality_flags"}
+)
 _TRACE_KEYS = frozenset({
     "schema", "content_sha256", "model_receipt_relative", "model_receipt_sha256",
     "report_relative", "report_sha256", "report_sidecar_sha256", "markdown_sha256",
@@ -121,6 +119,26 @@ class BuiltDailyTotals:
     @property
     def trace_inputs(self) -> dict[str, object]:
         return _canonical_mapping(json.loads(self.trace_inputs_bytes), "daily totals trace inputs")
+
+
+def derive_totals_windows(target: date, history_start: date) -> dict[str, object]:
+    """Derive rolling retrospective windows from an admitted season start."""
+    if not isinstance(target, date) or isinstance(target, datetime):
+        raise ValueError("target date differs")
+    if not isinstance(history_start, date) or isinstance(history_start, datetime):
+        raise ValueError("history start differs")
+    warmup_end = target - timedelta(days=93)
+    if history_start.year != target.year or history_start > warmup_end:
+        raise ValueError("history start cannot support rolling totals windows")
+    return {
+        "warmup_start": history_start.isoformat(),
+        "warmup_end": warmup_end.isoformat(),
+        "development_start": (target - timedelta(days=92)).isoformat(),
+        "development_end": (target - timedelta(days=32)).isoformat(),
+        "final_start": (target - timedelta(days=31)).isoformat(),
+        "final_end": (target - timedelta(days=1)).isoformat(),
+        **_WINDOW_PARAMETERS,
+    }
 
 
 def _sha_bytes(contents: bytes) -> str:
@@ -271,11 +289,16 @@ def validate_totals_model_receipt(value: object) -> dict[str, object]:
         raise ValueError("model receipt cutoff date differs")
     _identity(safe["history_source"], "HISTORY_SCHEDULE")
     _identity(safe["live_source"], "LIVE_SCHEDULE")
-    if safe["windows"] != _WINDOWS:
+    windows = safe["windows"]
+    if not isinstance(windows, Mapping):
+        raise ValueError("model receipt windows differ")
+    warmup_start = _date(windows.get("warmup_start"), "model receipt warmup start")
+    expected_windows = derive_totals_windows(date.fromisoformat(target), date.fromisoformat(warmup_start))
+    if windows != expected_windows:
         raise ValueError("model receipt windows differ")
     if safe["candidate_ids"] != list(CANDIDATE_IDS):
         raise ValueError("model receipt candidates differ")
-    candidate_definition = {"candidate_ids": list(CANDIDATE_IDS), "windows": _WINDOWS}
+    candidate_definition = {"candidate_ids": list(CANDIDATE_IDS), "windows": expected_windows}
     if _sha(safe["candidate_definition_sha256"], "model receipt candidate definition") != _sha_json(candidate_definition):
         raise ValueError("model receipt candidate definition differs")
     development = safe["development_metrics"]
@@ -292,27 +315,59 @@ def validate_totals_model_receipt(value: object) -> dict[str, object]:
     return safe
 
 
-def _game(value: object, target_date: str, cutoff_date: str, source_digest: str, candidate: str) -> dict[str, object]:
+def _game(
+    value: object, target_date: str, cutoff_date: str, source_digest: str,
+    candidate: str, live_source_digest: str,
+) -> dict[str, object]:
     safe = _canonical_mapping(value, "report game")
     status = safe.get("status")
-    allowed = _PROJECTED_GAME_KEYS if status == "PROJECTED" else _UNPROJECTED_GAME_KEYS if status == "UNPROJECTED" else frozenset()
+    allowed = (
+        _PROJECTED_GAME_KEYS if status == "PROJECTED"
+        else _UNPROJECTED_GAME_KEYS if status == "UNPROJECTED"
+        else _EXCLUDED_GAME_KEYS if status == "EXCLUDED"
+        else frozenset()
+    )
     if set(safe) != allowed:
         raise ValueError("report game fields differ")
     for field in ("game_pk", "away_team_id", "home_team_id", "venue_id"):
         if type(safe[field]) is not int or safe[field] <= 0:
             raise ValueError(f"report game {field} differs")
-    if safe["away_team_id"] == safe["home_team_id"] or _date(safe["official_date"], "report game date") != target_date:
+    game_date = _date(safe["official_date"], "report game date")
+    offdate_unplayed_exclusion = (
+        status == "EXCLUDED"
+        and isinstance(safe["source_status"], str)
+        and safe["source_status"] in OUT_OF_RANGE_UNPLAYED_STATUSES
+        and safe["reason"] == "PREGAME_STATUS_NOT_ACCEPTED"
+    )
+    if safe["away_team_id"] == safe["home_team_id"] or (game_date != target_date and not offdate_unplayed_exclusion):
         raise ValueError("report game identity differs")
     _utc_timestamp(safe["scheduled_start_utc"], "report game start")
-    if safe["feature_cutoff"] != cutoff_date or _sha(safe["source_digest"], "report game source digest") != source_digest:
+    if status != "EXCLUDED" and (safe["feature_cutoff"] != cutoff_date or _sha(safe["source_digest"], "report game source digest") != source_digest):
         raise ValueError("report game source binding differs")
     flags = safe["data_quality_flags"]
-    if not isinstance(flags, list) or any(flag not in {"ADMITTED_SCHEDULE", "MODEL_ELIGIBLE", "UNKNOWN_TEAM", "UNKNOWN_VENUE"} for flag in flags):
+    if not isinstance(flags, list) or any(flag not in {"ADMITTED_SCHEDULE", "MODEL_ELIGIBLE", "UNKNOWN_TEAM", "UNKNOWN_VENUE", "EXCLUDED", "PREGAME_STATUS_NOT_ACCEPTED", "OBSERVATION_AT_OR_AFTER_START"} for flag in flags):
         raise ValueError("report game data quality flags differ")
     if status == "UNPROJECTED":
         if safe["reason"] not in {"UNKNOWN_TEAM", "UNKNOWN_VENUE"}:
             raise ValueError("report game unprojected reason differs")
         if flags != ["ADMITTED_SCHEDULE", safe["reason"]]:
+            raise ValueError("report game data quality flags differ")
+        return safe
+    if status == "EXCLUDED":
+        source_status = safe["source_status"]
+        if not isinstance(source_status, str) or not source_status:
+            raise ValueError("report game excluded source status differs")
+        if _sha(safe["source_digest"], "report game source digest") != live_source_digest:
+            raise ValueError("report game excluded source binding differs")
+        observed = _utc_timestamp(safe["source_observed_at_utc"], "report game source observation")
+        observed_dt = datetime.fromisoformat(observed[:-1] + "+00:00")
+        start_dt = datetime.fromisoformat(safe["scheduled_start_utc"][:-1] + "+00:00")
+        if source_status in {"Scheduled", "Pre-Game", "Warmup"}:
+            if observed_dt < start_dt or safe["reason"] != "OBSERVATION_AT_OR_AFTER_START":
+                raise ValueError("report game excluded reason differs")
+        elif safe["reason"] != "PREGAME_STATUS_NOT_ACCEPTED":
+            raise ValueError("report game excluded reason differs")
+        if safe["data_quality_flags"] != ["ADMITTED_SCHEDULE", "EXCLUDED", safe["reason"]]:
             raise ValueError("report game data quality flags differ")
         return safe
     if flags != ["ADMITTED_SCHEDULE", "MODEL_ELIGIBLE"]:
@@ -360,7 +415,8 @@ def validate_totals_report(value: object) -> dict[str, object]:
     if not isinstance(safe["games"], list) or not safe["games"]:
         raise ValueError("totals report games differ")
     history_source = _identity(safe["history_source"], "HISTORY_SCHEDULE")
-    games = [_game(game, target, cutoff, history_source["payload_sha256"], candidate) for game in safe["games"]]
+    live_source = _identity(safe["live_source"], "LIVE_SCHEDULE")
+    games = [_game(game, target, cutoff, history_source["payload_sha256"], candidate, live_source["payload_sha256"]) for game in safe["games"]]
     keys = [(game["official_date"], game["scheduled_start_utc"], game["game_pk"]) for game in games]
     if keys != sorted(keys) or len({game["game_pk"] for game in games}) != len(games):
         raise ValueError("totals report game ordering differs")
@@ -369,11 +425,51 @@ def validate_totals_report(value: object) -> dict[str, object]:
     return safe
 
 
+def validate_totals_report_receipt_binding(receipt: object, report: object) -> None:
+    """Require projected report samples to be derived from the model receipt."""
+    receipt_safe = validate_totals_model_receipt(receipt)
+    report_safe = validate_totals_report(report)
+    development_residuals = receipt_safe["development_residuals"]
+    development_count = receipt_safe["development_residual_count"]
+    for game in report_safe["games"]:
+        if game["status"] != "PROJECTED":
+            continue
+        if game["residual_count"] != development_count:
+            raise ValueError("totals report residual authority count differs")
+        samples = game["residual_samples"]
+        if len(samples) != development_count:
+            raise ValueError("totals report residual authority samples differ")
+        expected_samples = list(_discrete_samples(development_residuals, game["expected_total"]))
+        if samples != expected_samples:
+            raise ValueError("totals report residual samples binding differs")
+
+
 def _source_identity(identity: AdmittedSourceIdentity) -> dict[str, object]:
     raw = asdict(identity)
     raw["binding_role"] = identity.binding.binding_role
     raw.pop("binding", None)
     return raw
+
+
+def _excluded_row_identity(
+    game: object, *, source_digest: str, source_observed_at_utc: str
+) -> dict[str, object]:
+    return {
+        "game_pk": game.game_pk, "official_date": game.official_date,
+        "scheduled_start_utc": game.scheduled_start_utc,
+        "away_team_id": game.away_team_id, "home_team_id": game.home_team_id,
+        "venue_id": game.venue_id, "status": "EXCLUDED",
+        "source_status": game.source_status, "reason": game.reason,
+        "source_observed_at_utc": source_observed_at_utc,
+        "source_digest": source_digest,
+        "data_quality_flags": ["ADMITTED_SCHEDULE", "EXCLUDED", game.reason],
+    }
+
+
+def _excluded_report_rows(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        raise ValueError("daily totals report games differ")
+    return [dict(row) for row in value if isinstance(row, Mapping) and row.get("status") == "EXCLUDED"]
 
 
 def _metrics_payload(metrics: EvaluationMetrics, coverage: float) -> dict[str, object]:
@@ -407,11 +503,26 @@ def build_daily_totals(root: Path, target_date: str, source_report: Path) -> Bui
         bundle = load_totals_sources_bound(trusted.path, trusted, source_relative)
         if bundle.target_date != target or bundle.cutoff_date != (date.fromisoformat(target) - timedelta(days=1)).isoformat():
             raise ValueError("admitted source dates differ")
-        if target != "2026-09-01" or bundle.cutoff_date != "2026-08-31":
-            raise ValueError("provisional totals fixed windows require 2026-09-01")
         source_sha = _sha_bytes(source_snapshot.contents)
         history = bundle.history_games
-        development = walk_forward_predictions(history, CANDIDATE_IDS, _WINDOWS["development_start"], _WINDOWS["development_end"])
+        target_day = date.fromisoformat(target)
+        target_year_history = tuple(
+            game for game in history if date.fromisoformat(game.official_date).year == target_day.year
+        )
+        if not target_year_history:
+            raise ValueError("history has no target-year final games")
+        windows = derive_totals_windows(
+            target_day,
+            min(date.fromisoformat(game.official_date) for game in target_year_history),
+        )
+        development = walk_forward_predictions(
+            history,
+            CANDIDATE_IDS,
+            str(windows["development_start"]),
+            str(windows["development_end"]),
+        )
+        if any(len(development[candidate]) < 100 for candidate in CANDIDATE_IDS):
+            raise ValueError("development evaluation requires at least 100 rows per candidate")
         selected = select_candidate(development)
         selected_development = development[selected]
         development_residuals = tuple(
@@ -425,19 +536,24 @@ def build_daily_totals(root: Path, target_date: str, source_report: Path) -> Bui
             )
             for candidate, rows in development.items()
         }
-        final_by_candidate = walk_forward_predictions(history, (selected,), _WINDOWS["final_start"], _WINDOWS["final_end"])
+        final_by_candidate = walk_forward_predictions(
+            history,
+            (selected,),
+            str(windows["final_start"]),
+            str(windows["final_end"]),
+        )
         final_rows = final_by_candidate[selected]
         if len(final_rows) < 100:
             raise ValueError("final evaluation requires at least 100 rows")
         final_metrics = _metrics_payload(evaluate_predictions(final_rows), _per_game_coverage(final_rows, development_residuals))
         history_identity = _source_identity(bundle.history_identity)
         live_identity = _source_identity(bundle.live_identity)
-        candidate_definition_sha = _sha_json({"candidate_ids": list(CANDIDATE_IDS), "windows": _WINDOWS})
+        candidate_definition_sha = _sha_json({"candidate_ids": list(CANDIDATE_IDS), "windows": windows})
         receipt: dict[str, object] = {
             "schema": MODEL_SCHEMA, "content_sha256": "", "status_labels": STATUS_LABELS,
             "source_report_relative": source_relative.as_posix(), "source_report_sha256": source_sha,
             "target_date": target, "cutoff_date": bundle.cutoff_date,
-            "history_source": history_identity, "live_source": live_identity, "windows": _WINDOWS,
+            "history_source": history_identity, "live_source": live_identity, "windows": windows,
             "candidate_ids": list(CANDIDATE_IDS), "candidate_definition_sha256": candidate_definition_sha,
             "development_metrics": development_metrics, "selected_candidate": selected,
             "final_metrics": final_metrics, "development_residuals": list(development_residuals),
@@ -458,6 +574,20 @@ def build_daily_totals(root: Path, target_date: str, source_report: Path) -> Bui
                 raise ValueError("projection result differs")
             samples = _discrete_samples(development_residuals, result.expected_total)
             game_rows.append({**base, "status": "PROJECTED", "candidate_id": selected, "away_expected_runs": result.away_expected_runs, "home_expected_runs": result.home_expected_runs, "expected_total": result.expected_total, "interval_80": list(interval_80(samples)), "residual_samples": list(samples), "residual_sha256": _sha_json(list(samples)), "residual_count": len(samples), "feature_cutoff": bundle.cutoff_date, "source_digest": bundle.history_identity.payload_sha256, "data_quality_flags": ["ADMITTED_SCHEDULE", "MODEL_ELIGIBLE"]})
+        excluded_target_games = getattr(bundle, "excluded_target_games", ())
+        if excluded_target_games:
+            live_observed = bundle.live_identity.binding.durable_at_utc
+        for game in excluded_target_games:
+            game_rows.append({
+                "game_pk": game.game_pk, "official_date": game.official_date,
+                "scheduled_start_utc": game.scheduled_start_utc,
+                "away_team_id": game.away_team_id, "home_team_id": game.home_team_id,
+                "venue_id": game.venue_id, "status": "EXCLUDED",
+                "source_status": game.source_status, "reason": game.reason,
+                "source_observed_at_utc": live_observed,
+                "source_digest": bundle.live_identity.payload_sha256,
+                "data_quality_flags": ["ADMITTED_SCHEDULE", "EXCLUDED", game.reason],
+            })
         report: dict[str, object] = {
             "schema": REPORT_SCHEMA, "content_sha256": "", "status_labels": STATUS_LABELS,
             "target_date": target, "cutoff_date": bundle.cutoff_date,
@@ -475,15 +605,17 @@ def build_daily_totals(root: Path, target_date: str, source_report: Path) -> Bui
 
 
 def render_totals_markdown(payload: object) -> str:
-    """Render a compact research-only representation from a validated report."""
+    """Render a compact rolling retrospective diagnostic from a validated report."""
     safe = validate_totals_report(payload)
-    lines = ["# Provisional Daily MLB Totals", "", "> **RESEARCH ONLY** · **ONE-SEASON PROVISIONAL** · **NOT BET-VALIDATED**", "", f"- Target date: `{safe['target_date']}`", f"- History cutoff: `{safe['cutoff_date']}`", f"- Selected candidate: `{safe['selected_candidate']}`", f"- Report content SHA-256: `{safe['content_sha256']}`", "", "| Game | Expected total | 80% interval | Status |", "| --- | ---: | --- | --- |"]
+    lines = ["# Rolling Retrospective MLB Totals Diagnostics", "", "> **RESEARCH ONLY** · **ONE-SEASON PROVISIONAL** · **NOT BET-VALIDATED**", "", f"- Target date: `{safe['target_date']}`", f"- History cutoff: `{safe['cutoff_date']}`", f"- Selected candidate: `{safe['selected_candidate']}`", f"- Report content SHA-256: `{safe['content_sha256']}`", "", "| Game | Expected total | 80% interval | Status |", "| --- | ---: | --- | --- |"]
     for game in safe["games"]:
         if game["status"] == "PROJECTED":
             lines.append(f"| {game['game_pk']} | {game['expected_total']:.3f} | {game['interval_80'][0]}–{game['interval_80'][1]} | PROJECTED |")
-        else:
+        elif game["status"] == "UNPROJECTED":
             lines.append(f"| {game['game_pk']} | — | — | UNPROJECTED ({game['reason']}) |")
-    lines.extend(["", "This report contains model research only and no market comparison or wagering recommendation.", ""])
+        else:
+            lines.append(f"| {game['game_pk']} | — | — | EXCLUDED ({game['reason']}; source_status={game['source_status']}) |")
+    lines.extend(["", "This rolling retrospective diagnostic contains model research only and no market comparison or wagering recommendation.", ""])
     return "\n".join(lines)
 
 
@@ -528,6 +660,7 @@ def persist_daily_totals(root: Path, built: BuiltDailyTotals) -> tuple[Path, Pat
         raise ValueError("built daily totals differs")
     receipt = validate_totals_model_receipt(built.model_receipt)
     report = validate_totals_report(built.report)
+    validate_totals_report_receipt_binding(receipt, report)
     receipt_contents = canonical_json_bytes(receipt)
     receipt_relative = _MODEL_ROOT / f"{receipt['content_sha256']}.json"
     if report["model_receipt_relative"] != receipt_relative.as_posix() or report["model_receipt_sha256"] != _sha_bytes(receipt_contents):
@@ -569,6 +702,27 @@ def persist_daily_totals(root: Path, built: BuiltDailyTotals) -> tuple[Path, Pat
             or _source_identity(admitted.live_identity) != report["live_source"]
         ):
             raise ValueError("daily totals admitted source identity differs")
+        admitted_excluded = tuple(getattr(admitted, "excluded_target_games", ()))
+        report_excluded = _excluded_report_rows(report["games"])
+        if admitted_excluded:
+            binding = getattr(admitted.live_identity, "binding", None)
+            observed = getattr(binding, "durable_at_utc", None)
+            if not isinstance(observed, str):
+                raise ValueError("daily totals excluded source observation differs")
+            expected_excluded = [
+                _excluded_row_identity(
+                    game,
+                    source_digest=admitted.live_identity.payload_sha256,
+                    source_observed_at_utc=observed,
+                )
+                for game in admitted_excluded
+            ]
+        else:
+            expected_excluded = []
+        def sort_key(row: Mapping[str, object]) -> tuple[object, object, object]:
+            return row["official_date"], row["scheduled_start_utc"], row["game_pk"]
+        if sorted(report_excluded, key=sort_key) != sorted(expected_excluded, key=sort_key):
+            raise ValueError("daily totals excluded target identity differs")
         rebind_regular_snapshot(trusted, source_snapshot, "daily totals source report")
         receipt_sidecar = _existing_or_write(trusted, receipt_relative.with_suffix(".sha256"), _sidecar(receipt_contents), "daily totals model receipt sidecar")
         receipt_snapshot = _existing_or_write(trusted, receipt_relative, receipt_contents, "daily totals model receipt")

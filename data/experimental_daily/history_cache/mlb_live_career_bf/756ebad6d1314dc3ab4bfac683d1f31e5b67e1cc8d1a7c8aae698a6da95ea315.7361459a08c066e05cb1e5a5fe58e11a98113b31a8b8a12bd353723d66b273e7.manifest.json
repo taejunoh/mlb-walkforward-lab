@@ -1,0 +1,12 @@
+{
+  "query": {
+    "as_of_date": "2026-09-09",
+    "pitcher_id": 594798,
+    "url": "https://statsapi.mlb.com/api/v1/people/594798/stats?stats=byDateRange&group=pitching&gameType=R&sportIds=1&startDate=1876-01-01&endDate=2026-09-09"
+  },
+  "retrieved_at_utc": "2026-09-10T19:33:17.391554+00:00",
+  "row_count": 1,
+  "schema_version": 1,
+  "sha256": "756ebad6d1314dc3ab4bfac683d1f31e5b67e1cc8d1a7c8aae698a6da95ea315",
+  "source": "mlb_live_career_bf"
+}

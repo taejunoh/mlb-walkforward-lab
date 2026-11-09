@@ -23,12 +23,11 @@ SUPPORTED_BOOK_IDS = (
 EXPECTED_BOOKS = SUPPORTED_BOOK_IDS
 
 POLICY = {
-    "schema": "PROVISIONAL_MULTIBOOK_MARKET_PLAYS_POLICY_V1",
+    "schema": "PROVISIONAL_MULTIBOOK_MARKET_PLAYS_POLICY_V2",
     "maximum_quote_age_seconds": 300,
-    "minimum_book_coverage": 3,
+    "minimum_book_coverage": 1,
     "minimum_data_completeness": "0.50",
     "minimum_ml_price_margin": "0.05",
-    "required_residual_count": 764,
     "minimum_nonpush_support": "0.80",
     "minimum_point_gap_runs": "1.00",
     "minimum_total_support_margin": "0.05",

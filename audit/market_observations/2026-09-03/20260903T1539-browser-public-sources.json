@@ -1,0 +1,6 @@
+{
+  "observed_at_utc":"2026-09-03T15:39:35.427Z",
+  "schedule_source":"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-03",
+  "fanduel":{"url":"https://sportsbook.fanduel.com/navigation/mlb","captured_at_utc":"2026-09-03T15:39:26.823Z","status":"AVAILABLE","event_count":9,"raw_capture":"data/experimental_multibook_market/raw/e9968e92711b2d332bd8ab53e6b8510f5b5087f2eb51fb5dc2b52a69d01b5eb4.json","sf_pit_start_et":"12:35 PM","first_three":"SFG@PIT ML +140/-166 O9 -110/U9 -110; TOR@CLE -108/-108 O7.5 -122/U7.5 +100; CWS@HOU +138/-164 O8.5 -108/U8.5 -112"},
+  "draftkings":{"url":"https://sportsbook.draftkings.com/leagues/baseball/mlb","captured_at_utc":"2026-09-03T15:39:35.427Z","status":"AVAILABLE","event_count":9,"raw_capture":"data/experimental_multibook_market/raw/59ef014a76d91411f50e4ad2b62756f4acb1c92cfe46bffd86bab38fe8a67d19.json","sf_pit_start_et":"12:45 PM","sf_pit_conflict":"UNRESOLVED: MLB official/FD 12:35 PM vs DK 12:45 PM; source time preserved","first_three":"SFG@PIT ML +141/-171 O9 -107/U9 -112; TOR@CLE -109/-110 O7.5 -119/U7.5 -101; CWS@HOU +129/-156 O8.5 -108/U8.5 -112"}
+}

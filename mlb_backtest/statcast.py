@@ -46,7 +46,7 @@ def is_statcast_row_capped_manifest(manifest: Mapping[str, object]) -> bool:
     )
 
 
-def statcast_url(start: str, end: str) -> str:
+def statcast_url(start: str, end: str, *, game_types: tuple[str, ...] = ('R',)) -> str:
     """Build the official detail CSV query for an inclusive regular-season range."""
     first, last = _iso(start, "start"), _iso(end, "end")
     if first > last:
@@ -58,7 +58,7 @@ def statcast_url(start: str, end: str) -> str:
             "player_type": "batter",
             "game_date_gt": first.isoformat(),
             "game_date_lt": last.isoformat(),
-            "hfGT": "R|",
+            "hfGT": '|'.join(game_types) + '|',
             "group_by": "name-year",
             "sort_col": "pitches",
             "player_event_sort": "api_p_release_speed",

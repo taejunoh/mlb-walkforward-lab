@@ -8,7 +8,10 @@ from unittest import mock
 
 import mlb_backtest.live_features as live_features
 from mlb_backtest.feature_engine import FeatureHistory, build_raw_game_features
-from mlb_backtest.live_features import build_live_raw_game_features
+from mlb_backtest.live_features import (
+    build_live_raw_game_features,
+    build_reconstructed_raw_game_features,
+)
 from mlb_backtest.live_sources import PregameParticipants
 from mlb_backtest.live_top3_contracts import (
     FinalGameObservation,
@@ -336,6 +339,36 @@ def _participants(**changes: object) -> PregameParticipants:
 
 
 class LiveFeatureTests(unittest.TestCase):
+    def test_reconstructed_features_keep_d1_boundary(self):
+        """Changing reconstruction provenance must not relax the D-1 boundary."""
+        bundle = _bundle()
+        prepared = live_features.prepare_live_feature_history(
+            bundle, target_game_pks=(GAME_PK,)
+        )
+        game = _projected_game()
+
+        raw = build_reconstructed_raw_game_features(
+            _participants(), game, bundle, {501: 1_234, 601: 2_345},
+            prepared_history=prepared,
+        )
+
+        self.assertEqual(
+            raw["lineup_provenance"],
+            "RECONSTRUCTED_FINAL_LINEUP",
+        )
+        self.assertEqual(
+            raw["starter_provenance"],
+            "RECONSTRUCTED_FINAL_STARTER",
+        )
+        with self.assertRaisesRegex(ValueError, "TARGET_DATE_MISMATCH"):
+            build_reconstructed_raw_game_features(
+                _participants(),
+                {**game, "official_date": "2025-05-02"},
+                bundle,
+                {501: 1_234, 601: 2_345},
+                prepared_history=prepared,
+            )
+
     def test_prepared_authority_matches_legacy_builder_output(self):
         bundle = _bundle()
         prepared = live_features.prepare_live_feature_history(

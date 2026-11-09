@@ -1083,6 +1083,9 @@ def _schedule_component(
     elif game.get("doubleheader_marker") in {"GAME1", "GAME2"}:
         doubleheader = True
         doubleheader_supported = True
+    elif game.get("doubleheader_marker") == "NO":
+        doubleheader = False
+        doubleheader_supported = True
     else:
         doubleheader = False
         doubleheader_supported = False

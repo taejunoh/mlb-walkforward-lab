@@ -1,0 +1,34 @@
+{
+  "query": {
+    "as_of_date": "2026-08-30",
+    "coverage_game_pks": [
+      822688,
+      822766,
+      822933,
+      823010,
+      823502,
+      823580,
+      823662,
+      823740,
+      823987,
+      824232,
+      824393,
+      824636,
+      824876,
+      824959
+    ],
+    "coverage_sha256": "c85b09df3d48af089ba6eb0ba0b10110e7289847fbb0f50c1be8925f1c1d3bee",
+    "end": "2026-08-30",
+    "gameType": "R",
+    "revision_sha256": "ca7e4cba4ddbd996cd7bb6e14d26f96c15e17f6869ee5878d70bc16add3dec85",
+    "role": "history",
+    "schedule_coverage_sha256": "43a52b8d3847b69135d60f8edd6918c555babab9ca7d20ee73654def7ac60dea",
+    "start": "2026-01-01",
+    "url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&gameType=R&startDate=2026-01-01&endDate=2026-08-30&hydrate=probablePitcher%2Clineups%2Cvenue%2Clinescore"
+  },
+  "retrieved_at_utc": "2026-08-31T16:51:10.443198+00:00",
+  "row_count": 1,
+  "schema_version": 1,
+  "sha256": "ca7e4cba4ddbd996cd7bb6e14d26f96c15e17f6869ee5878d70bc16add3dec85",
+  "source": "mlb_schedule"
+}

@@ -1,0 +1,1258 @@
+{
+  "schema": "MLB_OPERATIONS_CHECK_V1",
+  "triggered_at_utc": "2026-09-30T19:20:03.632Z",
+  "checked_at_utc": "2026-09-30T19:21:56Z",
+  "local_date": "2026-09-30",
+  "timezone": "America/New_York",
+  "status": "SOURCE_BLOCKERS_UNCHANGED_LINEUP_OBSERVATION_PENDING",
+  "schedule": {
+    "source_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&startDate=2026-09-29&endDate=2026-10-01&fields=totalGames,dates,date,games,gamePk,gameType,gameDate,status,abstractGameState,detailedState,codedGameState,teams,away,home,team,id,name",
+    "response_observed_by_utc": "2026-09-30T19:20:33Z",
+    "score_free": true,
+    "payload": {
+      "totalGames": 12,
+      "dates": [
+        {
+          "date": "2026-09-29",
+          "totalGames": 4,
+          "games": [
+            {
+              "gamePk": 849845,
+              "gameType": "F",
+              "gameDate": "2026-09-29T18:00:00Z",
+              "status": {
+                "abstractGameState": "Final",
+                "codedGameState": "F",
+                "detailedState": "Final"
+              },
+              "teams": {
+                "away": {
+                  "team": {
+                    "id": 143,
+                    "name": "Philadelphia Phillies"
+                  }
+                },
+                "home": {
+                  "team": {
+                    "id": 144,
+                    "name": "Atlanta Braves"
+                  }
+                }
+              }
+            },
+            {
+              "gamePk": 849849,
+              "gameType": "F",
+              "gameDate": "2026-09-29T21:00:00Z",
+              "status": {
+                "abstractGameState": "Final",
+                "codedGameState": "F",
+                "detailedState": "Final"
+              },
+              "teams": {
+                "away": {
+                  "team": {
+                    "id": 145,
+                    "name": "Chicago White Sox"
+                  }
+                },
+                "home": {
+                  "team": {
+                    "id": 117,
+                    "name": "Houston Astros"
+                  }
+                }
+              }
+            },
+            {
+              "gamePk": 849851,
+              "gameType": "F",
+              "gameDate": "2026-09-30T00:00:00Z",
+              "status": {
+                "abstractGameState": "Final",
+                "codedGameState": "F",
+                "detailedState": "Final"
+              },
+              "teams": {
+                "away": {
+                  "team": {
+                    "id": 111,
+                    "name": "Boston Red Sox"
+                  }
+                },
+                "home": {
+                  "team": {
+                    "id": 147,
+                    "name": "New York Yankees"
+                  }
+                }
+              }
+            },
+            {
+              "gamePk": 849843,
+              "gameType": "F",
+              "gameDate": "2026-09-30T02:00:00Z",
+              "status": {
+                "abstractGameState": "Final",
+                "codedGameState": "F",
+                "detailedState": "Final"
+              },
+              "teams": {
+                "away": {
+                  "team": {
+                    "id": 112,
+                    "name": "Chicago Cubs"
+                  }
+                },
+                "home": {
+                  "team": {
+                    "id": 135,
+                    "name": "San Diego Padres"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        {
+          "date": "2026-09-30",
+          "totalGames": 4,
+          "games": [
+            {
+              "gamePk": 849841,
+              "gameType": "F",
+              "gameDate": "2026-09-30T18:00:00Z",
+              "status": {
+                "abstractGameState": "Live",
+                "codedGameState": "I",
+                "detailedState": "In Progress"
+              },
+              "teams": {
+                "away": {
+                  "team": {
+                    "id": 143,
+                    "name": "Philadelphia Phillies"
+                  }
+                },
+                "home": {
+                  "team": {
+                    "id": 144,
+                    "name": "Atlanta Braves"
+                  }
+                }
+              }
+            },
+            {
+              "gamePk": 849846,
+              "gameType": "F",
+              "gameDate": "2026-09-30T21:00:00Z",
+              "status": {
+                "abstractGameState": "Preview",
+                "codedGameState": "P",
+                "detailedState": "Pre-Game"
+              },
+              "teams": {
+                "away": {
+                  "team": {
+                    "id": 145,
+                    "name": "Chicago White Sox"
+                  }
+                },
+                "home": {
+                  "team": {
+                    "id": 117,
+                    "name": "Houston Astros"
+                  }
+                }
+              }
+            },
+            {
+              "gamePk": 849848,
+              "gameType": "F",
+              "gameDate": "2026-10-01T00:00:00Z",
+              "status": {
+                "abstractGameState": "Preview",
+                "codedGameState": "S",
+                "detailedState": "Scheduled"
+              },
+              "teams": {
+                "away": {
+                  "team": {
+                    "id": 111,
+                    "name": "Boston Red Sox"
+                  }
+                },
+                "home": {
+                  "team": {
+                    "id": 147,
+                    "name": "New York Yankees"
+                  }
+                }
+              }
+            },
+            {
+              "gamePk": 849842,
+              "gameType": "F",
+              "gameDate": "2026-10-01T02:00:00Z",
+              "status": {
+                "abstractGameState": "Preview",
+                "codedGameState": "S",
+                "detailedState": "Scheduled"
+              },
+              "teams": {
+                "away": {
+                  "team": {
+                    "id": 112,
+                    "name": "Chicago Cubs"
+                  }
+                },
+                "home": {
+                  "team": {
+                    "id": 135,
+                    "name": "San Diego Padres"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        {
+          "date": "2026-10-01",
+          "totalGames": 4,
+          "games": [
+            {
+              "gamePk": 849844,
+              "gameType": "F",
+              "gameDate": "2026-10-01T18:00:00Z",
+              "status": {
+                "abstractGameState": "Preview",
+                "codedGameState": "S",
+                "detailedState": "Scheduled"
+              },
+              "teams": {
+                "away": {
+                  "team": {
+                    "id": 143,
+                    "name": "Philadelphia Phillies"
+                  }
+                },
+                "home": {
+                  "team": {
+                    "id": 144,
+                    "name": "Atlanta Braves"
+                  }
+                }
+              }
+            },
+            {
+              "gamePk": 849850,
+              "gameType": "F",
+              "gameDate": "2026-10-01T21:00:00Z",
+              "status": {
+                "abstractGameState": "Preview",
+                "codedGameState": "S",
+                "detailedState": "Scheduled"
+              },
+              "teams": {
+                "away": {
+                  "team": {
+                    "id": 145,
+                    "name": "Chicago White Sox"
+                  }
+                },
+                "home": {
+                  "team": {
+                    "id": 117,
+                    "name": "Houston Astros"
+                  }
+                }
+              }
+            },
+            {
+              "gamePk": 849847,
+              "gameType": "F",
+              "gameDate": "2026-10-02T00:00:00Z",
+              "status": {
+                "abstractGameState": "Preview",
+                "codedGameState": "S",
+                "detailedState": "Scheduled"
+              },
+              "teams": {
+                "away": {
+                  "team": {
+                    "id": 111,
+                    "name": "Boston Red Sox"
+                  }
+                },
+                "home": {
+                  "team": {
+                    "id": 147,
+                    "name": "New York Yankees"
+                  }
+                }
+              }
+            },
+            {
+              "gamePk": 849840,
+              "gameType": "F",
+              "gameDate": "2026-10-02T02:00:00Z",
+              "status": {
+                "abstractGameState": "Preview",
+                "codedGameState": "S",
+                "detailedState": "Scheduled"
+              },
+              "teams": {
+                "away": {
+                  "team": {
+                    "id": 112,
+                    "name": "Chicago Cubs"
+                  }
+                },
+                "home": {
+                  "team": {
+                    "id": 135,
+                    "name": "San Diego Padres"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "observations": {
+    "previous_day_final_games": 4,
+    "today_games": 4,
+    "today_in_progress": 1,
+    "today_pregame_or_scheduled": 3,
+    "tomorrow_scheduled_games": 4,
+    "saved_pregame_predictions": 0,
+    "previously_recorded_missed_game_pks": [
+      849841
+    ],
+    "new_missed_game_pks": [],
+    "remaining_future_cutoffs": 3,
+    "matching_model_process_count": 0,
+    "research_report_namespace": "ABSENT",
+    "research_flow_namespace": "ABSENT",
+    "poststart_report_namespace": "ABSENT",
+    "regular_flow_receipt_counts": {
+      "2026-09-16": 4,
+      "2026-09-23": 16,
+      "2026-09-24": 4
+    },
+    "receipt_inventory_changed": false,
+    "lineup_recheck_eligible_game_pks": [
+      849846
+    ],
+    "participant_rechecked": true,
+    "participant_recheck_reason": "CWS@HOU is about 99 minutes from its 21:00Z scheduled start, within the 120-to-15-minute window.",
+    "verified_source_repair_evidence_found": false,
+    "source_sha256": {
+      "mlb_backtest/live_history.py": "dbf96a065d6a05a6c017dd34518eae71381a92b44c75aa4ee41019d9b196d310",
+      "mlb_backtest/poststart_research_evaluation.py": "79d7b9aaf950ebce68906f0ed5e0d9a3a9722fe9476f93b77997e7820fd2dcec"
+    },
+    "duplicate_history_guard_still_present_at": "mlb_backtest/live_history.py:192",
+    "market_status": "NOT_EVALUATED_RESEARCH_ONLY",
+    "lineup_availability": {
+      "game_pk": 849846,
+      "away_starting_nine_count": 9,
+      "home_starting_nine_count": 0,
+      "away_probable_pitcher": {
+        "id": 680732,
+        "fullName": "Sean Burke"
+      },
+      "home_probable_pitcher": {
+        "id": 686613,
+        "fullName": "Hunter Brown"
+      },
+      "status": "UNSCORED_WAITING_FOR_HOME_LINEUP",
+      "limitation": "The masked official boxscore has no home batting-order slots at observation. Probable starters are available; do not misclassify an empty pitcher list in that boxscore as missing probable-starter data."
+    },
+    "history_and_poststart_source_hashes_unchanged": true
+  },
+  "actions": {
+    "model_runs": 0,
+    "poststart_runs": 0,
+    "new_model_reports": 0,
+    "new_primary_claims": 0,
+    "new_settlements": 0,
+    "new_validation_samples": 0,
+    "new_coverage_reviews": 0,
+    "source_code_modified": false,
+    "source_guards_changed": false,
+    "known_sep23_failure_retried": false,
+    "unchanged_source_failures_retried": false,
+    "scores_or_winners_requested": false
+  },
+  "blocker_evidence": [
+    "reports/daily_review/2026-09-30/postseason-live-activation-attempt-20260930T1521Z.json",
+    "reports/daily_review/2026-09-30/reconstruction-preparation/input-contract-blocker.json"
+  ],
+  "comparison": {
+    "previous_record": "reports/daily_review/2026-09-30/operations-check-20260930T185003Z.json",
+    "schedule_unchanged": true,
+    "schedule_state_changes": [],
+    "artifact_inventory_unchanged": true,
+    "participant_ids_unchanged": null,
+    "participant_comparison_reason": "First CWS@HOU participant observation in this monitored sequence; no previous baseline supports a scratch/change claim."
+  },
+  "notification": {
+    "decision": "DONT_NOTIFY",
+    "reason": "No new missed cutoff, schedule transition, model report, receipt or settlement. CWS@HOU home lineup remains pending at first observation; known source-contract blockers are unchanged and already reported."
+  },
+  "next_check": "Next existing 30-minute heartbeat: recheck CWS@HOU official lineup and starters before its 21:00Z start. Preserve the already recorded PHI@ATL miss and terminal settlements. A completed lineup would not resolve the unchanged history source-contract failure; do not retry without a verified repair.",
+  "participant_availability_observation": {
+    "url": "https://statsapi.mlb.com/api/v1/game/849846/boxscore?fields=teams,away,home,team,id,players,person,battingOrder,pitchers",
+    "observed_by_utc": "2026-09-30T19:20:52Z",
+    "game_pk": 849846,
+    "scope": "Read-only pregame participant availability; not a model input, model evaluation or saved prediction.",
+    "sides": {
+      "away": {
+        "team_id": 145,
+        "starting_nine_count": 9,
+        "starting_nine": [
+          {
+            "batting_order": "100",
+            "player_id": 803011
+          },
+          {
+            "batting_order": "200",
+            "player_id": 691019
+          },
+          {
+            "batting_order": "300",
+            "player_id": 678246
+          },
+          {
+            "batting_order": "400",
+            "player_id": 808959
+          },
+          {
+            "batting_order": "500",
+            "player_id": 643217
+          },
+          {
+            "batting_order": "600",
+            "player_id": 671976
+          },
+          {
+            "batting_order": "700",
+            "player_id": 805367
+          },
+          {
+            "batting_order": "800",
+            "player_id": 695731
+          },
+          {
+            "batting_order": "900",
+            "player_id": 695657
+          }
+        ],
+        "pitcher_ids": [
+          680732
+        ]
+      },
+      "home": {
+        "team_id": 117,
+        "starting_nine_count": 0,
+        "starting_nine": [],
+        "pitcher_ids": []
+      }
+    },
+    "payload": {
+      "teams": {
+        "away": {
+          "team": {
+            "id": 145
+          },
+          "teamStats": {},
+          "players": {
+            "ID671976": {
+              "person": {
+                "id": 671976
+              },
+              "jerseyNumber": "29",
+              "position": {},
+              "status": {},
+              "parentTeamId": 145,
+              "battingOrder": "600",
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {},
+              "allPositions": [
+                {}
+              ]
+            },
+            "ID641743": {
+              "person": {
+                "id": 641743
+              },
+              "jerseyNumber": "18",
+              "position": {},
+              "status": {},
+              "parentTeamId": 145,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID663436": {
+              "person": {
+                "id": 663436
+              },
+              "jerseyNumber": "65",
+              "position": {},
+              "status": {},
+              "parentTeamId": 145,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID682668": {
+              "person": {
+                "id": 682668
+              },
+              "jerseyNumber": "0",
+              "position": {},
+              "status": {},
+              "parentTeamId": 145,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID623211": {
+              "person": {
+                "id": 623211
+              },
+              "jerseyNumber": "50",
+              "position": {},
+              "status": {},
+              "parentTeamId": 145,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID689818": {
+              "person": {
+                "id": 689818
+              },
+              "jerseyNumber": "54",
+              "position": {},
+              "status": {},
+              "parentTeamId": 145,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID545341": {
+              "person": {
+                "id": 545341
+              },
+              "jerseyNumber": "34",
+              "position": {},
+              "status": {},
+              "parentTeamId": 145,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID808959": {
+              "person": {
+                "id": 808959
+              },
+              "jerseyNumber": "5",
+              "position": {},
+              "status": {},
+              "parentTeamId": 145,
+              "battingOrder": "400",
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {},
+              "allPositions": [
+                {}
+              ]
+            },
+            "ID691019": {
+              "person": {
+                "id": 691019
+              },
+              "jerseyNumber": "8",
+              "position": {},
+              "status": {},
+              "parentTeamId": 145,
+              "battingOrder": "200",
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {},
+              "allPositions": [
+                {}
+              ]
+            },
+            "ID805367": {
+              "person": {
+                "id": 805367
+              },
+              "jerseyNumber": "10",
+              "position": {},
+              "status": {},
+              "parentTeamId": 145,
+              "battingOrder": "700",
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {},
+              "allPositions": [
+                {}
+              ]
+            },
+            "ID502054": {
+              "person": {
+                "id": 502054
+              },
+              "jerseyNumber": "21",
+              "position": {},
+              "status": {},
+              "parentTeamId": 145,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID691799": {
+              "person": {
+                "id": 691799
+              },
+              "jerseyNumber": "31",
+              "position": {},
+              "status": {},
+              "parentTeamId": 145,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID695657": {
+              "person": {
+                "id": 695657
+              },
+              "jerseyNumber": "12",
+              "position": {},
+              "status": {},
+              "parentTeamId": 145,
+              "battingOrder": "900",
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {},
+              "allPositions": [
+                {}
+              ]
+            },
+            "ID695731": {
+              "person": {
+                "id": 695731
+              },
+              "jerseyNumber": "24",
+              "position": {},
+              "status": {},
+              "parentTeamId": 145,
+              "battingOrder": "800",
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {},
+              "allPositions": [
+                {}
+              ]
+            },
+            "ID702273": {
+              "person": {
+                "id": 702273
+              },
+              "jerseyNumber": "22",
+              "position": {},
+              "status": {},
+              "parentTeamId": 145,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID668670": {
+              "person": {
+                "id": 668670
+              },
+              "jerseyNumber": "28",
+              "position": {},
+              "status": {},
+              "parentTeamId": 145,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID696146": {
+              "person": {
+                "id": 696146
+              },
+              "jerseyNumber": "32",
+              "position": {},
+              "status": {},
+              "parentTeamId": 145,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID643217": {
+              "person": {
+                "id": 643217
+              },
+              "jerseyNumber": "23",
+              "position": {},
+              "status": {},
+              "parentTeamId": 145,
+              "battingOrder": "500",
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {},
+              "allPositions": [
+                {}
+              ]
+            },
+            "ID680732": {
+              "person": {
+                "id": 680732
+              },
+              "jerseyNumber": "59",
+              "position": {},
+              "status": {},
+              "parentTeamId": 145,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {},
+              "allPositions": [
+                {}
+              ]
+            },
+            "ID686668": {
+              "person": {
+                "id": 686668
+              },
+              "jerseyNumber": "7",
+              "position": {},
+              "status": {},
+              "parentTeamId": 145,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID663542": {
+              "person": {
+                "id": 663542
+              },
+              "jerseyNumber": "60",
+              "position": {},
+              "status": {},
+              "parentTeamId": 145,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID607200": {
+              "person": {
+                "id": 607200
+              },
+              "jerseyNumber": "47",
+              "position": {},
+              "status": {},
+              "parentTeamId": 145,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID656794": {
+              "person": {
+                "id": 656794
+              },
+              "jerseyNumber": "15",
+              "position": {},
+              "status": {},
+              "parentTeamId": 145,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID663855": {
+              "person": {
+                "id": 663855
+              },
+              "jerseyNumber": "44",
+              "position": {},
+              "status": {},
+              "parentTeamId": 145,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID803011": {
+              "person": {
+                "id": 803011
+              },
+              "jerseyNumber": "17",
+              "position": {},
+              "status": {},
+              "parentTeamId": 145,
+              "battingOrder": "100",
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {},
+              "allPositions": [
+                {}
+              ]
+            },
+            "ID678246": {
+              "person": {
+                "id": 678246
+              },
+              "jerseyNumber": "20",
+              "position": {},
+              "status": {},
+              "parentTeamId": 145,
+              "battingOrder": "300",
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {},
+              "allPositions": [
+                {}
+              ]
+            }
+          },
+          "batters": [
+            803011,
+            691019,
+            678246,
+            808959,
+            643217,
+            671976,
+            805367,
+            695731,
+            695657,
+            680732
+          ],
+          "pitchers": [
+            680732
+          ],
+          "bench": [
+            682668,
+            686668,
+            545341,
+            502054,
+            668670
+          ],
+          "bullpen": [
+            623211,
+            607200,
+            663855,
+            663542,
+            641743,
+            663436,
+            656794,
+            689818,
+            702273,
+            696146,
+            691799
+          ],
+          "battingOrder": [
+            803011,
+            691019,
+            678246,
+            808959,
+            643217,
+            671976,
+            805367,
+            695731,
+            695657
+          ],
+          "info": [],
+          "note": []
+        },
+        "home": {
+          "team": {
+            "id": 117
+          },
+          "teamStats": {},
+          "players": {
+            "ID670623": {
+              "person": {
+                "id": 670623
+              },
+              "jerseyNumber": "15",
+              "position": {},
+              "status": {},
+              "parentTeamId": 117,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID650556": {
+              "person": {
+                "id": 650556
+              },
+              "jerseyNumber": "52",
+              "position": {},
+              "status": {},
+              "parentTeamId": 117,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID669397": {
+              "person": {
+                "id": 669397
+              },
+              "jerseyNumber": "20",
+              "position": {},
+              "status": {},
+              "parentTeamId": 117,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID701358": {
+              "person": {
+                "id": 701358
+              },
+              "jerseyNumber": "11",
+              "position": {},
+              "status": {},
+              "parentTeamId": 117,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID669713": {
+              "person": {
+                "id": 669713
+              },
+              "jerseyNumber": "39",
+              "position": {},
+              "status": {},
+              "parentTeamId": 117,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID686613": {
+              "person": {
+                "id": 686613
+              },
+              "jerseyNumber": "58",
+              "position": {},
+              "status": {},
+              "parentTeamId": 117,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID681973": {
+              "person": {
+                "id": 681973
+              },
+              "jerseyNumber": "61",
+              "position": {},
+              "status": {},
+              "parentTeamId": 117,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID623352": {
+              "person": {
+                "id": 623352
+              },
+              "jerseyNumber": "71",
+              "position": {},
+              "status": {},
+              "parentTeamId": 117,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID805123": {
+              "person": {
+                "id": 805123
+              },
+              "jerseyNumber": "69",
+              "position": {},
+              "status": {},
+              "parentTeamId": 117,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID656986": {
+              "person": {
+                "id": 656986
+              },
+              "jerseyNumber": "62",
+              "position": {},
+              "status": {},
+              "parentTeamId": 117,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID701121": {
+              "person": {
+                "id": 701121
+              },
+              "jerseyNumber": "64",
+              "position": {},
+              "status": {},
+              "parentTeamId": 117,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID514888": {
+              "person": {
+                "id": 514888
+              },
+              "jerseyNumber": "27",
+              "position": {},
+              "status": {},
+              "parentTeamId": 117,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID666211": {
+              "person": {
+                "id": 666211
+              },
+              "jerseyNumber": "26",
+              "position": {},
+              "status": {},
+              "parentTeamId": 117,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID837227": {
+              "person": {
+                "id": 837227
+              },
+              "jerseyNumber": "45",
+              "position": {},
+              "status": {},
+              "parentTeamId": 117,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID694388": {
+              "person": {
+                "id": 694388
+              },
+              "jerseyNumber": "10",
+              "position": {},
+              "status": {},
+              "parentTeamId": 117,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID669384": {
+              "person": {
+                "id": 669384
+              },
+              "jerseyNumber": "29",
+              "position": {},
+              "status": {},
+              "parentTeamId": 117,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID665161": {
+              "person": {
+                "id": 665161
+              },
+              "jerseyNumber": "3",
+              "position": {},
+              "status": {},
+              "parentTeamId": 117,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID663567": {
+              "person": {
+                "id": 663567
+              },
+              "jerseyNumber": "38",
+              "position": {},
+              "status": {},
+              "parentTeamId": 117,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID687911": {
+              "person": {
+                "id": 687911
+              },
+              "jerseyNumber": "74",
+              "position": {},
+              "status": {},
+              "parentTeamId": 117,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID572233": {
+              "person": {
+                "id": 572233
+              },
+              "jerseyNumber": "8",
+              "position": {},
+              "status": {},
+              "parentTeamId": 117,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID699044": {
+              "person": {
+                "id": 699044
+              },
+              "jerseyNumber": "66",
+              "position": {},
+              "status": {},
+              "parentTeamId": 117,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID828599": {
+              "person": {
+                "id": 828599
+              },
+              "jerseyNumber": "28",
+              "position": {},
+              "status": {},
+              "parentTeamId": 117,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID543877": {
+              "person": {
+                "id": 543877
+              },
+              "jerseyNumber": "2",
+              "position": {},
+              "status": {},
+              "parentTeamId": 117,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID673237": {
+              "person": {
+                "id": 673237
+              },
+              "jerseyNumber": "21",
+              "position": {},
+              "status": {},
+              "parentTeamId": 117,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID670541": {
+              "person": {
+                "id": 670541
+              },
+              "jerseyNumber": "44",
+              "position": {},
+              "status": {},
+              "parentTeamId": 117,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            },
+            "ID676369": {
+              "person": {
+                "id": 676369
+              },
+              "jerseyNumber": "30",
+              "position": {},
+              "status": {},
+              "parentTeamId": 117,
+              "stats": {},
+              "seasonStats": {},
+              "gameStatus": {}
+            }
+          },
+          "batters": [],
+          "pitchers": [],
+          "bench": [
+            669397,
+            514888,
+            670541,
+            669384,
+            673237,
+            694388,
+            670623,
+            665161,
+            701358,
+            828599,
+            666211,
+            543877,
+            676369,
+            572233
+          ],
+          "bullpen": [
+            650556,
+            805123,
+            686613,
+            623352,
+            681973,
+            837227,
+            687911,
+            663567,
+            656986,
+            699044,
+            701121,
+            669713
+          ],
+          "battingOrder": [],
+          "info": [],
+          "note": []
+        }
+      }
+    }
+  },
+  "probable_starters_observation": {
+    "url": "https://statsapi.mlb.com/api/v1.1/game/849846/feed/live?fields=gamePk,gameData,datetime,dateTime,status,abstractGameState,codedGameState,detailedState,probablePitchers,away,home,id,fullName",
+    "observed_by_utc": "2026-09-30T19:21:15Z",
+    "payload": {
+      "gamePk": 849846,
+      "gameData": {
+        "datetime": {
+          "dateTime": "2026-09-30T21:00:00Z"
+        },
+        "status": {
+          "abstractGameState": "Preview",
+          "codedGameState": "P",
+          "detailedState": "Pre-Game"
+        },
+        "probablePitchers": {
+          "away": {
+            "id": 680732,
+            "fullName": "Sean Burke"
+          },
+          "home": {
+            "id": 686613,
+            "fullName": "Hunter Brown"
+          }
+        }
+      }
+    }
+  }
+}

@@ -12,7 +12,11 @@ from typing import Mapping
 from urllib.parse import parse_qsl, urlsplit
 
 from .experimental_totals import validate_final_games, validate_target_games
-from .live_sources import parse_live_schedule
+from .live_sources import (
+    ACCEPTED_PREGAME_STATUSES,
+    _require_pregame_boundary,
+    parse_live_schedule,
+)
 from .live_top3_contracts import SourceBinding, canonical_json_bytes, validate_run_payload
 from .secure_fs import (
     RegularFileSnapshot,
@@ -57,6 +61,20 @@ class AdmittedSourceIdentity:
     byte_length: int
 
 
+@dataclass(frozen=True, slots=True)
+class ExcludedTargetGame:
+    """A target game retained as an authenticated, non-forecastable exclusion."""
+
+    game_pk: int
+    official_date: str
+    scheduled_start_utc: str
+    away_team_id: int
+    home_team_id: int
+    venue_id: int
+    source_status: str
+    reason: str
+
+
 @dataclass(frozen=True)
 class TotalsSourceBundle:
     """Closed schedule rows and the complete chain by which they were admitted."""
@@ -67,6 +85,7 @@ class TotalsSourceBundle:
     live_identity: AdmittedSourceIdentity
     history_games: tuple[object, ...]
     target_games: tuple[object, ...]
+    excluded_target_games: tuple[ExcludedTargetGame, ...] = ()
 
 
 def _totals_sources_test_hook(stage: str, relative: Path) -> None:
@@ -257,7 +276,9 @@ def _validate_schedule_population(raw: bytes, *, role: str, expected_date: str) 
                 raise ValueError("schedule league differs")
             official_date = game.get("officialDate", date_entry.get("date"))
             if role == _LIVE_ROLE and official_date != expected_date:
-                raise ValueError("live schedule date differs")
+                status = game.get("status")
+                if not isinstance(status, dict) or status.get("detailedState") not in OUT_OF_RANGE_UNPLAYED_STATUSES:
+                    raise ValueError("live schedule date differs")
 
 
 def _closed_history_rows(
@@ -288,12 +309,33 @@ def _closed_history_rows(
     return tuple(validate_final_games(rows, cutoff_date=cutoff_date))
 
 
-def _closed_target_rows(raw: bytes, target_date: str) -> tuple[object, ...]:
+def _closed_target_rows(
+    raw: bytes, target_date: str, binding: SourceBinding
+) -> tuple[tuple[object, ...], tuple[ExcludedTargetGame, ...]]:
     _validate_schedule_population(raw, role=_LIVE_ROLE, expected_date=target_date)
+    games = parse_live_schedule(raw, requested_date=target_date)
+    if tuple(sorted(int(game["game_pk"]) for game in games)) != tuple(sorted(binding.game_pks)):
+        raise ValueError("live schedule binding game_pks differs")
     rows = []
-    for game in parse_live_schedule(raw, requested_date=target_date):
-        if game["status"] not in {"Scheduled", "Pre-Game"}:
-            raise ValueError("live schedule is not pregame")
+    excluded = []
+    for game in games:
+        identity = dict(
+            game_pk=game["game_pk"], official_date=game["official_date"],
+            scheduled_start_utc=game["scheduled_start_utc"],
+            away_team_id=game["away_team_id"], home_team_id=game["home_team_id"],
+            venue_id=game["venue_id"],
+        )
+        source_status = str(game["status"])
+        if source_status not in ACCEPTED_PREGAME_STATUSES:
+            excluded.append(ExcludedTargetGame(**identity, source_status=source_status, reason="PREGAME_STATUS_NOT_ACCEPTED"))
+            continue
+        try:
+            _require_pregame_boundary(binding, game)
+        except ValueError as exc:
+            if str(exc) != "live observation became durable at or after scheduled start":
+                raise
+            excluded.append(ExcludedTargetGame(**identity, source_status=source_status, reason="OBSERVATION_AT_OR_AFTER_START"))
+            continue
         rows.append({
             "game_pk": game["game_pk"],
             "official_date": game["official_date"],
@@ -303,12 +345,18 @@ def _closed_target_rows(raw: bytes, target_date: str) -> tuple[object, ...]:
             "venue_id": game["venue_id"],
             "status": "Pregame",
         })
-    return tuple(validate_target_games(rows, target_date=target_date))
+    ordered_excluded = tuple(
+        sorted(
+            excluded,
+            key=lambda game: (game.official_date, game.scheduled_start_utc, game.game_pk),
+        )
+    )
+    return tuple(validate_target_games(rows, target_date=target_date)), ordered_excluded
 
 
 def _admit_binding(
     trusted: TrustedRoot, binding: SourceBinding, *, target_date: str, cutoff_date: str
-) -> tuple[AdmittedSourceIdentity, tuple[object, ...], tuple[RegularFileSnapshot, ...]]:
+) -> tuple[AdmittedSourceIdentity, tuple[object, ...], tuple[ExcludedTargetGame, ...], tuple[RegularFileSnapshot, ...]]:
     try:
         query = json.loads(binding.query_identity_json)
     except json.JSONDecodeError as exc:
@@ -476,18 +524,16 @@ def _admit_binding(
             raise ValueError("live schedule completion differs")
     _require_sidecar(completion_sidecar, _snapshot_digest(completion), "schedule completion seal")
 
-    rows = (
-        _closed_history_rows(
+    if binding.binding_role == _HISTORY_ROLE:
+        rows = _closed_history_rows(
             payload.contents, cutoff_date, f"{cutoff_date[:4]}-01-01"
         )
-        if binding.binding_role == _HISTORY_ROLE
-        else _closed_target_rows(payload.contents, target_date)
-    )
+        excluded: tuple[ExcludedTargetGame, ...] = ()
+    else:
+        rows, excluded = _closed_target_rows(payload.contents, target_date, binding)
     if binding.binding_role == _HISTORY_ROLE:
         if binding.game_pks:
             raise ValueError("history schedule binding game_pks differs")
-    elif tuple(sorted(game.game_pk for game in rows)) != binding.game_pks:
-        raise ValueError("live schedule binding game_pks differs")
     snapshots = (
         claim, receipt, completion, completion_sidecar, manifest, manifest_sidecar,
         payload,
@@ -511,7 +557,7 @@ def _admit_binding(
         manifest_sidecar_sha256=_snapshot_digest(manifest_sidecar),
         payload_relative=payload_relative.as_posix(), payload_sha256=_snapshot_digest(payload), byte_length=len(payload.contents),
     )
-    return identity, rows, snapshots
+    return identity, rows, excluded, snapshots
 
 
 def load_totals_sources(root: Path, report_path: Path) -> TotalsSourceBundle:
@@ -535,11 +581,11 @@ def load_totals_sources_bound(
     validated = validate_run_payload(report)
     history_binding = _selected_binding(validated, _HISTORY_ROLE)
     live_binding = _selected_binding(validated, _LIVE_ROLE)
-    history_identity, history_games, history_snapshots = _admit_binding(
+    history_identity, history_games, _history_excluded, history_snapshots = _admit_binding(
         trusted, history_binding,
         target_date=str(validated["target_date"]), cutoff_date=str(validated["history_cutoff_date"]),
     )
-    live_identity, target_games, live_snapshots = _admit_binding(
+    live_identity, target_games, excluded_target_games, live_snapshots = _admit_binding(
         trusted, live_binding,
         target_date=str(validated["target_date"]), cutoff_date=str(validated["history_cutoff_date"]),
     )
@@ -565,4 +611,5 @@ def load_totals_sources_bound(
         target_date=str(validated["target_date"]), cutoff_date=str(validated["history_cutoff_date"]),
         history_identity=history_identity, live_identity=live_identity,
         history_games=history_games, target_games=target_games,
+        excluded_target_games=excluded_target_games,
     )

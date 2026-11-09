@@ -1,0 +1,7 @@
+{
+  "schema": "PROVISIONAL_MULTIBOOK_MARKET_UNAVAILABLE_V1",
+  "source_book": "BETMGM",
+  "recorded_at_utc": "2026-09-02T19:36:21.210Z",
+  "reason": "COLLECTOR_REJECTED",
+  "detail": "Observed BetMGM URL host was www.ny.betmgm.com, which is outside the fixed sportsbook authority sports.betmgm.com; host policy was preserved and the observation was not admitted. Source observation: audit/market_observations/2026-09-02/20260902-browser-public-sources.json"
+}

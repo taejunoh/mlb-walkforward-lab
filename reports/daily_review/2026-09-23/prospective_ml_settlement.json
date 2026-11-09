@@ -1,0 +1,102 @@
+{
+  "schema": "PROSPECTIVE_ML_DAILY_SETTLEMENT_REVIEW_V1",
+  "target_date": "2026-09-23",
+  "review_as_of_utc": "2026-09-24",
+  "model_card_sha256": "9bad89b9f4896a8f8862d3c304fd605921eca2d825fc2340bf51da01f7912759",
+  "source": {
+    "name": "MLB StatsAPI schedule",
+    "query_url_template": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-23&gamePks={gamePk}",
+    "observed_at_utc_range": ["2026-09-24T20:15:59.2588Z", "2026-09-24T20:16:30.778043Z"]
+  },
+  "counts": {
+    "pregame_primary_claims": 16,
+    "official_finals_diagnostically_compared": 16,
+    "formal_settlements": 15,
+    "collector_format_blockers": 1,
+    "hypothetical_pick_correct": 9,
+    "hypothetical_pick_incorrect": 7,
+    "betting_picks": 0
+  },
+  "metrics": {
+    "all_16_diagnostic": {"n": 16, "pick_accuracy": 0.5625, "p_home_brier": 0.25975311712660937, "p_home_log_loss": 0.7129493469685457},
+    "15_formally_settled": {"n": 15, "pick_accuracy": 0.5333333333333333, "p_home_brier": 0.2644727375996795, "p_home_log_loss": 0.7224534386261054}
+  },
+  "totals": {
+    "prospective_ml_snapshot_status": "NOT_EVALUATED",
+    "scope_note": "All 16 prospective-ML snapshots have totals_status NOT_EVALUATED. This review did not settle the separate daily_totals reports.",
+    "separate_daily_totals_diagnostic": {
+      "n": 16,
+      "target_date": "2026-09-23",
+      "feature_cutoff": "2026-09-22",
+      "eligible_pregame_predictions": 16,
+      "total_same_date_reports": 9,
+      "selection_rule": "First integrity-bound daily_totals report with a PROJECTED row strictly before that game's scheduled start; later same-date reports were not used to select performance.",
+      "selected_report": "reports/experimental_daily_totals/2026-09-23/20260923T091445528603Z-db519940b966ed12.json",
+      "selected_trace": "reports/experimental_daily_totals/2026-09-23/20260923T091445528603Z-db519940b966ed12.trace.json",
+      "artifact_timestamp_utc": "2026-09-23T09:14:45.528603Z",
+      "candidate_id": "TEAM_VENUE_30",
+      "mae_runs": 2.8854757775266338,
+      "rmse_runs": 3.4295772676959206,
+      "interpretation": "Descriptive one-slate comparison of provisional expected total runs with actual combined runs; not an Over/Under market settlement, betting result, or profitability claim."
+    }
+  },
+  "games": [
+    {"game_pk": 824223, "away": "Washington Nationals", "away_score": 4, "home": "Detroit Tigers", "home_score": 2, "predicted_side": "home", "p_home": 0.6349200789945656, "actual_winner_side": "away", "correct": false, "formal_settlement": true, "settlement_head": "audit/prospective_ml_observation/settlement_heads/77997d48a1281f80b5b928679e513e7dd70c66d5cb2a1455cc34ad774d0d6ee3/00000001.json", "result_receipt": "audit/experimental_daily/live_receipts/a7b9639fb28c41d19daafa481dc902f3.json", "asof_utc": "2026-09-24T20:16:10.484257Z", "query_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-23&gamePks=824223"},
+    {"game_pk": 824785, "away": "Toronto Blue Jays", "away_score": 2, "home": "Baltimore Orioles", "home_score": 4, "predicted_side": "home", "p_home": 0.5653060731611754, "actual_winner_side": "home", "correct": true, "formal_settlement": false, "settlement_head": null, "result_receipt": "audit/experimental_daily/live_receipts/1be2217c571544b0b50a6fee30b02152.json", "asof_utc": "2026-09-24T20:15:59.2588Z", "query_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-23&gamePks=824785", "collector_disposition": "FAILED: official result schedule differs; StatsAPI returned both the 2026-09-22 postponed entry and the 2026-09-23 Final entry for this gamePk; parser requires exactly one date bucket and one game."},
+    {"game_pk": 823168, "away": "Minnesota Twins", "away_score": 4, "home": "San Francisco Giants", "home_score": 2, "predicted_side": "home", "p_home": 0.515620013847442, "actual_winner_side": "away", "correct": false, "formal_settlement": true, "settlement_head": "audit/prospective_ml_observation/settlement_heads/80c3c6a64fcf727594c81305d68e22ee77430648061ce703985d2d2c3cc1ca52/00000001.json", "result_receipt": "audit/experimental_daily/live_receipts/c386b04ee96c4658914deef1bf63a7f8.json", "asof_utc": "2026-09-24T20:16:21.567932Z", "query_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-23&gamePks=823168"},
+    {"game_pk": 824784, "away": "Toronto Blue Jays", "away_score": 2, "home": "Baltimore Orioles", "home_score": 4, "predicted_side": "home", "p_home": 0.5015541597567912, "actual_winner_side": "home", "correct": true, "formal_settlement": true, "settlement_head": "audit/prospective_ml_observation/settlement_heads/3532abe0df49e215e84f4b3bef981025ce503f9355a02e3cd5bb6d853056ca0a/00000001.json", "result_receipt": "audit/experimental_daily/live_receipts/7b59b213ecd642ed907c695c689f577f.json", "asof_utc": "2026-09-24T20:16:13.148981Z", "query_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-23&gamePks=824784"},
+    {"game_pk": 823327, "away": "St. Louis Cardinals", "away_score": 5, "home": "Pittsburgh Pirates", "home_score": 1, "predicted_side": "home", "p_home": 0.5898466062733971, "actual_winner_side": "away", "correct": false, "formal_settlement": true, "settlement_head": "audit/prospective_ml_observation/settlement_heads/9a2b3b243d74dbc7034eaae5df3f797ef8555dc75395ef05fc6620629fe5f181/00000001.json", "result_receipt": "audit/experimental_daily/live_receipts/366e8423485549e78a436325707c04b0.json", "asof_utc": "2026-09-24T20:16:13.148981Z", "query_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-23&gamePks=823327"},
+    {"game_pk": 823410, "away": "Milwaukee Brewers", "away_score": 4, "home": "Philadelphia Phillies", "home_score": 1, "predicted_side": "away", "p_home": 0.4281682212781095, "actual_winner_side": "away", "correct": true, "formal_settlement": true, "settlement_head": "audit/prospective_ml_observation/settlement_heads/c99a164fdfe4209769e78b90aef3ad93f8d6a7c8f7a45c35aa5c50ad714a4cb2/00000001.json", "result_receipt": "audit/experimental_daily/live_receipts/90731ac0840e4af99efc061130c1b040.json", "asof_utc": "2026-09-24T20:16:14.840184Z", "query_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-23&gamePks=823410"},
+    {"game_pk": 823492, "away": "Tampa Bay Rays", "away_score": 2, "home": "New York Yankees", "home_score": 9, "predicted_side": "home", "p_home": 0.566340978357831, "actual_winner_side": "home", "correct": true, "formal_settlement": true, "settlement_head": "audit/prospective_ml_observation/settlement_heads/fa77b55a2f7dc821a85e6e12d81c86682365651e3c1723e41916c1fee9efafc0/00000001.json", "result_receipt": "audit/experimental_daily/live_receipts/1ddacfa8dc0149ca958d7abb19d23a09.json", "asof_utc": "2026-09-24T20:16:02.35077Z", "query_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-23&gamePks=823492"},
+    {"game_pk": 824710, "away": "Cleveland Guardians", "away_score": 0, "home": "Boston Red Sox", "home_score": 1, "predicted_side": "home", "p_home": 0.5427513515352843, "actual_winner_side": "home", "correct": true, "formal_settlement": true, "settlement_head": "audit/prospective_ml_observation/settlement_heads/7765bec688be4120314364cfe3036f8d9786cfc52a89aabdcb0f9931730f1711/00000001.json", "result_receipt": "audit/experimental_daily/live_receipts/eb99f9ed6afb43e18b1d7a26dac35ecb.json", "asof_utc": "2026-09-24T20:16:03.977865Z", "query_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-23&gamePks=824710"},
+    {"game_pk": 824868, "away": "Cincinnati Reds", "away_score": 2, "home": "Atlanta Braves", "home_score": 3, "predicted_side": "home", "p_home": 0.7540866703815371, "actual_winner_side": "home", "correct": true, "formal_settlement": true, "settlement_head": "audit/prospective_ml_observation/settlement_heads/d8e1609108c2da33e21593b78752748a49d10a4140c021da31b7de08e5bc12b9/00000001.json", "result_receipt": "audit/experimental_daily/live_receipts/cd2b253a4ca141599387db680a1c952b.json", "asof_utc": "2026-09-24T20:16:16.181141Z", "query_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-23&gamePks=824868"},
+    {"game_pk": 824060, "away": "Chicago White Sox", "away_score": 4, "home": "Kansas City Royals", "home_score": 5, "predicted_side": "away", "p_home": 0.45909009332091527, "actual_winner_side": "home", "correct": false, "formal_settlement": true, "settlement_head": "audit/prospective_ml_observation/settlement_heads/1b143b626da260a43a1036bac117b16c512a1105502f1b226cd157b08d437ae6/00000001.json", "result_receipt": "audit/experimental_daily/live_receipts/a6fe1deee0784105928f60f7e5dc29e8.json", "asof_utc": "2026-09-24T20:16:17.921458Z", "query_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-23&gamePks=824060"},
+    {"game_pk": 824625, "away": "Miami Marlins", "away_score": 3, "home": "Chicago Cubs", "home_score": 2, "predicted_side": "home", "p_home": 0.5905441833806045, "actual_winner_side": "away", "correct": false, "formal_settlement": true, "settlement_head": "audit/prospective_ml_observation/settlement_heads/8b604f1a621f4377d183fb42128a4f881a22084e93821b0bbfb28ccb3e968beb/00000001.json", "result_receipt": "audit/experimental_daily/live_receipts/d13b5d2514324c8a9dad1b45bd776f09.json", "asof_utc": "2026-09-24T20:16:05.323923Z", "query_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-23&gamePks=824625"},
+    {"game_pk": 822841, "away": "New York Mets", "away_score": 7, "home": "Texas Rangers", "home_score": 2, "predicted_side": "away", "p_home": 0.387016466185229, "actual_winner_side": "away", "correct": true, "formal_settlement": true, "settlement_head": "audit/prospective_ml_observation/settlement_heads/e43fc767fc3a508bc3e209f5e6fadc7fc0e90ad9d4de51cef5e4c060bbe3bd7e/00000001.json", "result_receipt": "audit/experimental_daily/live_receipts/cc5c15bc9a2f43c7b2f638f2140c5b2b.json", "asof_utc": "2026-09-24T20:16:06.534047Z", "query_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-23&gamePks=822841"},
+    {"game_pk": 824301, "away": "Arizona Diamondbacks", "away_score": 5, "home": "Colorado Rockies", "home_score": 3, "predicted_side": "away", "p_home": 0.4809363861363264, "actual_winner_side": "away", "correct": true, "formal_settlement": true, "settlement_head": "audit/prospective_ml_observation/settlement_heads/8a89cb104bba2c76d72fee2d37ec7950756ed991b260dd2bf0b6e5e1f4c6609f/00000001.json", "result_receipt": "audit/experimental_daily/live_receipts/a180f261709b4cdeae299faeff3f1815.json", "asof_utc": "2026-09-24T20:16:07.842109Z", "query_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-23&gamePks=824301"},
+    {"game_pk": 824951, "away": "Los Angeles Angels", "away_score": 3, "home": "Athletics", "home_score": 7, "predicted_side": "away", "p_home": 0.37256983307991437, "actual_winner_side": "home", "correct": false, "formal_settlement": true, "settlement_head": "audit/prospective_ml_observation/settlement_heads/f42d39dfb3f8a25953aea31c014539b2482fb4cd3bc91d68a59ac4521bff86ed/00000001.json", "result_receipt": "audit/experimental_daily/live_receipts/8c6d78a9115d463eb6beea5a146db104.json", "asof_utc": "2026-09-24T20:16:30.778043Z", "query_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-23&gamePks=824951"},
+    {"game_pk": 823086, "away": "Houston Astros", "away_score": 5, "home": "Seattle Mariners", "home_score": 6, "predicted_side": "home", "p_home": 0.5820715358035545, "actual_winner_side": "home", "correct": true, "formal_settlement": true, "settlement_head": "audit/prospective_ml_observation/settlement_heads/aad78d899ea17966b6e6d531cc3e8bc696b6ee86e619b89837becd62c0378fe0/00000001.json", "result_receipt": "audit/experimental_daily/live_receipts/40ced9c96824415e95ed7526cbef5fe4.json", "asof_utc": "2026-09-24T20:16:26.335612Z", "query_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-23&gamePks=823086"},
+    {"game_pk": 823894, "away": "San Diego Padres", "away_score": 5, "home": "Los Angeles Dodgers", "home_score": 1, "predicted_side": "home", "p_home": 0.6856078261091814, "actual_winner_side": "away", "correct": false, "formal_settlement": true, "settlement_head": "audit/prospective_ml_observation/settlement_heads/abb270d9555aedc7a15bf0f5efa93c630a8ad454a86c968db1d5af74ecf900eb/00000001.json", "result_receipt": "audit/experimental_daily/live_receipts/1dbd9afb08614da1be485b237b96274d.json", "asof_utc": "2026-09-24T20:16:28.870768Z", "query_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-23&gamePks=823894"}
+  ],
+  "daily_totals_diagnostic_games": [
+    {"game_pk": 824223, "predicted_total_runs": 8.944085014295737, "actual_total_runs": 6, "absolute_error_runs": 2.9440850142957373, "scheduled_start_utc": "2026-09-23T17:10:00Z", "feature_cutoff": "2026-09-22", "official_result_receipt": "audit/experimental_daily/live_receipts/a7b9639fb28c41d19daafa481dc902f3.json"},
+    {"game_pk": 824785, "predicted_total_runs": 8.031071883278509, "actual_total_runs": 6, "absolute_error_runs": 2.031071883278509, "scheduled_start_utc": "2026-09-23T17:35:00Z", "feature_cutoff": "2026-09-22", "official_result_receipt": "audit/experimental_daily/live_receipts/1be2217c571544b0b50a6fee30b02152.json", "actual_is_diagnostic_only": true},
+    {"game_pk": 823168, "predicted_total_runs": 9.500965051751578, "actual_total_runs": 6, "absolute_error_runs": 3.500965051751578, "scheduled_start_utc": "2026-09-23T19:45:00Z", "feature_cutoff": "2026-09-22", "official_result_receipt": "audit/experimental_daily/live_receipts/c386b04ee96c4658914deef1bf63a7f8.json"},
+    {"game_pk": 824784, "predicted_total_runs": 8.031071883278509, "actual_total_runs": 6, "absolute_error_runs": 2.031071883278509, "scheduled_start_utc": "2026-09-23T22:35:00Z", "feature_cutoff": "2026-09-22", "official_result_receipt": "audit/experimental_daily/live_receipts/7b59b213ecd642ed907c695c689f577f.json"},
+    {"game_pk": 823327, "predicted_total_runs": 8.978018500249583, "actual_total_runs": 6, "absolute_error_runs": 2.9780185002495827, "scheduled_start_utc": "2026-09-23T22:40:00Z", "feature_cutoff": "2026-09-22", "official_result_receipt": "audit/experimental_daily/live_receipts/366e8423485549e78a436325707c04b0.json"},
+    {"game_pk": 823410, "predicted_total_runs": 9.270680192597473, "actual_total_runs": 5, "absolute_error_runs": 4.270680192597473, "scheduled_start_utc": "2026-09-23T22:40:00Z", "feature_cutoff": "2026-09-22", "official_result_receipt": "audit/experimental_daily/live_receipts/90731ac0840e4af99efc061130c1b040.json"},
+    {"game_pk": 823492, "predicted_total_runs": 8.247509357598796, "actual_total_runs": 11, "absolute_error_runs": 2.752490642401204, "scheduled_start_utc": "2026-09-23T23:05:00Z", "feature_cutoff": "2026-09-22", "official_result_receipt": "audit/experimental_daily/live_receipts/1ddacfa8dc0149ca958d7abb19d23a09.json"},
+    {"game_pk": 824710, "predicted_total_runs": 8.760722067163627, "actual_total_runs": 1, "absolute_error_runs": 7.760722067163627, "scheduled_start_utc": "2026-09-23T23:10:00Z", "feature_cutoff": "2026-09-22", "official_result_receipt": "audit/experimental_daily/live_receipts/eb99f9ed6afb43e18b1d7a26dac35ecb.json"},
+    {"game_pk": 824868, "predicted_total_runs": 9.067857212633804, "actual_total_runs": 5, "absolute_error_runs": 4.067857212633804, "scheduled_start_utc": "2026-09-23T23:15:00Z", "feature_cutoff": "2026-09-22", "official_result_receipt": "audit/experimental_daily/live_receipts/cd2b253a4ca141599387db680a1c952b.json"},
+    {"game_pk": 824060, "predicted_total_runs": 9.588530706363038, "actual_total_runs": 9, "absolute_error_runs": 0.5885307063630378, "scheduled_start_utc": "2026-09-23T23:40:00Z", "feature_cutoff": "2026-09-22", "official_result_receipt": "audit/experimental_daily/live_receipts/a6fe1deee0784105928f60f7e5dc29e8.json"},
+    {"game_pk": 824625, "predicted_total_runs": 10.550848486876356, "actual_total_runs": 5, "absolute_error_runs": 5.550848486876356, "scheduled_start_utc": "2026-09-23T23:40:00Z", "feature_cutoff": "2026-09-22", "official_result_receipt": "audit/experimental_daily/live_receipts/d13b5d2514324c8a9dad1b45bd776f09.json"},
+    {"game_pk": 822841, "predicted_total_runs": 9.399256831812835, "actual_total_runs": 9, "absolute_error_runs": 0.3992568318128349, "scheduled_start_utc": "2026-09-24T00:05:00Z", "feature_cutoff": "2026-09-22", "official_result_receipt": "audit/experimental_daily/live_receipts/cc5c15bc9a2f43c7b2f638f2140c5b2b.json"},
+    {"game_pk": 824301, "predicted_total_runs": 9.569525376608002, "actual_total_runs": 8, "absolute_error_runs": 1.5695253766080022, "scheduled_start_utc": "2026-09-24T00:40:00Z", "feature_cutoff": "2026-09-22", "official_result_receipt": "audit/experimental_daily/live_receipts/a180f261709b4cdeae299faeff3f1815.json"},
+    {"game_pk": 824951, "predicted_total_runs": 9.439071911465632, "actual_total_runs": 10, "absolute_error_runs": 0.5609280885343679, "scheduled_start_utc": "2026-09-24T01:40:00Z", "feature_cutoff": "2026-09-22", "official_result_receipt": "audit/experimental_daily/live_receipts/8c6d78a9115d463eb6beea5a146db104.json"},
+    {"game_pk": 823086, "predicted_total_runs": 8.684484140389017, "actual_total_runs": 11, "absolute_error_runs": 2.315515859610983, "scheduled_start_utc": "2026-09-24T02:10:00Z", "feature_cutoff": "2026-09-22", "official_result_receipt": "audit/experimental_daily/live_receipts/40ced9c96824415e95ed7526cbef5fe4.json"},
+    {"game_pk": 823894, "predicted_total_runs": 8.846044642970535, "actual_total_runs": 6, "absolute_error_runs": 2.8460446429705346, "scheduled_start_utc": "2026-09-24T02:10:00Z", "feature_cutoff": "2026-09-22", "official_result_receipt": "audit/experimental_daily/live_receipts/1dbd9afb08614da1be485b237b96274d.json"}
+  ],
+  "official_result_diagnostic_for_824785": {
+    "outcome": "Final",
+    "score": "Baltimore Orioles 4, Toronto Blue Jays 2",
+    "source_receipt": "audit/experimental_daily/live_receipts/1be2217c571544b0b50a6fee30b02152.json",
+    "matching_payload_entry_official_date": "2026-09-23",
+    "note": "Diagnostic comparison only; no formal settlement head exists."
+  },
+  "workflow": {
+    "pregame_receipts": [
+      "audit/prospective_ml_daily_flow/2026-09-23/0987b2efb5cbb74aead7ab91a3f0405e3367d7434a4fce3a831ba6ec1679b1c9.json",
+      "audit/prospective_ml_daily_flow/2026-09-23/185e1b289da1c2a02ab93e86192f67353d493b869ff6fcce4c34d4facf22f9d9.json",
+      "audit/prospective_ml_daily_flow/2026-09-23/ba08a47b893752c54611dadbd3071cac0158ead4a2b1f3f8ec98d23ae38aaee2.json",
+      "audit/prospective_ml_daily_flow/2026-09-23/c2df1c0f65691d716686adceeacc26ff348d7e137b60ae50553f086c65a86232.json",
+      "audit/prospective_ml_daily_flow/2026-09-23/d9d2b182a04301a1a9d08aee6ec130b1f6bb412318c138d37beab41e6c7535c1.json",
+      "audit/prospective_ml_daily_flow/2026-09-23/df182b18a27bdb90bd25b1d3ac3bc852c0ac5ca90b1384cec0f15d9c5c1f1bd9.json",
+      "audit/prospective_ml_daily_flow/2026-09-23/e8e690cf37c2e031aff6a4b7dce989ea2c2b6fd3fc161f9408e581921ea79d2e.json",
+      "audit/prospective_ml_daily_flow/2026-09-23/f6db35897757b504302a563bbb6f38f3cc7661fd0d7e31de8a08b4174de87179.json"
+    ],
+    "daily_flow_receipt_directory": "audit/prospective_ml_daily_flow/2026-09-23/",
+    "alternate_cli_documented": "python -m mlb_backtest.prospective_ml_settlement settle --root ROOT --snapshot RELATIVE_SNAPSHOT --result-receipt RELATIVE_RECEIPT",
+    "alternate_cli_limitation": "The documented direct settle CLI calls the same official-result parser and does not resolve this two-date-bucket payload. No normalization or source/code bypass was performed."
+  },
+  "betting_interpretation": "These are research-side comparisons, not betting outcomes or realized P&L. The prospective betting pick count was 0."
+}

@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mlb_backtest.locking import LOCK_REQUIRED_FIELDS, lock_predictions
+from mlb_backtest.locking import LOCK_REQUIRED_FIELDS, lock_predictions, validate_lock_rows
 
 
 MODEL_CARD_SHA = "a" * 64
@@ -53,6 +53,14 @@ def _concurrent_lock(root, start_event, ready_queue, result_queue):
 
 
 class LockingTest(unittest.TestCase):
+    def test_lock_rows_accept_explicit_non_doubleheader_marker(self):
+        row = prediction()
+        row["doubleheader_marker"] = "NO"
+
+        validated = validate_lock_rows([row])
+
+        self.assertEqual(validated[0]["doubleheader_marker"], "NO")
+
     def test_concurrent_identical_writers_share_one_stable_manifest(self):
         with tempfile.TemporaryDirectory() as td:
             context = multiprocessing.get_context("spawn")

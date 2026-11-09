@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "items": [
+    {
+      "id": "sep29-pregame-coverage",
+      "title": "9월 29일 사전 예측 저장 상태",
+      "queries": [
+        {
+          "id": "official-schedule-and-local-records",
+          "source": {
+            "label": "공식 MLB 일정과 운영 기록",
+            "links": [{"label": "MLB 9월 29일 일정", "url": "https://www.mlb.com/schedule/2026-09-29"}],
+            "files": ["reports/daily_review/2026-09-29/operations-check-20260929T210445Z.json", "reports/daily_review/2026-09-29/operations-status.json"],
+            "filters": ["경기 날짜: 뉴욕 현지 2026-09-29", "경기 유형: 공식 일정의 F", "득점과 경기 결과는 수집 필드에서 제외"],
+            "caveats": ["Warmup 상태라도 예정 시작 시간이 지나면 새 경기 전 예측을 저장할 수 없습니다.", "현재 코드는 정규시즌만 지원하며 포스트시즌 설계 문서는 아직 구현되지 않았습니다.", "저장 예측 없음은 적중률 0%가 아니라 평가 표본 없음입니다."],
+            "executedAt": "2026-09-29T21:06:11Z"
+          },
+          "reportingPeriod": "2026-09-29 경기, 17:06 EDT 일정 관측",
+          "columns": [
+            {"field":"game_pk","label":"gamePk"},
+            {"field":"game","label":"경기"},
+            {"field":"start_edt","label":"예정 시작 EDT"},
+            {"field":"official_status","label":"공식 상태"},
+            {"field":"record_status","label":"사전 예측 상태"}
+          ],
+          "rows": [
+            {"game_pk":849845,"game":"PHI @ ATL","start_edt":"14:00","official_status":"Final","record_status":"저장 예측 없음 · 사후 생성 금지"},
+            {"game_pk":849849,"game":"CWS @ HOU","start_edt":"17:00","official_status":"Warmup","record_status":"저장 예측 없음 · 예정 시작 경과"},
+            {"game_pk":849851,"game":"BOS @ NYY","start_edt":"20:00","official_status":"Pre-Game","record_status":"포스트시즌 미지원 · 미평가"},
+            {"game_pk":849843,"game":"CHC @ SD","start_edt":"22:00","official_status":"Scheduled","record_status":"포스트시즌 미지원 · 미평가"}
+          ]
+        }
+      ]
+    }
+  ]
+}

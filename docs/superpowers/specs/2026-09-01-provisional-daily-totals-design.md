@@ -163,3 +163,11 @@ Acceptance requires:
 Passing these checks permits only the label `internal provisional total
 projection`. It does not permit `validated O/U bet`, `profitable`, or any
 equivalent claim.
+
+## Successor for later daily targets
+
+The approved [2026-09-05 daily-readiness contract](2026-09-05-daily-evaluation-readiness-design.md)
+derives sealed development intervals `D-92..D-32` and rolling retrospective
+final diagnostics `D-31..D-1` for later target dates. It preserves the Sep-1
+intervals and historical artifact; overlapping later diagnostics are not new
+independent validation and do not authorize betting.

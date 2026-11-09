@@ -1320,8 +1320,8 @@ def schedule_history_rows(
             row["result_available_on"] = game.get("result_available_on")
         if row["away_team_id"] == row["home_team_id"]:
             raise ValueError("schedule history requires distinct numeric team identities")
-        if row["doubleheader_marker"] not in {None, "GAME1", "GAME2"}:
-            raise ValueError("doubleheader_marker must be GAME1, GAME2, or None")
+        if row["doubleheader_marker"] not in {None, "GAME1", "GAME2", "NO"}:
+            raise ValueError("doubleheader_marker must be GAME1, GAME2, NO, or None")
         venue_id = game.get("venue_id")
         reference = venue_reference.get(venue_id, {})
         if not isinstance(reference, Mapping):

@@ -31,6 +31,8 @@ def _schedule(
     status: str | None = None,
     sport_id: object | None = None,
     league_id: object | None = None,
+    game_pk: int | None = None,
+    scheduled_start_utc: str | None = None,
 ) -> bytes:
     status = status or ("Final" if final else "Pre-Game")
     away = {"team": {"id": 11, "name": "Away"}}
@@ -39,10 +41,10 @@ def _schedule(
         away.update(score=3, isWinner=False)
         home.update(score=4, isWinner=True)
     game = {
-        "gamePk": 1001 if final else 2001,
+        "gamePk": game_pk if game_pk is not None else (1001 if final else 2001),
         "gameType": game_type,
         "officialDate": date,
-        "gameDate": f"{date}T19:00:00Z",
+        "gameDate": scheduled_start_utc or f"{date}T19:00:00Z",
         "status": {"detailedState": status},
         "teams": {"away": away, "home": home},
         "venue": {"id": 33, "name": "Park"},
@@ -57,7 +59,13 @@ def _schedule(
 
 
 def _binding(
-    *, role: str, observation_id: str, payload: bytes, payload_relative: Path
+    *,
+    role: str,
+    observation_id: str,
+    payload: bytes,
+    payload_relative: Path,
+    durable_at_utc: str = "2025-05-01T10:00:01Z",
+    game_pks: tuple[int, ...] = (2001,),
 ) -> SourceBinding:
     if role == "HISTORY_SCHEDULE":
         url = (
@@ -78,13 +86,13 @@ def _binding(
     values: dict[str, object] = {
         "source": "stats_api",
         "binding_role": role,
-        "game_pks": [] if role == "HISTORY_SCHEDULE" else [2001],
+        "game_pks": [] if role == "HISTORY_SCHEDULE" else list(game_pks),
         "observation_id": observation_id,
         "query_identity_json": canonical_json_bytes(identity).decode().strip(),
         "requested_url": url,
         "final_url": url,
         "response_completed_at_utc": "2025-05-01T10:00:00Z",
-        "durable_at_utc": "2025-05-01T10:00:01Z",
+        "durable_at_utc": durable_at_utc,
         "http_status": 200,
         "content_type": "application/json",
         "etag": None,
@@ -249,8 +257,13 @@ def write_source_fixture(
     history_league_id: object | None = None,
     live_game_type: str = "R",
     live_status: str | None = None,
+    live_final: bool = False,
+    live_durable_at_utc: str = "2025-05-01T10:00:01Z",
+    live_scheduled_start_utc: str | None = None,
     history_manifest_overrides: dict[str, object] | None = None,
     live_manifest_overrides: dict[str, object] | None = None,
+    live_games: tuple[tuple[int, str, str], ...] | None = None,
+    live_official_dates: dict[int, str] | None = None,
 ) -> SourceFixture:
     from tests.test_live_top3_service import _build, _final_observer, _game, _slate
 
@@ -261,9 +274,24 @@ def write_source_fixture(
         sport_id=history_sport_id,
         league_id=history_league_id,
     )
-    live_payload = _schedule(
-        date=TARGET, final=False, game_type=live_game_type, status=live_status
-    )
+    if live_games is None:
+        live_payload = _schedule(
+            date=TARGET, final=live_final, game_type=live_game_type, status=live_status,
+            scheduled_start_utc=live_scheduled_start_utc,
+        )
+        live_game_pks = (1001,) if live_final else (2001,)
+    else:
+        games = []
+        for game_pk, status, scheduled_start_utc in live_games:
+            game = json.loads(_schedule(
+                date=TARGET, final=False, game_type=live_game_type, status=status,
+                game_pk=game_pk, scheduled_start_utc=scheduled_start_utc,
+            ))["dates"][0]["games"][0]
+            if live_official_dates and game_pk in live_official_dates:
+                game["officialDate"] = live_official_dates[game_pk]
+            games.append(game)
+        live_payload = json.dumps({"dates": [{"date": TARGET, "games": games}]}).encode()
+        live_game_pks = tuple(game_pk for game_pk, _status, _start in live_games)
     history = _write_evidence(
         root,
         _binding(
@@ -288,6 +316,8 @@ def write_source_fixture(
                 Path("data/experimental_daily/live_observations/mlb_live_schedule")
                 / f"{hashlib.sha256(live_payload).hexdigest()}.raw"
             ),
+            durable_at_utc=live_durable_at_utc,
+            game_pks=live_game_pks,
         ),
         live_payload,
         manifest_overrides=live_manifest_overrides,
@@ -366,6 +396,137 @@ class TotalsSourcesTests(unittest.TestCase):
             ).hexdigest(),
             bundle.live_identity.manifest_sidecar_sha256,
         )
+
+    def test_loader_accepts_prestart_warmup_target_schedule(self) -> None:
+        from mlb_backtest.experimental_totals import TargetTotalGame
+        from mlb_backtest.experimental_totals_sources import load_totals_sources
+
+        fixture = write_source_fixture(
+            self.root,
+            live_status="Warmup",
+            live_durable_at_utc="2025-05-01T18:59:59Z",
+        )
+
+        bundle = load_totals_sources(self.root, fixture.report.relative_to(self.root))
+
+        self.assertIsInstance(bundle.target_games[0], TargetTotalGame)
+        self.assertEqual(bundle.target_games[0].game_pk, 2001)
+        self.assertEqual(bundle.excluded_target_games, ())
+
+    def test_loader_partitions_mixed_slate_and_preserves_exclusion_identity(self) -> None:
+        from mlb_backtest.experimental_totals_sources import load_totals_sources
+
+        fixture = write_source_fixture(
+            self.root,
+            live_durable_at_utc="2025-05-01T18:59:59Z",
+            live_games=(
+                (2001, "Warmup", "2025-05-01T19:00:00Z"),
+                (2002, "In Progress", "2025-05-01T18:00:00Z"),
+                (2003, "Unknown", "2025-05-01T21:00:00Z"),
+            ),
+        )
+
+        bundle = load_totals_sources(self.root, fixture.report.relative_to(self.root))
+
+        self.assertEqual([game.game_pk for game in bundle.target_games], [2001])
+        self.assertEqual([game.game_pk for game in bundle.excluded_target_games], [2002, 2003])
+        self.assertEqual(
+            [
+                (game.game_pk, game.official_date, game.scheduled_start_utc,
+                 game.away_team_id, game.home_team_id, game.venue_id,
+                 game.source_status, game.reason)
+                for game in bundle.excluded_target_games
+            ],
+            [
+                (2002, TARGET, "2025-05-01T18:00:00Z", 11, 22, 33, "In Progress", "PREGAME_STATUS_NOT_ACCEPTED"),
+                (2003, TARGET, "2025-05-01T21:00:00Z", 11, 22, 33, "Unknown", "PREGAME_STATUS_NOT_ACCEPTED"),
+            ],
+        )
+
+    def test_loader_preserves_offdate_postponed_game_as_excluded(self) -> None:
+        from mlb_backtest.experimental_totals_sources import load_totals_sources
+
+        fixture = write_source_fixture(
+            self.root,
+            live_games=(
+                (2001, "Pre-Game", "2025-05-01T19:00:00Z"),
+                (2002, "Postponed", "2025-05-01T21:00:00Z"),
+            ),
+            live_official_dates={2002: "2025-05-02"},
+        )
+
+        bundle = load_totals_sources(self.root, fixture.report.relative_to(self.root))
+
+        self.assertEqual([game.game_pk for game in bundle.target_games], [2001])
+        self.assertEqual(
+            [(game.game_pk, game.official_date, game.source_status, game.reason)
+             for game in bundle.excluded_target_games],
+            [(2002, "2025-05-02", "Postponed", "PREGAME_STATUS_NOT_ACCEPTED")],
+        )
+
+    def test_loader_requires_full_population_ids_before_status_partition(self) -> None:
+        from mlb_backtest.experimental_totals_sources import load_totals_sources
+
+        fixture = write_source_fixture(
+            self.root,
+            live_durable_at_utc="2025-05-01T18:59:59Z",
+            live_games=(
+                (2001, "Pre-Game", "2025-05-01T19:00:00Z"),
+                (2002, "In Progress", "2025-05-01T18:00:00Z"),
+            ),
+        )
+        _replace_report_binding(fixture.report, "LIVE_SCHEDULE", {"game_pks": [2001]})
+
+        with self.assertRaisesRegex(ValueError, "binding game_pks"):
+            load_totals_sources(self.root, fixture.report.relative_to(self.root))
+
+    def test_loader_excludes_accepted_status_at_or_after_start(self) -> None:
+        from mlb_backtest.experimental_totals_sources import load_totals_sources
+
+        fixture = write_source_fixture(
+            self.root,
+            live_status="Warmup",
+            live_durable_at_utc="2025-05-01T19:00:00Z",
+        )
+
+        bundle = load_totals_sources(self.root, fixture.report.relative_to(self.root))
+
+        self.assertEqual(bundle.target_games, ())
+        self.assertEqual(bundle.excluded_target_games[0].reason, "OBSERVATION_AT_OR_AFTER_START")
+
+    def test_loader_rejects_malformed_timestamp_before_exclusion(self) -> None:
+        from mlb_backtest.experimental_totals_sources import load_totals_sources
+
+        fixture = write_source_fixture(self.root, live_scheduled_start_utc="malformed")
+
+        with self.assertRaisesRegex(ValueError, "malformed schedule"):
+            load_totals_sources(self.root, fixture.report.relative_to(self.root))
+
+    def test_loader_rejects_warmup_target_schedule_durable_at_start(self) -> None:
+        from mlb_backtest.experimental_totals_sources import load_totals_sources
+
+        fixture = write_source_fixture(
+            self.root,
+            live_status="Warmup",
+            live_durable_at_utc="2025-05-01T19:00:00Z",
+        )
+
+        bundle = load_totals_sources(self.root, fixture.report.relative_to(self.root))
+        self.assertEqual(bundle.target_games, ())
+        self.assertEqual(bundle.excluded_target_games[0].reason, "OBSERVATION_AT_OR_AFTER_START")
+
+    def test_loader_rejects_started_target_schedule_even_before_start(self) -> None:
+        from mlb_backtest.experimental_totals_sources import load_totals_sources
+
+        fixture = write_source_fixture(
+            self.root,
+            live_status="In Progress",
+            live_durable_at_utc="2025-05-01T18:59:59Z",
+        )
+
+        bundle = load_totals_sources(self.root, fixture.report.relative_to(self.root))
+        self.assertEqual(bundle.target_games, ())
+        self.assertEqual(bundle.excluded_target_games[0].reason, "PREGAME_STATUS_NOT_ACCEPTED")
 
     def test_bound_loader_uses_and_preserves_caller_trusted_root(self) -> None:
         from mlb_backtest import experimental_totals_sources
@@ -581,9 +742,10 @@ class TotalsSourcesTests(unittest.TestCase):
         self.temporary.cleanup()
         self.temporary = tempfile.TemporaryDirectory(dir=Path.cwd())
         self.root = Path(self.temporary.name)
-        postgame = write_source_fixture(self.root, live_status="Final")
-        with self.assertRaisesRegex(ValueError, "final game requires both scores|not pregame"):
-            load_totals_sources(self.root, postgame.report.relative_to(self.root))
+        postgame = write_source_fixture(self.root, live_status="Final", live_final=True)
+        bundle = load_totals_sources(self.root, postgame.report.relative_to(self.root))
+        self.assertEqual(bundle.target_games, ())
+        self.assertEqual(bundle.excluded_target_games[0].reason, "PREGAME_STATUS_NOT_ACCEPTED")
 
     def test_loader_rebinds_every_component_before_returning(self) -> None:
         from mlb_backtest import experimental_totals_sources

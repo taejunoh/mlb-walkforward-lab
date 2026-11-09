@@ -22,6 +22,7 @@ from typing import Literal, Protocol
 from .daily_totals import (
     validate_totals_model_receipt,
     validate_totals_report,
+    validate_totals_report_receipt_binding,
     validate_totals_trace,
 )
 from .live_sources import compare_probable_pitchers, parse_pregame_boxscore
@@ -35,6 +36,7 @@ from .secure_fs import (
     read_regular_snapshot,
     rebind_regular_snapshot,
 )
+from .scoring import overall_completeness
 from .source_parsers.schedule import parse_schedule
 
 
@@ -49,6 +51,17 @@ class ParticipantGateEvidence:
     starter_consistent: bool
     late_scratch: bool
     reason_codes: tuple[str, ...]
+    away_lineup: tuple[int, ...] = ()
+    home_lineup: tuple[int, ...] = ()
+    away_observed_starter_id: int | None = None
+    home_observed_starter_id: int | None = None
+    away_expected_starter_id: int | None = None
+    home_expected_starter_id: int | None = None
+    payload_relative: Path | None = None
+    payload_sha256: str | None = None
+    receipt_relative: Path | None = None
+    receipt_sha256: str | None = None
+    durable_at_utc: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.complete) is not bool or type(self.starter_consistent) is not bool:
@@ -73,6 +86,7 @@ class MlGameAuthority:
     participant: ParticipantGateEvidence
     model_status: Literal["SCORED", "UNSCORED"]
     legacy_primary_rank: int | None
+    p_home: Fraction | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +98,7 @@ class TotalsGameAuthority:
     expected_total: Fraction | None
     residual_samples: tuple[int, ...]
     status: Literal["PROJECTED", "UNPROJECTED"]
+    residual_count: int | None = None
 
 
 class EvidenceAuthority(Protocol):
@@ -99,6 +114,7 @@ class MlAuthority:
     trace_relative: Path
     _root: Path
     _snapshots: tuple[RegularFileSnapshot, ...]
+    model_card_sha256: str = ""
 
     @property
     def by_game(self) -> Mapping[int, MlGameAuthority]:
@@ -248,6 +264,18 @@ def _read_live_binding_files(
         str(binding["receipt_sha256"]),
     )
     receipt = _json(receipt_snapshot, "live source receipt")
+    # A caller may rehash a legacy-looking envelope after removing its scope.
+    # The immutable acquisition receipt still identifies the consuming policy.
+    if "query_identity_json" in receipt:
+        try:
+            raw_query = json.loads(receipt["query_identity_json"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("live source receipt query identity differs") from exc
+        if isinstance(raw_query, Mapping) and any(
+            key in raw_query
+            for key in ("competition_scope", "research_policy_version", "history_population")
+        ):
+            raise ValueError("legacy ML source query policy differs")
     if receipt.get("payload_relative") != binding.get("payload_relative"):
         raise ValueError("live receipt payload_relative binding differs")
     if receipt.get("payload_sha256") != binding.get("payload_sha256"):
@@ -257,13 +285,23 @@ def _read_live_binding_files(
     manifest_relative = receipt.get("manifest_relative")
     if not isinstance(manifest_relative, str):
         raise ValueError("live receipt manifest_relative binding differs")
-    _snapshot_once(
+    manifest_snapshot = _snapshot_once(
         root,
         snapshots,
         _relative(root.path, manifest_relative, "manifest"),
         "live source manifest",
         str(binding["manifest_sha256"]),
     )
+    # Minimal legacy receipts need not carry a query. Independently inspect the
+    # authenticated raw manifest so dropping that optional field cannot erase
+    # a research acquisition's policy or its separate source namespace.
+    manifest = _json(manifest_snapshot, "live source manifest")
+    manifest_query = manifest.get("query")
+    if (isinstance(manifest_query, Mapping) and any(
+        key in manifest_query
+        for key in ("competition_scope", "research_policy_version", "history_population")
+    )) or str(manifest.get("source", "")).endswith("_postseason_research_v1"):
+        raise ValueError("legacy ML raw manifest policy differs")
     claim = receipt.get("claim_relative")
     claim_sha = receipt.get("claim_sha256")
     if claim is not None:
@@ -303,12 +341,38 @@ def _participant_evidence(
         "participant payload",
         str(binding["payload_sha256"]),
     )
+    payload_relative = _relative(
+        root.path, binding["payload_relative"], "participant payload"
+    )
+    payload_sha256 = str(binding["payload_sha256"])
+    receipt_relative = None
+    receipt_sha256 = None
+    raw_receipt_relative = binding.get("receipt_relative")
+    if raw_receipt_relative is not None:
+        receipt_relative = _relative(root.path, raw_receipt_relative, "participant receipt")
+        raw_receipt_sha256 = binding.get("receipt_sha256")
+        if isinstance(raw_receipt_sha256, str):
+            receipt_sha256 = raw_receipt_sha256
+    durable_at_utc = binding.get("durable_at_utc")
+    if not isinstance(durable_at_utc, str):
+        durable_at_utc = None
+    schedule_game = schedule[game_pk]
+    away_expected_starter_id = schedule_game.get("away_probable_pitcher_id")
+    home_expected_starter_id = schedule_game.get("home_probable_pitcher_id")
+    away_lineup: tuple[int, ...] = ()
+    home_lineup: tuple[int, ...] = ()
+    away_observed_starter_id: int | None = None
+    home_observed_starter_id: int | None = None
     try:
         parsed = parse_pregame_boxscore(payload.contents, game_pk=game_pk)
         parsed = compare_probable_pitchers(schedule[game_pk], parsed)
         reasons.update(parsed.reason_codes)
         complete = bool(parsed.complete)
         starter_consistent = "STARTER_CONFLICT" not in reasons and "MISSING_SCHEDULE_PROBABLE" not in reasons
+        away_lineup = parsed.away_lineup
+        home_lineup = parsed.home_lineup
+        away_observed_starter_id = parsed.away_pitcher_list_id
+        home_observed_starter_id = parsed.home_pitcher_list_id
     except (TypeError, ValueError) as exc:
         reasons.add("PARTICIPANT_PARSE_FAILURE")
         complete = False
@@ -323,6 +387,17 @@ def _participant_evidence(
         starter_consistent,
         late_scratch,
         tuple(sorted(reasons)),
+        away_lineup,
+        home_lineup,
+        away_observed_starter_id,
+        home_observed_starter_id,
+        away_expected_starter_id,
+        home_expected_starter_id,
+        payload_relative,
+        payload_sha256,
+        receipt_relative,
+        receipt_sha256,
+        durable_at_utc,
     )
 
 
@@ -366,6 +441,7 @@ def _ml_games(
             raise ValueError("ML game is absent from LIVE_SCHEDULE")
         game = schedule[game_pk]
         row = trace_rows.get(game_pk)
+        p_home: Fraction | None = None
         primary = primary_ranked.get(game_pk) or primary_unscored.get(game_pk) or {}
         reasons = primary.get("reason_codes", ()) if isinstance(primary, Mapping) else ()
         participant = _participant_evidence(
@@ -380,6 +456,8 @@ def _ml_games(
             status: Literal["SCORED", "UNSCORED"] = "UNSCORED"
             rank = None
         else:
+            if row.get("p_home") is not None:
+                p_home = _fraction(row["p_home"], "p_home")
             side = row["predicted_side"]
             if side == "none":
                 predicted_side = None
@@ -394,11 +472,9 @@ def _ml_games(
             qualities = row.get("qualities")
             if not isinstance(qualities, Mapping):
                 raise ValueError("ML qualities differ")
-            completeness_value = qualities.get("overall_completeness")
-            if completeness_value is None:
-                numeric = [value for value in qualities.values() if isinstance(value, (int, float)) and not isinstance(value, bool)]
-                completeness_value = min(numeric) if numeric else None
-            completeness = None if completeness_value is None else _fraction(completeness_value, "data completeness")
+            completeness = _fraction(
+                overall_completeness(qualities), "data completeness"
+            )
             rank = row.get("primary_rank")
             if rank is not None and (type(rank) is not int or rank <= 0):
                 raise ValueError("ML primary rank differs")
@@ -420,6 +496,7 @@ def _ml_games(
                 participant,
                 status,
                 rank,
+                p_home,
             )
         )
     return tuple(games)
@@ -445,6 +522,9 @@ def load_ml_authority(root: Path, ml_trace: Path) -> MlAuthority:
             raise ValueError("ML model card binding differs")
         bindings = [dict(binding) for binding in primary_payload["source_bindings"]]
         for binding in bindings:
+            identity = json.loads(binding["query_identity_json"])
+            if any(key in identity for key in ("competition_scope", "research_policy_version", "history_population")):
+                raise ValueError("legacy ML source query policy differs")
             if binding["binding_role"] in {"LIVE_SCHEDULE", "LIVE_PARTICIPANTS"}:
                 _read_live_binding_files(trusted, snapshots, binding)
         schedule_bindings = [b for b in bindings if b["binding_role"] == "LIVE_SCHEDULE"]
@@ -472,6 +552,7 @@ def load_ml_authority(root: Path, ml_trace: Path) -> MlAuthority:
             trace_relative,
             root,
             tuple(snapshots.values()),
+            str(trace_payload["model_card_sha256"]),
         )
 
 
@@ -511,7 +592,8 @@ def load_totals_authority(root: Path, totals_trace: Path) -> TotalsAuthority:
             raise ValueError("totals report component binding differs")
         receipt_relative = _relative(root, trace_payload["model_receipt_relative"], "totals model receipt")
         receipt_snapshot = _snapshot_once(trusted, snapshots, receipt_relative, "totals model receipt", str(trace_payload["model_receipt_sha256"]))
-        validate_totals_model_receipt(_json(receipt_snapshot, "totals model receipt"))
+        receipt_payload = validate_totals_model_receipt(_json(receipt_snapshot, "totals model receipt"))
+        validate_totals_report_receipt_binding(receipt_payload, report_payload)
         receipt_sidecar_relative = receipt_relative.with_suffix(".sha256")
         receipt_sidecar = _snapshot_once(trusted, snapshots, receipt_sidecar_relative, "totals model receipt sidecar")
         if receipt_sidecar.contents != f"{_digest(receipt_snapshot.contents)}\n".encode("ascii"):
@@ -535,9 +617,7 @@ def load_totals_authority(root: Path, totals_trace: Path) -> TotalsAuthority:
         for raw in report_payload["games"]:
             samples = raw.get("residual_samples", []) if raw["status"] == "PROJECTED" else []
             if raw["status"] == "PROJECTED":
-                if type(raw["residual_count"]) is not int or raw["residual_count"] != 764:
-                    raise ValueError("totals residual authority count differs")
-                if not isinstance(samples, list) or len(samples) != 764:
+                if not isinstance(samples, list):
                     raise ValueError("totals residual authority differs")
                 if any(type(value) is not int or value < 0 for value in samples):
                     raise ValueError("totals residual samples must be integer runs")
@@ -550,6 +630,7 @@ def load_totals_authority(root: Path, totals_trace: Path) -> TotalsAuthority:
                     None if raw["status"] != "PROJECTED" else Fraction(str(raw["expected_total"])),
                     tuple(samples),
                     raw["status"],
+                    None if raw["status"] != "PROJECTED" else raw["residual_count"],
                 )
             )
         return TotalsAuthority(

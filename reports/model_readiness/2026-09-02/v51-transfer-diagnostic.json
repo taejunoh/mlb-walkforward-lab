@@ -1,0 +1,380 @@
+{
+  "caveats": [
+    "retrospective, not live T-45 validation",
+    "Top1 is selection-conditioned",
+    "Wilson ignores date/team dependence",
+    "no market comparison, promotion claim, or new threshold"
+  ],
+  "fixed_bins": {
+    "all_final_locked_rows": [
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.0, 0.1)",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      },
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.1, 0.2)",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      },
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.2, 0.3)",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      },
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.3, 0.4)",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      },
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.4, 0.5)",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      },
+      {
+        "N": 1032,
+        "W": 518,
+        "absolute_gap": 0.04301082418488322,
+        "bin": "[0.5, 0.6)",
+        "mean_probability": 0.5449488086810073,
+        "observed_wilson_95": [
+          0.4714815785982984,
+          0.5323800156840706
+        ],
+        "observed_win_rate": 0.501937984496124
+      },
+      {
+        "N": 298,
+        "W": 194,
+        "absolute_gap": 0.018413317971140764,
+        "bin": "[0.6, 0.7)",
+        "mean_probability": 0.6325933934382552,
+        "observed_wilson_95": [
+          0.5952770473121786,
+          0.7028925886823297
+        ],
+        "observed_win_rate": 0.6510067114093959
+      },
+      {
+        "N": 10,
+        "W": 6,
+        "absolute_gap": 0.10853370641999993,
+        "bin": "[0.7, 0.8)",
+        "mean_probability": 0.7085337064199999,
+        "observed_wilson_95": [
+          0.3126695474501864,
+          0.8318224187964902
+        ],
+        "observed_win_rate": 0.6
+      },
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.8, 0.9)",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      },
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.9, 1.0]",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      }
+    ],
+    "top1_final_rows": [
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.0, 0.1)",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      },
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.1, 0.2)",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      },
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.2, 0.3)",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      },
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.3, 0.4)",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      },
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.4, 0.5)",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      },
+      {
+        "N": 3,
+        "W": 1,
+        "absolute_gap": 0.2545645342000001,
+        "bin": "[0.5, 0.6)",
+        "mean_probability": 0.5878978675333334,
+        "observed_wilson_95": [
+          0.0614903152761605,
+          0.7923450448735121
+        ],
+        "observed_win_rate": 0.3333333333333333
+      },
+      {
+        "N": 87,
+        "W": 60,
+        "absolute_gap": 0.03721451862068981,
+        "bin": "[0.6, 0.7)",
+        "mean_probability": 0.6524406537931033,
+        "observed_wilson_95": [
+          0.5861598330932992,
+          0.7771098583256103
+        ],
+        "observed_win_rate": 0.6896551724137931
+      },
+      {
+        "N": 10,
+        "W": 6,
+        "absolute_gap": 0.10853370641999993,
+        "bin": "[0.7, 0.8)",
+        "mean_probability": 0.7085337064199999,
+        "observed_wilson_95": [
+          0.3126695474501864,
+          0.8318224187964902
+        ],
+        "observed_win_rate": 0.6
+      },
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.8, 0.9)",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      },
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.9, 1.0]",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      }
+    ]
+  },
+  "frozen_card": {
+    "alpha": 0.10307467324665347,
+    "beta": 0.6128874176132043
+  },
+  "integrity": {
+    "arithmetic_sanity_checks": true,
+    "bin_count_sums_match": true,
+    "legacy_top1_primary_crosscheck": true,
+    "locked_evaluated_key_match": true
+  },
+  "method": "frozen chosen-side probabilities; no calibration refit or threshold selection",
+  "monthly": {
+    "all_final_locked_rows": {
+      "2025-05": {
+        "L": 182,
+        "N": 411,
+        "W": 229,
+        "accuracy": 0.5571776155717761,
+        "accuracy_wilson_95": [
+          0.5088453452745906,
+          0.6044509104528967
+        ],
+        "brier": 0.24183726007148054,
+        "log_loss": 0.6764360770587202,
+        "mean_probability": 0.5681886483338198
+      },
+      "2025-06": {
+        "L": 181,
+        "N": 397,
+        "W": 216,
+        "accuracy": 0.5440806045340051,
+        "accuracy_wilson_95": [
+          0.49489837472803916,
+          0.5924179118050952
+        ],
+        "brier": 0.2462607133979596,
+        "log_loss": 0.6855257431817938,
+        "mean_probability": 0.5669380311226699
+      },
+      "2025-07": {
+        "L": 178,
+        "N": 369,
+        "W": 191,
+        "accuracy": 0.5176151761517616,
+        "accuracy_wilson_95": [
+          0.4667116046129437,
+          0.5681557492445658
+        ],
+        "brier": 0.25030227736664484,
+        "log_loss": 0.6939128535529946,
+        "mean_probability": 0.561149050595935
+      },
+      "2025-08": {
+        "L": 81,
+        "N": 163,
+        "W": 82,
+        "accuracy": 0.5030674846625767,
+        "accuracy_wilson_95": [
+          0.4271275823408157,
+          0.5788661266622147
+        ],
+        "brier": 0.24834759161477912,
+        "log_loss": 0.6896801664753951,
+        "mean_probability": 0.5663889961766871
+      }
+    },
+    "top1_final_rows": {
+      "2025-05": {
+        "L": 10,
+        "N": 31,
+        "W": 21,
+        "accuracy": 0.6774193548387096,
+        "accuracy_wilson_95": [
+          0.5014068555995079,
+          0.8143076925268695
+        ],
+        "brier": 0.21567953044697213,
+        "log_loss": 0.6224395843156768,
+        "mean_probability": 0.6611466449580646
+      },
+      "2025-06": {
+        "L": 8,
+        "N": 30,
+        "W": 22,
+        "accuracy": 0.7333333333333333,
+        "accuracy_wilson_95": [
+          0.5555169795568831,
+          0.8581750444608938
+        ],
+        "brier": 0.19562312034070217,
+        "log_loss": 0.5808764308029295,
+        "mean_probability": 0.6572994149966667
+      },
+      "2025-07": {
+        "L": 13,
+        "N": 27,
+        "W": 14,
+        "accuracy": 0.5185185185185185,
+        "accuracy_wilson_95": [
+          0.3398532458621043,
+          0.6925704935029092
+        ],
+        "brier": 0.27429128557285903,
+        "log_loss": 0.7460439126326961,
+        "mean_probability": 0.6500646213407407
+      },
+      "2025-08": {
+        "L": 2,
+        "N": 12,
+        "W": 10,
+        "accuracy": 0.8333333333333334,
+        "accuracy_wilson_95": [
+          0.5519636426153274,
+          0.9530358523851776
+        ],
+        "brier": 0.18137850230267127,
+        "log_loss": 0.5538786260337626,
+        "mean_probability": 0.6537578605833333
+      }
+    }
+  },
+  "official_date_range": [
+    "2025-05-01",
+    "2025-08-12"
+  ],
+  "rerun_command": "PYTHONDONTWRITEBYTECODE=1 python3 scripts/analysis/v51_transfer_diagnostic.py --source-root '/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/mlb-v5-1-backtest' --json-out reports/model_readiness/2026-09-02/v51-transfer-diagnostic.json --md-out reports/model_readiness/2026-09-02/v51-transfer-diagnostic.md",
+  "schema": "V51_RETROSPECTIVE_TRANSFER_DIAGNOSTIC_V1",
+  "scopes": {
+    "all_final_locked_rows": {
+      "L": 622,
+      "N": 1340,
+      "W": 718,
+      "accuracy": 0.5358208955223881,
+      "accuracy_wilson_95": [
+        0.5090537249375656,
+        0.5623832658506346
+      ],
+      "brier": 0.24627075738049958,
+      "log_loss": 0.6855527297095908,
+      "mean_probability": 0.5656607006474623
+    },
+    "top1_final_rows": {
+      "L": 33,
+      "N": 100,
+      "W": 67,
+      "accuracy": 0.67,
+      "accuracy_wilson_95": [
+        0.5730516033971139,
+        0.7543701620610456
+      ],
+      "brier": 0.22137165792176453,
+      "log_loss": 0.6351164919136184,
+      "mean_probability": 0.6561136754680001
+    }
+  },
+  "source_digests": {
+    "evaluated": "db2b6276396a9d5f24a512bbf684ab6bafa0285e34161a434deaf5054bf2ec76",
+    "locked": "bbe584cf0fe3d193b4ad13ee58bdf1a6f9026de7c1ad221ba09d06ff48069dcb",
+    "model_card": "9bad89b9f4896a8f8862d3c304fd605921eca2d825fc2340bf51da01f7912759",
+    "training_edges": "66cfe5db414c76c625de316556236a172ce0e5db71e28fefc390576438e41318"
+  },
+  "source_paths": {
+    "evaluated": "data/v5_1_bt/outcomes/evaluated/evaluated_predictions.jsonl",
+    "locked": "data/v5_1_bt/locked/predictions.jsonl",
+    "model_card": "audit/v5_1_bt/model_card.json",
+    "training_edges": "data/v5_1_bt/calibration/training_edges.jsonl"
+  },
+  "source_root": "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/mlb-v5-1-backtest"
+}

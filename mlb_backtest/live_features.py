@@ -25,6 +25,9 @@ from .live_sources import (
 )
 from .live_top3_contracts import FinalGameObservation, LiveHistoryBundle
 from .statcast import StatcastData
+from .competition_policy import CompetitionPolicy, REGULAR_SEASON_V1, POSTSEASON_ML_RESEARCH_V1, policy_identity, validate_competition_policy
+from .live_history import ResearchLiveHistoryBundle, validate_research_history_authority
+from .source_parsers.statcast import is_completed_pa_row
 
 
 _PREPARED_AUTHORITY_SEAL = object()
@@ -235,6 +238,7 @@ class _SealedFeatureHistory(FeatureHistory):
 def _validate_history(
     bundle: LiveHistoryBundle,
     venue_by_name: Mapping[str, Mapping[str, object]],
+    competition_policy: CompetitionPolicy = REGULAR_SEASON_V1,
 ) -> FeatureHistory:
     history = bundle.feature_history
     if not isinstance(history, FeatureHistory):
@@ -280,6 +284,7 @@ def _validate_history(
                 not isinstance(raw_day, str)
                 or row_day.isoformat() != raw_day
                 or row_day > cutoff
+                or competition_policy == POSTSEASON_ML_RESEARCH_V1 and row_day.year != cutoff.year
                 or schedule_kind and result_fields & set(row)
             ):
                 _fail("AS_OF_VIOLATION")
@@ -335,14 +340,47 @@ class PreparedLiveFeatureHistory:
     venue_by_id: Mapping[int, Mapping[str, object]]
     venue_by_name: Mapping[str, Mapping[str, object]]
     _seal: object = field(default=None, repr=False, compare=False)
+    _competition_policy: CompetitionPolicy = field(default=REGULAR_SEASON_V1, repr=False)
 
 
 def prepare_live_feature_history(
-    bundle: LiveHistoryBundle, *, target_game_pks: tuple[int, ...]
+    bundle: LiveHistoryBundle | ResearchLiveHistoryBundle, *, target_game_pks: tuple[int, ...],
+    competition_policy: CompetitionPolicy = REGULAR_SEASON_V1,
 ) -> PreparedLiveFeatureHistory:
     """Validate and rebuild raw D-1 authority once for a sealed target slate."""
-    if not isinstance(bundle, LiveHistoryBundle):
+    competition_policy = validate_competition_policy(competition_policy)
+    expected_bundle = LiveHistoryBundle if competition_policy == REGULAR_SEASON_V1 else ResearchLiveHistoryBundle
+    if not isinstance(bundle, expected_bundle):
+        if competition_policy == POSTSEASON_ML_RESEARCH_V1:
+            _fail('RESEARCH_HISTORY_POLICY_MISMATCH')
         _fail("INVALID_HISTORY_BUNDLE")
+    if competition_policy == POSTSEASON_ML_RESEARCH_V1:
+        authority = validate_research_history_authority(bundle.cache_authority, bundle.cutoff_date)
+        for binding in bundle.source_bindings:
+            identity = json.loads(binding.query_identity_json)
+            if any(identity.get(key) != value for key, value in policy_identity(competition_policy).items()):
+                _fail('RESEARCH_HISTORY_POLICY_MISMATCH')
+            if binding.binding_role in {'HISTORY_SCHEDULE','HISTORY_STATCAST'} and (identity.get('coverage') != authority['coverage'] or identity.get('coverage_sha256') != authority['coverage_sha256']):
+                _fail('RESEARCH_HISTORY_COVERAGE_BINDING_MISMATCH')
+        expected_games = {row['game_pk']: row for row in authority['coverage']['game_identities'] if row['game_pk'] in authority['coverage']['played_game_pks']}
+        actual = {row['game_pk'] for row in bundle.feature_history.pitches}
+        schedule_rows = bundle.feature_history.schedule_history.rows
+        if actual != set(expected_games) or {row['game_pk'] for row in schedule_rows} != set(expected_games):
+            _fail('RESEARCH_HISTORY_COVERAGE_MISMATCH')
+        for row in (*bundle.feature_history.pitches, *bundle.feature_history.plate_appearances):
+            if row.get('game_pk') not in expected_games:
+                _fail('RESEARCH_HISTORY_COVERAGE_MISMATCH')
+            official = expected_games[row['game_pk']]
+            if row.get('game_date') != official['official_date'] or row.get('game_type') != official['game_type']:
+                _fail('RESEARCH_HISTORY_POPULATION_MISMATCH')
+        for row in schedule_rows:
+            official = expected_games[row['game_pk']]
+            if any(row.get(key) != official[key] for key in ('official_date','game_type','away_team_id','home_team_id')):
+                _fail('RESEARCH_HISTORY_COVERAGE_IDENTITY_MISMATCH')
+        expected_terminal = {str(row['event_id']): dict(row) for row in bundle.feature_history.pitches if is_completed_pa_row(row)}
+        actual_terminal = {str(row['event_id']): dict(row) for row in bundle.feature_history.plate_appearances}
+        if expected_terminal != actual_terminal or len(actual_terminal) != len(bundle.feature_history.plate_appearances):
+            _fail('RESEARCH_HISTORY_TERMINAL_COVERAGE_MISMATCH')
     if (
         not isinstance(target_game_pks, tuple)
         or any(type(game_pk) is not int or game_pk <= 0 for game_pk in target_game_pks)
@@ -353,7 +391,7 @@ def prepare_live_feature_history(
     venue_by_id, venue_by_name = _prepare_venue_authority(
         bundle.venue_references
     )
-    history = _validate_history(bundle, venue_by_name)
+    history = _validate_history(bundle, venue_by_name, competition_policy)
     historical_game_pks = (
         history.pitch_game_pks
         | history.pa_game_pks
@@ -368,6 +406,7 @@ def prepare_live_feature_history(
         _detach_history_value(venue_by_id),
         _detach_history_value(venue_by_name),
         _PREPARED_AUTHORITY_SEAL,
+        competition_policy,
     )
 
 
@@ -445,45 +484,19 @@ def _adapt_game(
     return adapted
 
 
-def build_live_raw_game_features(
+def _build_raw_game_features(
     participants: PregameParticipants,
-    final_observation: FinalGameObservation,
+    game: Mapping[str, object],
     history_bundle: LiveHistoryBundle,
     career_bf_total_by_pitcher: Mapping[int, int],
     *,
-    prepared_history: PreparedLiveFeatureHistory | None = None,
+    game_pk: int,
+    prepared_history: PreparedLiveFeatureHistory | None,
+    starter_provenance: str,
+    lineup_provenance: str,
+    competition_policy: CompetitionPolicy = REGULAR_SEASON_V1,
 ) -> dict[str, object]:
-    """Build one live raw row from authenticated pregame and exact D-1 inputs."""
-    if not isinstance(participants, PregameParticipants):
-        _fail("INVALID_PREGAME_PARTICIPANTS")
-    if not isinstance(final_observation, FinalGameObservation):
-        _fail("INVALID_FINAL_OBSERVATION")
-    if not isinstance(history_bundle, LiveHistoryBundle):
-        _fail("INVALID_HISTORY_BUNDLE")
-    game = final_observation.projected_game
-    if set(game) != set(_LIVE_SCHEDULE_FIELDS):
-        _fail("INVALID_FINAL_GAME_PROJECTION")
-    if any(game.get(f"{side}_lineup") for side in ("away", "home")):
-        _fail("TARGET_PARTICIPANT_LEAKAGE")
-    if final_observation.target_date != history_bundle.target_date:
-        _fail("TARGET_DATE_MISMATCH")
-    if game.get("official_date") != history_bundle.target_date:
-        _fail("TARGET_DATE_MISMATCH")
-    try:
-        final_identity = json.loads(
-            final_observation.source_binding.query_identity_json
-        )
-    except (TypeError, json.JSONDecodeError):
-        _fail("FINAL_BINDING_IDENTITY_MISMATCH")
-    if (
-        not isinstance(final_identity, Mapping)
-        or final_identity.get("target_date") != history_bundle.target_date
-    ):
-        _fail("FINAL_BINDING_IDENTITY_MISMATCH")
-    if game.get("game_type") != "R":
-        _fail("INVALID_GAME_TYPE")
-    if game.get("status") not in ACCEPTED_PREGAME_STATUSES:
-        _fail("PREGAME_STATUS_NOT_ACCEPTED")
+    """Validate shared D-1 authority and construct raw components."""
     if not _canonical_start(game.get("scheduled_start_utc")):
         _fail("INVALID_SCHEDULED_START_UTC")
     if (
@@ -507,20 +520,21 @@ def build_live_raw_game_features(
         _fail("TEAM_IDENTITY_MISMATCH")
     starter_ids = _validate_participants(participants, game)
     career_bf = _validate_career_bf(career_bf_total_by_pitcher, starter_ids)
-    legacy_preparation = prepared_history is None
-    if legacy_preparation:
+    if prepared_history is None:
         venue, _venue_by_name = _validate_venue_references(
             game, history_bundle.venue_references
         )
         prepared_history = prepare_live_feature_history(
             history_bundle,
-            target_game_pks=(final_observation.game_pk,),
+            target_game_pks=(game_pk,),
+            competition_policy=competition_policy,
         )
     elif (
         not isinstance(prepared_history, PreparedLiveFeatureHistory)
         or prepared_history._seal is not _PREPARED_AUTHORITY_SEAL
         or prepared_history._bundle is not history_bundle
-        or final_observation.game_pk not in prepared_history.target_game_pks
+        or game_pk not in prepared_history.target_game_pks
+        or prepared_history._competition_policy != competition_policy
     ):
         _fail("INVALID_PREPARED_HISTORY")
     else:
@@ -546,15 +560,111 @@ def build_live_raw_game_features(
         history_bundle.team_code_by_name,
         resolved_era,
         starter_ids=starter_ids,
-        starter_provenance="PROBABLE_CONSISTENT",
-        lineup_provenance="OBSERVED_PREGAME_LINEUP",
+        starter_provenance=starter_provenance,
+        lineup_provenance=lineup_provenance,
         league_era_provenance=era_provenance,
         career_bf_total_by_pitcher=career_bf,
+    )
+
+
+def build_live_raw_game_features(
+    participants: PregameParticipants,
+    final_observation: FinalGameObservation,
+    history_bundle: LiveHistoryBundle,
+    career_bf_total_by_pitcher: Mapping[int, int],
+    *,
+    prepared_history: PreparedLiveFeatureHistory | None = None,
+    competition_policy: CompetitionPolicy = REGULAR_SEASON_V1,
+) -> dict[str, object]:
+    """Build one live raw row from authenticated pregame and exact D-1 inputs."""
+    if not isinstance(participants, PregameParticipants):
+        _fail("INVALID_PREGAME_PARTICIPANTS")
+    if not isinstance(final_observation, FinalGameObservation):
+        _fail("INVALID_FINAL_OBSERVATION")
+    competition_policy = validate_competition_policy(competition_policy)
+    expected_bundle = LiveHistoryBundle if competition_policy == REGULAR_SEASON_V1 else ResearchLiveHistoryBundle
+    if not isinstance(history_bundle, expected_bundle):
+        if competition_policy == POSTSEASON_ML_RESEARCH_V1:
+            _fail('RESEARCH_HISTORY_POLICY_MISMATCH')
+        _fail("INVALID_HISTORY_BUNDLE")
+    game = final_observation.projected_game
+    if set(game) != set(_LIVE_SCHEDULE_FIELDS):
+        _fail("INVALID_FINAL_GAME_PROJECTION")
+    if any(game.get(f"{side}_lineup") for side in ("away", "home")):
+        _fail("TARGET_PARTICIPANT_LEAKAGE")
+    if final_observation.target_date != history_bundle.target_date:
+        _fail("TARGET_DATE_MISMATCH")
+    if game.get("official_date") != history_bundle.target_date:
+        _fail("TARGET_DATE_MISMATCH")
+    try:
+        final_identity = json.loads(
+            final_observation.source_binding.query_identity_json
+        )
+    except (TypeError, json.JSONDecodeError):
+        _fail("FINAL_BINDING_IDENTITY_MISMATCH")
+    if (
+        not isinstance(final_identity, Mapping)
+        or final_identity.get("target_date") != history_bundle.target_date
+        or any(final_identity.get(key) != value for key, value in policy_identity(competition_policy).items())
+        or competition_policy == POSTSEASON_ML_RESEARCH_V1 and any(final_identity.get(key) != game.get(key) for key in ('game_pk','game_type','away_team_id','home_team_id'))
+    ):
+        _fail("FINAL_BINDING_IDENTITY_MISMATCH")
+    if game.get("game_type") not in competition_policy.target_game_types:
+        _fail("INVALID_GAME_TYPE")
+    if game.get("status") not in ACCEPTED_PREGAME_STATUSES:
+        _fail("PREGAME_STATUS_NOT_ACCEPTED")
+    return _build_raw_game_features(
+        participants,
+        game,
+        history_bundle,
+        career_bf_total_by_pitcher,
+        game_pk=final_observation.game_pk,
+        prepared_history=prepared_history,
+        starter_provenance="PROBABLE_CONSISTENT",
+        lineup_provenance="OBSERVED_PREGAME_LINEUP",
+        competition_policy=competition_policy,
+    )
+
+
+def build_reconstructed_raw_game_features(
+    participants: PregameParticipants,
+    game: Mapping[str, object],
+    history_bundle: LiveHistoryBundle,
+    career_bf_total_by_pitcher: Mapping[int, int],
+    *,
+    prepared_history: PreparedLiveFeatureHistory,
+) -> dict[str, object]:
+    """Score final reconstructed participants without claiming a pregame observation."""
+    if not isinstance(participants, PregameParticipants):
+        _fail("INVALID_PREGAME_PARTICIPANTS")
+    if not isinstance(history_bundle, LiveHistoryBundle):
+        _fail("INVALID_HISTORY_BUNDLE")
+    if not isinstance(game, Mapping):
+        _fail("INVALID_FINAL_GAME_PROJECTION")
+    if game.get("official_date") != history_bundle.target_date:
+        _fail("TARGET_DATE_MISMATCH")
+    if game.get("game_type") != "R":
+        _fail("INVALID_GAME_TYPE")
+    if any(game.get(f"{side}_lineup") for side in ("away", "home")):
+        _fail("TARGET_PARTICIPANT_LEAKAGE")
+    game_pk = game.get("game_pk")
+    if type(game_pk) is not int or game_pk <= 0:
+        _fail("GAME_IDENTITY_MISMATCH")
+    return _build_raw_game_features(
+        participants,
+        game,
+        history_bundle,
+        career_bf_total_by_pitcher,
+        game_pk=game_pk,
+        prepared_history=prepared_history,
+        starter_provenance="RECONSTRUCTED_FINAL_STARTER",
+        lineup_provenance="RECONSTRUCTED_FINAL_LINEUP",
     )
 
 
 __all__ = [
     "PreparedLiveFeatureHistory",
     "build_live_raw_game_features",
+    "build_reconstructed_raw_game_features",
     "prepare_live_feature_history",
 ]

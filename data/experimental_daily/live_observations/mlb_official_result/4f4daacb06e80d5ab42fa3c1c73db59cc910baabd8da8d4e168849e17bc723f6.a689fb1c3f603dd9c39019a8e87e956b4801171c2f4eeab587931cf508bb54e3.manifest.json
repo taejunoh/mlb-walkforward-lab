@@ -1,0 +1,13 @@
+{
+  "query": {
+    "game_pk": 824066,
+    "kind": "prospective_ml_official_result",
+    "observation_id": "784f6db6b07541a0b844a346f86f0bd3",
+    "url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-05&gamePks=824066"
+  },
+  "retrieved_at_utc": "2026-09-15T23:14:22.146039+00:00",
+  "row_count": 1,
+  "schema_version": 1,
+  "sha256": "4f4daacb06e80d5ab42fa3c1c73db59cc910baabd8da8d4e168849e17bc723f6",
+  "source": "mlb_official_result"
+}

@@ -1,0 +1,7 @@
+{
+  "schema": "PROVISIONAL_MULTIBOOK_MARKET_UNAVAILABLE_V1",
+  "source_book": "DRAFTKINGS",
+  "recorded_at_utc": "2026-09-02T19:36:21.210Z",
+  "reason": "LOGIN_REQUIRED",
+  "detail": "DraftKings public page explicitly required login, so no market capture was admitted. Source observation: audit/market_observations/2026-09-02/20260902-browser-public-sources.json"
+}

@@ -1,0 +1,460 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "title": "MLB Totals vs Market — September 6",
+    "surface": "report",
+    "generatedAt": "2026-09-06T19:43:25.599064Z",
+    "sources": [
+      {
+        "id": "comparison",
+        "label": "오늘 내부 모델 × 저장된 DraftKings 공개 가격",
+        "path": "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix/reports/experimental_daily_totals/2026-09-06/market-comparison-20260906T194325Z/comparison.sql",
+        "query": {
+          "sql": "-- Actual SQLite comparison query for the Sept. 6, 2026 provisional totals.\n-- :model_json is the selected-candidate totals report; :quotes_json is the\n-- captured public-page observation. The latter is descriptive only and is not\n-- admitted bookmaker transport.\nWITH\ngame_labels(game_pk, matchup) AS (\n    VALUES\n        (823253, 'New York Yankees at San Diego Padres'),\n        (823091, 'Athletics at Seattle Mariners'),\n        (824552, 'Minnesota Twins at Chicago White Sox'),\n        (823903, 'Washington Nationals at Los Angeles Dodgers')\n),\nquote_game(event_id, game_pk) AS (\n    VALUES\n        ('34624714', 823253),\n        ('34624715', 823091),\n        ('34624716', 824552),\n        ('34624717', 823903)\n),\nmodel AS (\n    SELECT\n        CAST(json_extract(game.value, '$.game_pk') AS INTEGER) AS game_pk,\n        json_extract(game.value, '$.scheduled_start_utc') AS scheduled_start_utc,\n        CAST(json_extract(game.value, '$.expected_total') AS REAL) AS expected_total,\n        CAST(json_extract(game.value, '$.away_expected_runs') AS REAL) AS away_expected_runs,\n        CAST(json_extract(game.value, '$.home_expected_runs') AS REAL) AS home_expected_runs,\n        json_extract(game.value, '$.residual_samples') AS residual_samples_json\n    FROM json_each(:model_json, '$.games') AS game\n    WHERE json_extract(game.value, '$.status') = 'PROJECTED'\n),\nquotes AS (\n    SELECT\n        quote_game.game_pk,\n        json_extract(quote.value, '$.displayed_matchup') AS displayed_matchup,\n        json_extract(quote.value, '$.total.displayed_line') AS displayed_line_text,\n        CAST(replace(json_extract(quote.value, '$.total.displayed_line'), '−', '-') AS REAL) AS displayed_line,\n        CAST(replace(json_extract(quote.value, '$.total.over'), '−', '-') AS REAL) AS over_price_american,\n        CAST(replace(json_extract(quote.value, '$.total.under'), '−', '-') AS REAL) AS under_price_american,\n        json_extract(:quotes_json, '$.response_completed_at_utc') AS captured_at_utc,\n        json_extract(:quotes_json, '$.provider_quote_updated_at_utc') AS provider_quote_updated_at_utc,\n        json_extract(:quotes_json, '$.provider_quote_freshness') AS provider_quote_freshness,\n        json_extract(:quotes_json, '$.observation_status') AS observation_status\n    FROM json_each(:quotes_json, '$.rows') AS quote\n    JOIN quote_game\n      ON quote_game.event_id = json_extract(quote.value, '$.event_id')\n),\nresiduals AS (\n    SELECT\n        model.game_pk,\n        quotes.displayed_line,\n        COUNT(*) AS residual_count,\n        SUM(CASE WHEN CAST(sample.value AS REAL) > quotes.displayed_line THEN 1 ELSE 0 END) AS residual_over_count,\n        SUM(CASE WHEN CAST(sample.value AS REAL) < quotes.displayed_line THEN 1 ELSE 0 END) AS residual_under_count,\n        SUM(CASE WHEN CAST(sample.value AS REAL) = quotes.displayed_line THEN 1 ELSE 0 END) AS residual_push_count\n    FROM model\n    JOIN quotes ON quotes.game_pk = model.game_pk\n    JOIN json_each(model.residual_samples_json) AS sample\n    GROUP BY model.game_pk, quotes.displayed_line\n),\njoined AS (\n    SELECT\n        model.game_pk,\n        game_labels.matchup,\n        model.scheduled_start_utc,\n        quotes.captured_at_utc,\n        quotes.provider_quote_updated_at_utc,\n        quotes.provider_quote_freshness,\n        quotes.observation_status,\n        quotes.displayed_matchup,\n        quotes.displayed_line_text,\n        quotes.displayed_line,\n        quotes.over_price_american,\n        quotes.under_price_american,\n        model.away_expected_runs,\n        model.home_expected_runs,\n        model.expected_total,\n        model.expected_total - quotes.displayed_line AS mean_minus_line,\n        residuals.residual_count,\n        residuals.residual_over_count,\n        residuals.residual_under_count,\n        residuals.residual_push_count\n    FROM model\n    JOIN quotes ON quotes.game_pk = model.game_pk\n    JOIN game_labels ON game_labels.game_pk = model.game_pk\n    JOIN residuals ON residuals.game_pk = model.game_pk\n),\nscored AS (\n    SELECT\n        joined.*,\n        CAST(residual_over_count AS REAL) / NULLIF(residual_count, 0) AS residual_over_share,\n        CAST(residual_under_count AS REAL) / NULLIF(residual_count, 0) AS residual_under_share,\n        CAST(residual_push_count AS REAL) / NULLIF(residual_count, 0) AS residual_push_share,\n        CAST(residual_over_count AS REAL) / NULLIF(residual_over_count + residual_under_count, 0) AS conditional_over_nonpush_share,\n        CAST(residual_under_count AS REAL) / NULLIF(residual_over_count + residual_under_count, 0) AS conditional_under_nonpush_share,\n        CASE\n            WHEN over_price_american < 0 THEN -over_price_american / (-over_price_american + 100.0)\n            ELSE 100.0 / (over_price_american + 100.0)\n        END AS over_breakeven_probability,\n        CASE\n            WHEN under_price_american < 0 THEN -under_price_american / (-under_price_american + 100.0)\n            ELSE 100.0 / (under_price_american + 100.0)\n        END AS under_breakeven_probability\n    FROM joined\n)\nSELECT\n    game_pk,\n    matchup,\n    scheduled_start_utc,\n    captured_at_utc,\n    provider_quote_updated_at_utc,\n    provider_quote_freshness,\n    observation_status,\n    displayed_matchup,\n    displayed_line_text,\n    displayed_line,\n    over_price_american,\n    under_price_american,\n    away_expected_runs,\n    home_expected_runs,\n    expected_total,\n    mean_minus_line,\n    residual_count,\n    residual_over_count,\n    residual_under_count,\n    residual_push_count,\n    residual_over_share,\n    residual_under_share,\n    residual_push_share,\n    conditional_over_nonpush_share,\n    conditional_under_nonpush_share,\n    over_breakeven_probability,\n    under_breakeven_probability\nFROM scored\nORDER BY scheduled_start_utc, game_pk;\n",
+          "engine": "SQLite JSON1 (in-memory)",
+          "language": "sql",
+          "description": "실제 저장된 모델 JSON과 공개 가격 관측 JSON을 결합해 차이·잔차 표본 빈도·가격 손익분기율 계산. 비확률·비베팅 연구 비교.",
+          "filters": [
+            "Sep 6 2026",
+            "PROJECTED only",
+            "4 captured events",
+            "quote update time unknown"
+          ],
+          "metric_definitions": {
+            "mean_minus_line": "내부 예상 총점−공개 O/U 기준점(점); 기대수익 아님",
+            "conditional_share": "push 표본을 제외한 잔차 표본 빈도; 검증된 적중확률 아님",
+            "breakeven": "American odds 직접 변환; 정수 기준점에서는 push제외 승패에 대한 손익분기율"
+          },
+          "parameters": {
+            "model_json": "reports/experimental_daily_totals/2026-09-06/20260906T192716990269Z-8c8a3aedec1403e7.json",
+            "quotes_json": "reports/experimental_daily_totals/2026-09-06/market-observation-20260906T194325Z/metadata.json"
+          }
+        }
+      },
+      {
+        "id": "quote",
+        "label": "DraftKings Network 공개 페이지 관측",
+        "href": "https://dknetwork.draftkings.com/moneyline-total-spread/",
+        "path": "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix/reports/experimental_daily_totals/2026-09-06/market-observation-20260906T194325Z/metadata.json"
+      },
+      {
+        "id": "model",
+        "label": "9월 6일 내부 예상 총점",
+        "path": "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix/reports/experimental_daily_totals/2026-09-06/20260906T192716990269Z-8c8a3aedec1403e7.json"
+      }
+    ],
+    "blocks": [
+      {
+        "id": "title",
+        "type": "markdown",
+        "body": "# MLB Totals vs Market — September 6"
+      },
+      {
+        "id": "summary",
+        "type": "markdown",
+        "body": "## Executive Summary\n\n**실제 공개 기준점·가격과 내부 모델을 비교했습니다. 최종 베팅은 네 경기 모두 PASS입니다.** ATH–SEA는 오버 쪽에 큰 설명상 차이가 있지만, 이를 검증된 적중확률·수익 우위로 볼 수 없습니다.\n\n**관측은 뉴욕 9월 6일 오후 3시 43분입니다.** DraftKings 공개 페이지를 저장했지만 북의 가격 갱신 시각과 실제 주문 가능 가격은 확인되지 않았습니다. 1개 북 기준으로 비교했으며, 추가 북이 없다는 이유로 보류한 것은 아닙니다."
+      },
+      {
+        "id": "comparison-note",
+        "type": "markdown",
+        "body": "## ATH–SEA의 차이가 가장 크지만 베팅 신호는 아닙니다\n\n차이는 내부 예상 총점에서 공개 기준점을 뺀 값입니다. 네 경기 모두 양수지만 평균만으로 오버를 선택하면 안 됩니다. 평균과 기준점을 넘는 표본 빈도는 다르고, 비용인 배당도 함께 봐야 합니다. 차트는 차이의 크기만 보여주며 예상 수익이나 확신도를 보여주지 않습니다."
+      },
+      {
+        "id": "difference-chart",
+        "type": "chart",
+        "chartId": "difference"
+      },
+      {
+        "id": "quotes-table",
+        "type": "table",
+        "tableId": "quotes"
+      },
+      {
+        "id": "support-note",
+        "type": "markdown",
+        "body": "## 평균이 기준점보다 높아도 오버 표본이 더 많지는 않습니다\n\n아래 비중은 769개 개발 잔차로 만든 결과 표본의 빈도입니다. **보정된 적중확률이 아닙니다.** 7점·8점 같은 정수 기준점은 같은 점수가 나오는 push 표본을 빼고 승패 표본끼리 비교했습니다. 가격 손익분기율은 배당의 산술 변환일 뿐입니다.\n\nNYY–SD와 MIN–CWS는 이 단순 표본 비교에서도 양쪽 모두 가격 손익분기율에 못 미칩니다. ATH–SEA의 오버 쪽과 WSH–LAD의 언더 쪽에서 표본 비중이 높게 보이더라도, 모델 보정과 가격 유효성 검증이 없어 추천으로 올리지 않습니다."
+      },
+      {
+        "id": "support-table",
+        "type": "table",
+        "tableId": "support"
+      },
+      {
+        "id": "limitations",
+        "type": "markdown",
+        "body": "## 무엇을 검증했고 무엇이 남았나\n\n저장한 페이지의 해시와 가격 추출, 네 경기 연결, 표본 수·비중·합계 계산을 교차 확인했습니다. 내부 모델은 9월 5일까지의 팀 득실점·구장 기록을 사용하며 선발·라인업·날씨를 반영하지 않습니다. 별도 최종 417경기 평균 절대오차 3.47점은 총점 진단 수치이지 베팅 검증 결과가 아닙니다.\n\n이번 관측은 정식 배당 입력으로 승인된 자료가 아닌 별도 연구 기록입니다. 제공자 갱신 시각은 미확인이고, 경기 시작 뒤에는 사전 베팅 자료로 재사용하면 안 됩니다."
+      },
+      {
+        "id": "next",
+        "type": "markdown",
+        "body": "## 다음 작업은 배당 입력 연결과 독립 검증입니다\n\n1. 한 북의 실제 가격·제공자 시각·경기 전체 일정을 저장해 기존 평가기에 연결합니다. 과거 날짜에 고정된 검증 기준은 덮어쓰지 않습니다.\n2. 보정에 사용하지 않은 시간순 표본에서 총점 초과·미만·push 비중을 검증합니다. 오늘 결과로 오늘 판단을 바꾸지 않습니다.\n3. 앞으로의 사전 관측과 공식 결과를 연결해 배당 대비 성능을 누적합니다. 과거 시작 전 가격이 없으면 소급해서 만들지 않습니다.\n\n핵심 미해결 질문은 ‘잔차 표본 비중이 실제 적중률로 재현되는가’와 ‘실제 체결 가능한 가격에서도 차이가 유지되는가’입니다."
+      }
+    ],
+    "charts": [
+      {
+        "id": "difference",
+        "type": "bar",
+        "title": "내부 예상 총점 − 공개 기준점",
+        "dataset": "comparison",
+        "sourceId": "comparison",
+        "source": {
+          "id": "comparison",
+          "label": "오늘 내부 모델 × 저장된 DraftKings 공개 가격",
+          "path": "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix/reports/experimental_daily_totals/2026-09-06/market-comparison-20260906T194325Z/comparison.sql",
+          "query": {
+            "sql": "-- Actual SQLite comparison query for the Sept. 6, 2026 provisional totals.\n-- :model_json is the selected-candidate totals report; :quotes_json is the\n-- captured public-page observation. The latter is descriptive only and is not\n-- admitted bookmaker transport.\nWITH\ngame_labels(game_pk, matchup) AS (\n    VALUES\n        (823253, 'New York Yankees at San Diego Padres'),\n        (823091, 'Athletics at Seattle Mariners'),\n        (824552, 'Minnesota Twins at Chicago White Sox'),\n        (823903, 'Washington Nationals at Los Angeles Dodgers')\n),\nquote_game(event_id, game_pk) AS (\n    VALUES\n        ('34624714', 823253),\n        ('34624715', 823091),\n        ('34624716', 824552),\n        ('34624717', 823903)\n),\nmodel AS (\n    SELECT\n        CAST(json_extract(game.value, '$.game_pk') AS INTEGER) AS game_pk,\n        json_extract(game.value, '$.scheduled_start_utc') AS scheduled_start_utc,\n        CAST(json_extract(game.value, '$.expected_total') AS REAL) AS expected_total,\n        CAST(json_extract(game.value, '$.away_expected_runs') AS REAL) AS away_expected_runs,\n        CAST(json_extract(game.value, '$.home_expected_runs') AS REAL) AS home_expected_runs,\n        json_extract(game.value, '$.residual_samples') AS residual_samples_json\n    FROM json_each(:model_json, '$.games') AS game\n    WHERE json_extract(game.value, '$.status') = 'PROJECTED'\n),\nquotes AS (\n    SELECT\n        quote_game.game_pk,\n        json_extract(quote.value, '$.displayed_matchup') AS displayed_matchup,\n        json_extract(quote.value, '$.total.displayed_line') AS displayed_line_text,\n        CAST(replace(json_extract(quote.value, '$.total.displayed_line'), '−', '-') AS REAL) AS displayed_line,\n        CAST(replace(json_extract(quote.value, '$.total.over'), '−', '-') AS REAL) AS over_price_american,\n        CAST(replace(json_extract(quote.value, '$.total.under'), '−', '-') AS REAL) AS under_price_american,\n        json_extract(:quotes_json, '$.response_completed_at_utc') AS captured_at_utc,\n        json_extract(:quotes_json, '$.provider_quote_updated_at_utc') AS provider_quote_updated_at_utc,\n        json_extract(:quotes_json, '$.provider_quote_freshness') AS provider_quote_freshness,\n        json_extract(:quotes_json, '$.observation_status') AS observation_status\n    FROM json_each(:quotes_json, '$.rows') AS quote\n    JOIN quote_game\n      ON quote_game.event_id = json_extract(quote.value, '$.event_id')\n),\nresiduals AS (\n    SELECT\n        model.game_pk,\n        quotes.displayed_line,\n        COUNT(*) AS residual_count,\n        SUM(CASE WHEN CAST(sample.value AS REAL) > quotes.displayed_line THEN 1 ELSE 0 END) AS residual_over_count,\n        SUM(CASE WHEN CAST(sample.value AS REAL) < quotes.displayed_line THEN 1 ELSE 0 END) AS residual_under_count,\n        SUM(CASE WHEN CAST(sample.value AS REAL) = quotes.displayed_line THEN 1 ELSE 0 END) AS residual_push_count\n    FROM model\n    JOIN quotes ON quotes.game_pk = model.game_pk\n    JOIN json_each(model.residual_samples_json) AS sample\n    GROUP BY model.game_pk, quotes.displayed_line\n),\njoined AS (\n    SELECT\n        model.game_pk,\n        game_labels.matchup,\n        model.scheduled_start_utc,\n        quotes.captured_at_utc,\n        quotes.provider_quote_updated_at_utc,\n        quotes.provider_quote_freshness,\n        quotes.observation_status,\n        quotes.displayed_matchup,\n        quotes.displayed_line_text,\n        quotes.displayed_line,\n        quotes.over_price_american,\n        quotes.under_price_american,\n        model.away_expected_runs,\n        model.home_expected_runs,\n        model.expected_total,\n        model.expected_total - quotes.displayed_line AS mean_minus_line,\n        residuals.residual_count,\n        residuals.residual_over_count,\n        residuals.residual_under_count,\n        residuals.residual_push_count\n    FROM model\n    JOIN quotes ON quotes.game_pk = model.game_pk\n    JOIN game_labels ON game_labels.game_pk = model.game_pk\n    JOIN residuals ON residuals.game_pk = model.game_pk\n),\nscored AS (\n    SELECT\n        joined.*,\n        CAST(residual_over_count AS REAL) / NULLIF(residual_count, 0) AS residual_over_share,\n        CAST(residual_under_count AS REAL) / NULLIF(residual_count, 0) AS residual_under_share,\n        CAST(residual_push_count AS REAL) / NULLIF(residual_count, 0) AS residual_push_share,\n        CAST(residual_over_count AS REAL) / NULLIF(residual_over_count + residual_under_count, 0) AS conditional_over_nonpush_share,\n        CAST(residual_under_count AS REAL) / NULLIF(residual_over_count + residual_under_count, 0) AS conditional_under_nonpush_share,\n        CASE\n            WHEN over_price_american < 0 THEN -over_price_american / (-over_price_american + 100.0)\n            ELSE 100.0 / (over_price_american + 100.0)\n        END AS over_breakeven_probability,\n        CASE\n            WHEN under_price_american < 0 THEN -under_price_american / (-under_price_american + 100.0)\n            ELSE 100.0 / (under_price_american + 100.0)\n        END AS under_breakeven_probability\n    FROM joined\n)\nSELECT\n    game_pk,\n    matchup,\n    scheduled_start_utc,\n    captured_at_utc,\n    provider_quote_updated_at_utc,\n    provider_quote_freshness,\n    observation_status,\n    displayed_matchup,\n    displayed_line_text,\n    displayed_line,\n    over_price_american,\n    under_price_american,\n    away_expected_runs,\n    home_expected_runs,\n    expected_total,\n    mean_minus_line,\n    residual_count,\n    residual_over_count,\n    residual_under_count,\n    residual_push_count,\n    residual_over_share,\n    residual_under_share,\n    residual_push_share,\n    conditional_over_nonpush_share,\n    conditional_under_nonpush_share,\n    over_breakeven_probability,\n    under_breakeven_probability\nFROM scored\nORDER BY scheduled_start_utc, game_pk;\n",
+            "engine": "SQLite JSON1 (in-memory)",
+            "language": "sql",
+            "description": "실제 저장된 모델 JSON과 공개 가격 관측 JSON을 결합해 차이·잔차 표본 빈도·가격 손익분기율 계산. 비확률·비베팅 연구 비교.",
+            "filters": [
+              "Sep 6 2026",
+              "PROJECTED only",
+              "4 captured events",
+              "quote update time unknown"
+            ],
+            "metric_definitions": {
+              "mean_minus_line": "내부 예상 총점−공개 O/U 기준점(점); 기대수익 아님",
+              "conditional_share": "push 표본을 제외한 잔차 표본 빈도; 검증된 적중확률 아님",
+              "breakeven": "American odds 직접 변환; 정수 기준점에서는 push제외 승패에 대한 손익분기율"
+            },
+            "parameters": {
+              "model_json": "reports/experimental_daily_totals/2026-09-06/20260906T192716990269Z-8c8a3aedec1403e7.json",
+              "quotes_json": "reports/experimental_daily_totals/2026-09-06/market-observation-20260906T194325Z/metadata.json"
+            }
+          }
+        },
+        "encodings": {
+          "x": {
+            "field": "matchup_short",
+            "type": "nominal"
+          },
+          "y": {
+            "field": "mean_minus_line",
+            "type": "quantitative",
+            "label": "차이",
+            "unit": "점"
+          }
+        },
+        "settings": {
+          "orientation": "horizontal",
+          "groupMode": "single",
+          "showValues": true
+        },
+        "labels": {
+          "values": "all"
+        },
+        "valueFormat": "number",
+        "unit": "점",
+        "layout": "full"
+      }
+    ],
+    "tables": [
+      {
+        "id": "quotes",
+        "title": "관측 가격과 내부 예상치",
+        "dataset": "comparison",
+        "sourceId": "comparison",
+        "source": {
+          "id": "comparison",
+          "label": "오늘 내부 모델 × 저장된 DraftKings 공개 가격",
+          "path": "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix/reports/experimental_daily_totals/2026-09-06/market-comparison-20260906T194325Z/comparison.sql",
+          "query": {
+            "sql": "-- Actual SQLite comparison query for the Sept. 6, 2026 provisional totals.\n-- :model_json is the selected-candidate totals report; :quotes_json is the\n-- captured public-page observation. The latter is descriptive only and is not\n-- admitted bookmaker transport.\nWITH\ngame_labels(game_pk, matchup) AS (\n    VALUES\n        (823253, 'New York Yankees at San Diego Padres'),\n        (823091, 'Athletics at Seattle Mariners'),\n        (824552, 'Minnesota Twins at Chicago White Sox'),\n        (823903, 'Washington Nationals at Los Angeles Dodgers')\n),\nquote_game(event_id, game_pk) AS (\n    VALUES\n        ('34624714', 823253),\n        ('34624715', 823091),\n        ('34624716', 824552),\n        ('34624717', 823903)\n),\nmodel AS (\n    SELECT\n        CAST(json_extract(game.value, '$.game_pk') AS INTEGER) AS game_pk,\n        json_extract(game.value, '$.scheduled_start_utc') AS scheduled_start_utc,\n        CAST(json_extract(game.value, '$.expected_total') AS REAL) AS expected_total,\n        CAST(json_extract(game.value, '$.away_expected_runs') AS REAL) AS away_expected_runs,\n        CAST(json_extract(game.value, '$.home_expected_runs') AS REAL) AS home_expected_runs,\n        json_extract(game.value, '$.residual_samples') AS residual_samples_json\n    FROM json_each(:model_json, '$.games') AS game\n    WHERE json_extract(game.value, '$.status') = 'PROJECTED'\n),\nquotes AS (\n    SELECT\n        quote_game.game_pk,\n        json_extract(quote.value, '$.displayed_matchup') AS displayed_matchup,\n        json_extract(quote.value, '$.total.displayed_line') AS displayed_line_text,\n        CAST(replace(json_extract(quote.value, '$.total.displayed_line'), '−', '-') AS REAL) AS displayed_line,\n        CAST(replace(json_extract(quote.value, '$.total.over'), '−', '-') AS REAL) AS over_price_american,\n        CAST(replace(json_extract(quote.value, '$.total.under'), '−', '-') AS REAL) AS under_price_american,\n        json_extract(:quotes_json, '$.response_completed_at_utc') AS captured_at_utc,\n        json_extract(:quotes_json, '$.provider_quote_updated_at_utc') AS provider_quote_updated_at_utc,\n        json_extract(:quotes_json, '$.provider_quote_freshness') AS provider_quote_freshness,\n        json_extract(:quotes_json, '$.observation_status') AS observation_status\n    FROM json_each(:quotes_json, '$.rows') AS quote\n    JOIN quote_game\n      ON quote_game.event_id = json_extract(quote.value, '$.event_id')\n),\nresiduals AS (\n    SELECT\n        model.game_pk,\n        quotes.displayed_line,\n        COUNT(*) AS residual_count,\n        SUM(CASE WHEN CAST(sample.value AS REAL) > quotes.displayed_line THEN 1 ELSE 0 END) AS residual_over_count,\n        SUM(CASE WHEN CAST(sample.value AS REAL) < quotes.displayed_line THEN 1 ELSE 0 END) AS residual_under_count,\n        SUM(CASE WHEN CAST(sample.value AS REAL) = quotes.displayed_line THEN 1 ELSE 0 END) AS residual_push_count\n    FROM model\n    JOIN quotes ON quotes.game_pk = model.game_pk\n    JOIN json_each(model.residual_samples_json) AS sample\n    GROUP BY model.game_pk, quotes.displayed_line\n),\njoined AS (\n    SELECT\n        model.game_pk,\n        game_labels.matchup,\n        model.scheduled_start_utc,\n        quotes.captured_at_utc,\n        quotes.provider_quote_updated_at_utc,\n        quotes.provider_quote_freshness,\n        quotes.observation_status,\n        quotes.displayed_matchup,\n        quotes.displayed_line_text,\n        quotes.displayed_line,\n        quotes.over_price_american,\n        quotes.under_price_american,\n        model.away_expected_runs,\n        model.home_expected_runs,\n        model.expected_total,\n        model.expected_total - quotes.displayed_line AS mean_minus_line,\n        residuals.residual_count,\n        residuals.residual_over_count,\n        residuals.residual_under_count,\n        residuals.residual_push_count\n    FROM model\n    JOIN quotes ON quotes.game_pk = model.game_pk\n    JOIN game_labels ON game_labels.game_pk = model.game_pk\n    JOIN residuals ON residuals.game_pk = model.game_pk\n),\nscored AS (\n    SELECT\n        joined.*,\n        CAST(residual_over_count AS REAL) / NULLIF(residual_count, 0) AS residual_over_share,\n        CAST(residual_under_count AS REAL) / NULLIF(residual_count, 0) AS residual_under_share,\n        CAST(residual_push_count AS REAL) / NULLIF(residual_count, 0) AS residual_push_share,\n        CAST(residual_over_count AS REAL) / NULLIF(residual_over_count + residual_under_count, 0) AS conditional_over_nonpush_share,\n        CAST(residual_under_count AS REAL) / NULLIF(residual_over_count + residual_under_count, 0) AS conditional_under_nonpush_share,\n        CASE\n            WHEN over_price_american < 0 THEN -over_price_american / (-over_price_american + 100.0)\n            ELSE 100.0 / (over_price_american + 100.0)\n        END AS over_breakeven_probability,\n        CASE\n            WHEN under_price_american < 0 THEN -under_price_american / (-under_price_american + 100.0)\n            ELSE 100.0 / (under_price_american + 100.0)\n        END AS under_breakeven_probability\n    FROM joined\n)\nSELECT\n    game_pk,\n    matchup,\n    scheduled_start_utc,\n    captured_at_utc,\n    provider_quote_updated_at_utc,\n    provider_quote_freshness,\n    observation_status,\n    displayed_matchup,\n    displayed_line_text,\n    displayed_line,\n    over_price_american,\n    under_price_american,\n    away_expected_runs,\n    home_expected_runs,\n    expected_total,\n    mean_minus_line,\n    residual_count,\n    residual_over_count,\n    residual_under_count,\n    residual_push_count,\n    residual_over_share,\n    residual_under_share,\n    residual_push_share,\n    conditional_over_nonpush_share,\n    conditional_under_nonpush_share,\n    over_breakeven_probability,\n    under_breakeven_probability\nFROM scored\nORDER BY scheduled_start_utc, game_pk;\n",
+            "engine": "SQLite JSON1 (in-memory)",
+            "language": "sql",
+            "description": "실제 저장된 모델 JSON과 공개 가격 관측 JSON을 결합해 차이·잔차 표본 빈도·가격 손익분기율 계산. 비확률·비베팅 연구 비교.",
+            "filters": [
+              "Sep 6 2026",
+              "PROJECTED only",
+              "4 captured events",
+              "quote update time unknown"
+            ],
+            "metric_definitions": {
+              "mean_minus_line": "내부 예상 총점−공개 O/U 기준점(점); 기대수익 아님",
+              "conditional_share": "push 표본을 제외한 잔차 표본 빈도; 검증된 적중확률 아님",
+              "breakeven": "American odds 직접 변환; 정수 기준점에서는 push제외 승패에 대한 손익분기율"
+            },
+            "parameters": {
+              "model_json": "reports/experimental_daily_totals/2026-09-06/20260906T192716990269Z-8c8a3aedec1403e7.json",
+              "quotes_json": "reports/experimental_daily_totals/2026-09-06/market-observation-20260906T194325Z/metadata.json"
+            }
+          }
+        },
+        "columns": [
+          {
+            "field": "matchup_short",
+            "label": "경기"
+          },
+          {
+            "field": "mean",
+            "label": "예상 총점"
+          },
+          {
+            "field": "displayed_line",
+            "label": "기준점"
+          },
+          {
+            "field": "prices",
+            "label": "공개 O/U 가격"
+          },
+          {
+            "field": "delta",
+            "label": "평균 차이"
+          },
+          {
+            "field": "decision",
+            "label": "판정"
+          }
+        ],
+        "defaultSort": {
+          "field": "matchup_short",
+          "direction": "asc"
+        }
+      },
+      {
+        "id": "support",
+        "title": "잔차 표본 비중과 가격 손익분기율 · 확률 검증 아님",
+        "dataset": "comparison",
+        "sourceId": "comparison",
+        "source": {
+          "id": "comparison",
+          "label": "오늘 내부 모델 × 저장된 DraftKings 공개 가격",
+          "path": "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix/reports/experimental_daily_totals/2026-09-06/market-comparison-20260906T194325Z/comparison.sql",
+          "query": {
+            "sql": "-- Actual SQLite comparison query for the Sept. 6, 2026 provisional totals.\n-- :model_json is the selected-candidate totals report; :quotes_json is the\n-- captured public-page observation. The latter is descriptive only and is not\n-- admitted bookmaker transport.\nWITH\ngame_labels(game_pk, matchup) AS (\n    VALUES\n        (823253, 'New York Yankees at San Diego Padres'),\n        (823091, 'Athletics at Seattle Mariners'),\n        (824552, 'Minnesota Twins at Chicago White Sox'),\n        (823903, 'Washington Nationals at Los Angeles Dodgers')\n),\nquote_game(event_id, game_pk) AS (\n    VALUES\n        ('34624714', 823253),\n        ('34624715', 823091),\n        ('34624716', 824552),\n        ('34624717', 823903)\n),\nmodel AS (\n    SELECT\n        CAST(json_extract(game.value, '$.game_pk') AS INTEGER) AS game_pk,\n        json_extract(game.value, '$.scheduled_start_utc') AS scheduled_start_utc,\n        CAST(json_extract(game.value, '$.expected_total') AS REAL) AS expected_total,\n        CAST(json_extract(game.value, '$.away_expected_runs') AS REAL) AS away_expected_runs,\n        CAST(json_extract(game.value, '$.home_expected_runs') AS REAL) AS home_expected_runs,\n        json_extract(game.value, '$.residual_samples') AS residual_samples_json\n    FROM json_each(:model_json, '$.games') AS game\n    WHERE json_extract(game.value, '$.status') = 'PROJECTED'\n),\nquotes AS (\n    SELECT\n        quote_game.game_pk,\n        json_extract(quote.value, '$.displayed_matchup') AS displayed_matchup,\n        json_extract(quote.value, '$.total.displayed_line') AS displayed_line_text,\n        CAST(replace(json_extract(quote.value, '$.total.displayed_line'), '−', '-') AS REAL) AS displayed_line,\n        CAST(replace(json_extract(quote.value, '$.total.over'), '−', '-') AS REAL) AS over_price_american,\n        CAST(replace(json_extract(quote.value, '$.total.under'), '−', '-') AS REAL) AS under_price_american,\n        json_extract(:quotes_json, '$.response_completed_at_utc') AS captured_at_utc,\n        json_extract(:quotes_json, '$.provider_quote_updated_at_utc') AS provider_quote_updated_at_utc,\n        json_extract(:quotes_json, '$.provider_quote_freshness') AS provider_quote_freshness,\n        json_extract(:quotes_json, '$.observation_status') AS observation_status\n    FROM json_each(:quotes_json, '$.rows') AS quote\n    JOIN quote_game\n      ON quote_game.event_id = json_extract(quote.value, '$.event_id')\n),\nresiduals AS (\n    SELECT\n        model.game_pk,\n        quotes.displayed_line,\n        COUNT(*) AS residual_count,\n        SUM(CASE WHEN CAST(sample.value AS REAL) > quotes.displayed_line THEN 1 ELSE 0 END) AS residual_over_count,\n        SUM(CASE WHEN CAST(sample.value AS REAL) < quotes.displayed_line THEN 1 ELSE 0 END) AS residual_under_count,\n        SUM(CASE WHEN CAST(sample.value AS REAL) = quotes.displayed_line THEN 1 ELSE 0 END) AS residual_push_count\n    FROM model\n    JOIN quotes ON quotes.game_pk = model.game_pk\n    JOIN json_each(model.residual_samples_json) AS sample\n    GROUP BY model.game_pk, quotes.displayed_line\n),\njoined AS (\n    SELECT\n        model.game_pk,\n        game_labels.matchup,\n        model.scheduled_start_utc,\n        quotes.captured_at_utc,\n        quotes.provider_quote_updated_at_utc,\n        quotes.provider_quote_freshness,\n        quotes.observation_status,\n        quotes.displayed_matchup,\n        quotes.displayed_line_text,\n        quotes.displayed_line,\n        quotes.over_price_american,\n        quotes.under_price_american,\n        model.away_expected_runs,\n        model.home_expected_runs,\n        model.expected_total,\n        model.expected_total - quotes.displayed_line AS mean_minus_line,\n        residuals.residual_count,\n        residuals.residual_over_count,\n        residuals.residual_under_count,\n        residuals.residual_push_count\n    FROM model\n    JOIN quotes ON quotes.game_pk = model.game_pk\n    JOIN game_labels ON game_labels.game_pk = model.game_pk\n    JOIN residuals ON residuals.game_pk = model.game_pk\n),\nscored AS (\n    SELECT\n        joined.*,\n        CAST(residual_over_count AS REAL) / NULLIF(residual_count, 0) AS residual_over_share,\n        CAST(residual_under_count AS REAL) / NULLIF(residual_count, 0) AS residual_under_share,\n        CAST(residual_push_count AS REAL) / NULLIF(residual_count, 0) AS residual_push_share,\n        CAST(residual_over_count AS REAL) / NULLIF(residual_over_count + residual_under_count, 0) AS conditional_over_nonpush_share,\n        CAST(residual_under_count AS REAL) / NULLIF(residual_over_count + residual_under_count, 0) AS conditional_under_nonpush_share,\n        CASE\n            WHEN over_price_american < 0 THEN -over_price_american / (-over_price_american + 100.0)\n            ELSE 100.0 / (over_price_american + 100.0)\n        END AS over_breakeven_probability,\n        CASE\n            WHEN under_price_american < 0 THEN -under_price_american / (-under_price_american + 100.0)\n            ELSE 100.0 / (under_price_american + 100.0)\n        END AS under_breakeven_probability\n    FROM joined\n)\nSELECT\n    game_pk,\n    matchup,\n    scheduled_start_utc,\n    captured_at_utc,\n    provider_quote_updated_at_utc,\n    provider_quote_freshness,\n    observation_status,\n    displayed_matchup,\n    displayed_line_text,\n    displayed_line,\n    over_price_american,\n    under_price_american,\n    away_expected_runs,\n    home_expected_runs,\n    expected_total,\n    mean_minus_line,\n    residual_count,\n    residual_over_count,\n    residual_under_count,\n    residual_push_count,\n    residual_over_share,\n    residual_under_share,\n    residual_push_share,\n    conditional_over_nonpush_share,\n    conditional_under_nonpush_share,\n    over_breakeven_probability,\n    under_breakeven_probability\nFROM scored\nORDER BY scheduled_start_utc, game_pk;\n",
+            "engine": "SQLite JSON1 (in-memory)",
+            "language": "sql",
+            "description": "실제 저장된 모델 JSON과 공개 가격 관측 JSON을 결합해 차이·잔차 표본 빈도·가격 손익분기율 계산. 비확률·비베팅 연구 비교.",
+            "filters": [
+              "Sep 6 2026",
+              "PROJECTED only",
+              "4 captured events",
+              "quote update time unknown"
+            ],
+            "metric_definitions": {
+              "mean_minus_line": "내부 예상 총점−공개 O/U 기준점(점); 기대수익 아님",
+              "conditional_share": "push 표본을 제외한 잔차 표본 빈도; 검증된 적중확률 아님",
+              "breakeven": "American odds 직접 변환; 정수 기준점에서는 push제외 승패에 대한 손익분기율"
+            },
+            "parameters": {
+              "model_json": "reports/experimental_daily_totals/2026-09-06/20260906T192716990269Z-8c8a3aedec1403e7.json",
+              "quotes_json": "reports/experimental_daily_totals/2026-09-06/market-observation-20260906T194325Z/metadata.json"
+            }
+          }
+        },
+        "columns": [
+          {
+            "field": "matchup_short",
+            "label": "경기"
+          },
+          {
+            "field": "residual_over_count",
+            "label": "O 표본"
+          },
+          {
+            "field": "residual_under_count",
+            "label": "U 표본"
+          },
+          {
+            "field": "residual_push_count",
+            "label": "Push 표본"
+          },
+          {
+            "field": "support",
+            "label": "Push 제외 표본 비중"
+          },
+          {
+            "field": "breakeven",
+            "label": "가격 손익분기율"
+          }
+        ],
+        "defaultSort": {
+          "field": "matchup_short",
+          "direction": "asc"
+        }
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "status": "ready",
+    "generatedAt": "2026-09-06T19:43:25.599064Z",
+    "datasets": {
+      "comparison": [
+        {
+          "game_pk": 823091,
+          "matchup": "Athletics at Seattle Mariners",
+          "scheduled_start_utc": "2026-09-06T20:10:00Z",
+          "captured_at_utc": "2026-09-06T19:43:25.599064000Z",
+          "provider_quote_updated_at_utc": null,
+          "provider_quote_freshness": "UNKNOWN",
+          "observation_status": "OBSERVATION_ONLY_NOT_ADMITTED",
+          "displayed_matchup": "Athletics @ SEA Mariners",
+          "displayed_line_text": "7",
+          "displayed_line": 7,
+          "over_price_american": -117,
+          "under_price_american": -103,
+          "away_expected_runs": 5.089701417749676,
+          "home_expected_runs": 4.764468962552115,
+          "expected_total": 9.854170380301792,
+          "mean_minus_line": 2.8541703803017917,
+          "residual_count": 769,
+          "residual_over_count": 490,
+          "residual_under_count": 206,
+          "residual_push_count": 73,
+          "residual_over_share": 0.6371911573472041,
+          "residual_under_share": 0.26788036410923277,
+          "residual_push_share": 0.09492847854356307,
+          "conditional_over_nonpush_share": 0.7040229885057471,
+          "conditional_under_nonpush_share": 0.2959770114942529,
+          "over_breakeven_probability": 0.5391705069124424,
+          "under_breakeven_probability": 0.5073891625615764,
+          "matchup_short": "ATH @ SEA",
+          "mean": "9.85",
+          "delta": "+2.85",
+          "prices": "O -117 / U -103",
+          "support": "O 70.4% / U 29.6%",
+          "breakeven": "O 53.9% / U 50.7%",
+          "decision": "PASS · 연구 기록"
+        },
+        {
+          "game_pk": 823253,
+          "matchup": "New York Yankees at San Diego Padres",
+          "scheduled_start_utc": "2026-09-06T20:10:00Z",
+          "captured_at_utc": "2026-09-06T19:43:25.599064000Z",
+          "provider_quote_updated_at_utc": null,
+          "provider_quote_freshness": "UNKNOWN",
+          "observation_status": "OBSERVATION_ONLY_NOT_ADMITTED",
+          "displayed_matchup": "NY Yankees @ SD Padres",
+          "displayed_line_text": "7",
+          "displayed_line": 7,
+          "over_price_american": -105,
+          "under_price_american": -115,
+          "away_expected_runs": 3.884912966506739,
+          "home_expected_runs": 3.752120927314881,
+          "expected_total": 7.63703389382162,
+          "mean_minus_line": 0.63703389382162,
+          "residual_count": 769,
+          "residual_over_count": 345,
+          "residual_under_count": 362,
+          "residual_push_count": 62,
+          "residual_over_share": 0.4486345903771131,
+          "residual_under_share": 0.47074122236671,
+          "residual_push_share": 0.08062418725617686,
+          "conditional_over_nonpush_share": 0.48797736916548795,
+          "conditional_under_nonpush_share": 0.512022630834512,
+          "over_breakeven_probability": 0.5121951219512195,
+          "under_breakeven_probability": 0.5348837209302325,
+          "matchup_short": "NYY @ SD",
+          "mean": "7.64",
+          "delta": "+0.64",
+          "prices": "O -105 / U -115",
+          "support": "O 48.8% / U 51.2%",
+          "breakeven": "O 51.2% / U 53.5%",
+          "decision": "PASS · 연구 기록"
+        },
+        {
+          "game_pk": 824552,
+          "matchup": "Minnesota Twins at Chicago White Sox",
+          "scheduled_start_utc": "2026-09-06T22:20:00Z",
+          "captured_at_utc": "2026-09-06T19:43:25.599064000Z",
+          "provider_quote_updated_at_utc": null,
+          "provider_quote_freshness": "UNKNOWN",
+          "observation_status": "OBSERVATION_ONLY_NOT_ADMITTED",
+          "displayed_matchup": "MIN Twins @ CHI White Sox",
+          "displayed_line_text": "8.5",
+          "displayed_line": 8.5,
+          "over_price_american": -112,
+          "under_price_american": -108,
+          "away_expected_runs": 4.59551090294477,
+          "home_expected_runs": 4.77610838918251,
+          "expected_total": 9.37161929212728,
+          "mean_minus_line": 0.8716192921272796,
+          "residual_count": 769,
+          "residual_over_count": 380,
+          "residual_under_count": 389,
+          "residual_push_count": 0,
+          "residual_over_share": 0.494148244473342,
+          "residual_under_share": 0.505851755526658,
+          "residual_push_share": 0,
+          "conditional_over_nonpush_share": 0.494148244473342,
+          "conditional_under_nonpush_share": 0.505851755526658,
+          "over_breakeven_probability": 0.5283018867924528,
+          "under_breakeven_probability": 0.5192307692307693,
+          "matchup_short": "MIN @ CWS",
+          "mean": "9.37",
+          "delta": "+0.87",
+          "prices": "O -112 / U -108",
+          "support": "O 49.4% / U 50.6%",
+          "breakeven": "O 52.8% / U 51.9%",
+          "decision": "PASS · 연구 기록"
+        },
+        {
+          "game_pk": 823903,
+          "matchup": "Washington Nationals at Los Angeles Dodgers",
+          "scheduled_start_utc": "2026-09-07T02:10:00Z",
+          "captured_at_utc": "2026-09-06T19:43:25.599064000Z",
+          "provider_quote_updated_at_utc": null,
+          "provider_quote_freshness": "UNKNOWN",
+          "observation_status": "OBSERVATION_ONLY_NOT_ADMITTED",
+          "displayed_matchup": "WAS Nationals @ LA Dodgers",
+          "displayed_line_text": "8",
+          "displayed_line": 8,
+          "over_price_american": -119,
+          "under_price_american": -101,
+          "away_expected_runs": 4.2097481576294635,
+          "home_expected_runs": 4.4282739194337,
+          "expected_total": 8.638022077063162,
+          "mean_minus_line": 0.6380220770631624,
+          "residual_count": 769,
+          "residual_over_count": 345,
+          "residual_under_count": 362,
+          "residual_push_count": 62,
+          "residual_over_share": 0.4486345903771131,
+          "residual_under_share": 0.47074122236671,
+          "residual_push_share": 0.08062418725617686,
+          "conditional_over_nonpush_share": 0.48797736916548795,
+          "conditional_under_nonpush_share": 0.512022630834512,
+          "over_breakeven_probability": 0.54337899543379,
+          "under_breakeven_probability": 0.5024875621890548,
+          "matchup_short": "WSH @ LAD",
+          "mean": "8.64",
+          "delta": "+0.64",
+          "prices": "O -119 / U -101",
+          "support": "O 48.8% / U 51.2%",
+          "breakeven": "O 54.3% / U 50.2%",
+          "decision": "PASS · 연구 기록"
+        }
+      ]
+    }
+  },
+  "sources": [
+    {
+      "id": "comparison",
+      "label": "오늘 내부 모델 × 저장된 DraftKings 공개 가격",
+      "path": "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix/reports/experimental_daily_totals/2026-09-06/market-comparison-20260906T194325Z/comparison.sql",
+      "query": {
+        "sql": "-- Actual SQLite comparison query for the Sept. 6, 2026 provisional totals.\n-- :model_json is the selected-candidate totals report; :quotes_json is the\n-- captured public-page observation. The latter is descriptive only and is not\n-- admitted bookmaker transport.\nWITH\ngame_labels(game_pk, matchup) AS (\n    VALUES\n        (823253, 'New York Yankees at San Diego Padres'),\n        (823091, 'Athletics at Seattle Mariners'),\n        (824552, 'Minnesota Twins at Chicago White Sox'),\n        (823903, 'Washington Nationals at Los Angeles Dodgers')\n),\nquote_game(event_id, game_pk) AS (\n    VALUES\n        ('34624714', 823253),\n        ('34624715', 823091),\n        ('34624716', 824552),\n        ('34624717', 823903)\n),\nmodel AS (\n    SELECT\n        CAST(json_extract(game.value, '$.game_pk') AS INTEGER) AS game_pk,\n        json_extract(game.value, '$.scheduled_start_utc') AS scheduled_start_utc,\n        CAST(json_extract(game.value, '$.expected_total') AS REAL) AS expected_total,\n        CAST(json_extract(game.value, '$.away_expected_runs') AS REAL) AS away_expected_runs,\n        CAST(json_extract(game.value, '$.home_expected_runs') AS REAL) AS home_expected_runs,\n        json_extract(game.value, '$.residual_samples') AS residual_samples_json\n    FROM json_each(:model_json, '$.games') AS game\n    WHERE json_extract(game.value, '$.status') = 'PROJECTED'\n),\nquotes AS (\n    SELECT\n        quote_game.game_pk,\n        json_extract(quote.value, '$.displayed_matchup') AS displayed_matchup,\n        json_extract(quote.value, '$.total.displayed_line') AS displayed_line_text,\n        CAST(replace(json_extract(quote.value, '$.total.displayed_line'), '−', '-') AS REAL) AS displayed_line,\n        CAST(replace(json_extract(quote.value, '$.total.over'), '−', '-') AS REAL) AS over_price_american,\n        CAST(replace(json_extract(quote.value, '$.total.under'), '−', '-') AS REAL) AS under_price_american,\n        json_extract(:quotes_json, '$.response_completed_at_utc') AS captured_at_utc,\n        json_extract(:quotes_json, '$.provider_quote_updated_at_utc') AS provider_quote_updated_at_utc,\n        json_extract(:quotes_json, '$.provider_quote_freshness') AS provider_quote_freshness,\n        json_extract(:quotes_json, '$.observation_status') AS observation_status\n    FROM json_each(:quotes_json, '$.rows') AS quote\n    JOIN quote_game\n      ON quote_game.event_id = json_extract(quote.value, '$.event_id')\n),\nresiduals AS (\n    SELECT\n        model.game_pk,\n        quotes.displayed_line,\n        COUNT(*) AS residual_count,\n        SUM(CASE WHEN CAST(sample.value AS REAL) > quotes.displayed_line THEN 1 ELSE 0 END) AS residual_over_count,\n        SUM(CASE WHEN CAST(sample.value AS REAL) < quotes.displayed_line THEN 1 ELSE 0 END) AS residual_under_count,\n        SUM(CASE WHEN CAST(sample.value AS REAL) = quotes.displayed_line THEN 1 ELSE 0 END) AS residual_push_count\n    FROM model\n    JOIN quotes ON quotes.game_pk = model.game_pk\n    JOIN json_each(model.residual_samples_json) AS sample\n    GROUP BY model.game_pk, quotes.displayed_line\n),\njoined AS (\n    SELECT\n        model.game_pk,\n        game_labels.matchup,\n        model.scheduled_start_utc,\n        quotes.captured_at_utc,\n        quotes.provider_quote_updated_at_utc,\n        quotes.provider_quote_freshness,\n        quotes.observation_status,\n        quotes.displayed_matchup,\n        quotes.displayed_line_text,\n        quotes.displayed_line,\n        quotes.over_price_american,\n        quotes.under_price_american,\n        model.away_expected_runs,\n        model.home_expected_runs,\n        model.expected_total,\n        model.expected_total - quotes.displayed_line AS mean_minus_line,\n        residuals.residual_count,\n        residuals.residual_over_count,\n        residuals.residual_under_count,\n        residuals.residual_push_count\n    FROM model\n    JOIN quotes ON quotes.game_pk = model.game_pk\n    JOIN game_labels ON game_labels.game_pk = model.game_pk\n    JOIN residuals ON residuals.game_pk = model.game_pk\n),\nscored AS (\n    SELECT\n        joined.*,\n        CAST(residual_over_count AS REAL) / NULLIF(residual_count, 0) AS residual_over_share,\n        CAST(residual_under_count AS REAL) / NULLIF(residual_count, 0) AS residual_under_share,\n        CAST(residual_push_count AS REAL) / NULLIF(residual_count, 0) AS residual_push_share,\n        CAST(residual_over_count AS REAL) / NULLIF(residual_over_count + residual_under_count, 0) AS conditional_over_nonpush_share,\n        CAST(residual_under_count AS REAL) / NULLIF(residual_over_count + residual_under_count, 0) AS conditional_under_nonpush_share,\n        CASE\n            WHEN over_price_american < 0 THEN -over_price_american / (-over_price_american + 100.0)\n            ELSE 100.0 / (over_price_american + 100.0)\n        END AS over_breakeven_probability,\n        CASE\n            WHEN under_price_american < 0 THEN -under_price_american / (-under_price_american + 100.0)\n            ELSE 100.0 / (under_price_american + 100.0)\n        END AS under_breakeven_probability\n    FROM joined\n)\nSELECT\n    game_pk,\n    matchup,\n    scheduled_start_utc,\n    captured_at_utc,\n    provider_quote_updated_at_utc,\n    provider_quote_freshness,\n    observation_status,\n    displayed_matchup,\n    displayed_line_text,\n    displayed_line,\n    over_price_american,\n    under_price_american,\n    away_expected_runs,\n    home_expected_runs,\n    expected_total,\n    mean_minus_line,\n    residual_count,\n    residual_over_count,\n    residual_under_count,\n    residual_push_count,\n    residual_over_share,\n    residual_under_share,\n    residual_push_share,\n    conditional_over_nonpush_share,\n    conditional_under_nonpush_share,\n    over_breakeven_probability,\n    under_breakeven_probability\nFROM scored\nORDER BY scheduled_start_utc, game_pk;\n",
+        "engine": "SQLite JSON1 (in-memory)",
+        "language": "sql",
+        "description": "실제 저장된 모델 JSON과 공개 가격 관측 JSON을 결합해 차이·잔차 표본 빈도·가격 손익분기율 계산. 비확률·비베팅 연구 비교.",
+        "filters": [
+          "Sep 6 2026",
+          "PROJECTED only",
+          "4 captured events",
+          "quote update time unknown"
+        ],
+        "metric_definitions": {
+          "mean_minus_line": "내부 예상 총점−공개 O/U 기준점(점); 기대수익 아님",
+          "conditional_share": "push 표본을 제외한 잔차 표본 빈도; 검증된 적중확률 아님",
+          "breakeven": "American odds 직접 변환; 정수 기준점에서는 push제외 승패에 대한 손익분기율"
+        },
+        "parameters": {
+          "model_json": "reports/experimental_daily_totals/2026-09-06/20260906T192716990269Z-8c8a3aedec1403e7.json",
+          "quotes_json": "reports/experimental_daily_totals/2026-09-06/market-observation-20260906T194325Z/metadata.json"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "query": {
+    "observation_id": "092db661f3bd4821b9a5d3f8be2eb289",
+    "target_date": "2026-09-24",
+    "url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&gameType=R&startDate=2026-09-24&endDate=2026-09-24&hydrate=probablePitcher%2Cvenue"
+  },
+  "retrieved_at_utc": "2026-09-24T20:25:06.600577+00:00",
+  "row_count": 1,
+  "schema_version": 1,
+  "sha256": "a389cf7986630bcf6a756c870dca0084c59f70b6310cde562a8c7d04785971bd",
+  "source": "mlb_live_schedule"
+}

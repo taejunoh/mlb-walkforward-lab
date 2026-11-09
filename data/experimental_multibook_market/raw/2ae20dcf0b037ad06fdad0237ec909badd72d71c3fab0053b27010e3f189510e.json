@@ -1,0 +1,26 @@
+{
+  "schema": "PROVISIONAL_MULTIBOOK_MARKET_RAW_CAPTURE_V1",
+  "content_sha256": "2ae20dcf0b037ad06fdad0237ec909badd72d71c3fab0053b27010e3f189510e",
+  "source_book": "FANDUEL",
+  "captured_at_utc": "2026-09-02T19:36:21.210Z",
+  "source_url": "https://sportsbook.fanduel.com/navigation/mlb",
+  "transport_metadata": {
+    "collector": "browser_public_sources",
+    "observation_relative": "audit/market_observations/2026-09-02/20260902-browser-public-sources.json",
+    "observed_at_utc": "2026-09-02T19:36:21.210Z",
+    "unit_verification": "line_half_runs is a half-run tick; evaluator computes Fraction(line_half_runs, 2)"
+  },
+  "events": [
+    {"book_event_id":"36019406","away_team":"Philadelphia Phillies","home_team":"Arizona Diamondbacks","scheduled_start_utc":"2026-09-02T19:41:00Z","moneyline":{"away_american_odds":-130,"home_american_odds":110},"totals":[{"line_half_runs":17,"over_american_odds":-118,"under_american_odds":-104}]},
+    {"book_event_id":"36019408","away_team":"Seattle Mariners","home_team":"Boston Red Sox","scheduled_start_utc":"2026-09-02T20:11:00Z","moneyline":{"away_american_odds":122,"home_american_odds":-144},"totals":[{"line_half_runs":17,"over_american_odds":-105,"under_american_odds":-115}]},
+    {"book_event_id":"36019401","away_team":"New York Mets","home_team":"Tampa Bay Rays","scheduled_start_utc":"2026-09-02T22:41:00Z","moneyline":{"away_american_odds":144,"home_american_odds":-172},"totals":[{"line_half_runs":16,"over_american_odds":-110,"under_american_odds":-110}]},
+    {"book_event_id":"36019407","away_team":"Toronto Blue Jays","home_team":"Cleveland Guardians","scheduled_start_utc":"2026-09-02T22:41:00Z","moneyline":{"away_american_odds":-132,"home_american_odds":112},"totals":[{"line_half_runs":15,"over_american_odds":100,"under_american_odds":-122}]},
+    {"book_event_id":"36019409","away_team":"San Francisco Giants","home_team":"Pittsburgh Pirates","scheduled_start_utc":"2026-09-02T22:41:00Z","moneyline":{"away_american_odds":128,"home_american_odds":-152},"totals":[{"line_half_runs":17,"over_american_odds":-122,"under_american_odds":100}]},
+    {"book_event_id":"36019398","away_team":"Milwaukee Brewers","home_team":"Chicago Cubs","scheduled_start_utc":"2026-09-02T23:41:00Z","moneyline":{"away_american_odds":-162,"home_american_odds":136},"totals":[{"line_half_runs":17,"over_american_odds":-104,"under_american_odds":-118}]},
+    {"book_event_id":"36019399","away_team":"Detroit Tigers","home_team":"Minnesota Twins","scheduled_start_utc":"2026-09-02T23:41:00Z","moneyline":{"away_american_odds":-104,"home_american_odds":-112},"totals":[{"line_half_runs":17,"over_american_odds":-118,"under_american_odds":-104}]},
+    {"book_event_id":"36019402","away_team":"Miami Marlins","home_team":"Kansas City Royals","scheduled_start_utc":"2026-09-02T23:41:00Z","moneyline":{"away_american_odds":-104,"home_american_odds":-112},"totals":[{"line_half_runs":18,"over_american_odds":-105,"under_american_odds":-115}]},
+    {"book_event_id":"36019404","away_team":"Chicago White Sox","home_team":"Houston Astros","scheduled_start_utc":"2026-09-03T00:11:00Z","moneyline":{"away_american_odds":120,"home_american_odds":-142},"totals":[{"line_half_runs":17,"over_american_odds":-114,"under_american_odds":-106}]},
+    {"book_event_id":"36019405","away_team":"New York Yankees","home_team":"Los Angeles Angels","scheduled_start_utc":"2026-09-03T01:39:00Z","moneyline":{"away_american_odds":-166,"home_american_odds":140},"totals":[{"line_half_runs":13,"over_american_odds":-112,"under_american_odds":-108}]},
+    {"book_event_id":"36019397","away_team":"St. Louis Cardinals","home_team":"Los Angeles Dodgers","scheduled_start_utc":"2026-09-03T02:11:00Z","moneyline":{"away_american_odds":205,"home_american_odds":-250},"totals":[{"line_half_runs":15,"over_american_odds":-124,"under_american_odds":102}]}
+  ]
+}

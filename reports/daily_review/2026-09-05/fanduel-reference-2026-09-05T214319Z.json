@@ -1,0 +1,32 @@
+{
+  "source": {
+    "book": "FanDuel Sportsbook",
+    "region_host": "sbapi.ny.sportsbook.fanduel.com",
+    "endpoint_path": "/api/event-page",
+    "public_query_template_redacted": "https://sbapi.ny.sportsbook.fanduel.com/api/event-page?betexRegion=GBR&capiJurisdiction=intl&currencyCode=USD&exchangeLocale=en_US&includePrices=true&language=en&priceHistory=1&regionCode=NAMERICA&_ak=[REDACTED_PUBLIC_APP_KEY]&eventId={event_id}",
+    "note": "_ak value is redacted; it is a public app configuration key, not a private credential. NY regional host."
+  },
+  "capture": {
+    "fetch_started_at_utc": "2026-09-05T21:43:19Z",
+    "fetch_completed_at_utc": "2026-09-05T21:43:21Z",
+    "market_scope": "full-game MONEY_LINE and TOTAL_POINTS_(OVER/UNDER)",
+    "state_assertions": ["marketStatus=OPEN", "inPlay=false"],
+    "timestamp_semantics": "Observed fetch time only; no backend last-price-update timestamp is asserted.",
+    "comparison_to_previous": "All 13 normalized quotes unchanged from 2026-09-05T21:39:48Z capture. Raw response SHA-256 changed only for event 36030293 (WSH@LAD), with unchanged normalized markets."
+  },
+  "games": [
+    {"event_id":"36030294","away":"Atlanta Braves","home":"Philadelphia Phillies","away_ml":138,"home_ml":-164,"total":8.5,"over":-104,"under":-118,"raw_response_sha256":"7539ecbd8cee9c097ca9346c6f99e1b5902d9243897cd6cc4ef5cb8a33065ee9"},
+    {"event_id":"36030289","away":"Detroit Tigers","home":"Cleveland Guardians","away_ml":134,"home_ml":-158,"total":7.0,"over":-102,"under":-120,"raw_response_sha256":"c94098085460e2bfa82a3badd178152b308c81e17f046821a296556f14aa2df3"},
+    {"event_id":"36030291","away":"Los Angeles Angels","home":"Pittsburgh Pirates","away_ml":154,"home_ml":-184,"total":7.5,"over":-118,"under":-104,"raw_response_sha256":"6d12351327db7c32a82dfdbc8f8d234be3b8f8c274914d66627fd49540e2b49d"},
+    {"event_id":"36030295","away":"Milwaukee Brewers","home":"Cincinnati Reds","away_ml":-156,"home_ml":132,"total":9.0,"over":-114,"under":-106,"raw_response_sha256":"649a831dd33c83f9adf7722403663e1b37c2a6874fb70011b991af6fdf7c94d8"},
+    {"event_id":"36030298","away":"Boston Red Sox","home":"Baltimore Orioles","away_ml":-132,"home_ml":112,"total":7.5,"over":-122,"under":100,"raw_response_sha256":"910d7614d28e7a328433cb8b18c1ee37caa07fbb557182af92c12cf1d63d6399"},
+    {"event_id":"36030287","away":"Tampa Bay Rays","home":"Texas Rangers","away_ml":-108,"home_ml":-108,"total":6.5,"over":-124,"under":102,"raw_response_sha256":"d0cea3e6884d913fab7b496e1665152feff0c05c87a7da5d6317e2982b5fd62f"},
+    {"event_id":"36030296","away":"Toronto Blue Jays","home":"Kansas City Royals","away_ml":-106,"home_ml":-110,"total":9.5,"over":-105,"under":-115,"raw_response_sha256":"3143afc6bb8fa6768fa8d39795a8abba2abc5b02e12a02cfd77531ad7292db88"},
+    {"event_id":"36030297","away":"Minnesota Twins","home":"Chicago White Sox","away_ml":106,"home_ml":-124,"total":8.5,"over":100,"under":-122,"raw_response_sha256":"d13d577536aac5b16feda68e4ff84aa843205ada847461bf27be9b8154623eb5"},
+    {"event_id":"36030288","away":"Arizona Diamondbacks","home":"Houston Astros","away_ml":-108,"home_ml":-108,"total":8.5,"over":-124,"under":102,"raw_response_sha256":"5e82961d7439b5ffc577d0b75852979173fbe84582f7da263ab5a2dfc21951ff"},
+    {"event_id":"36030299","away":"New York Yankees","home":"San Diego Padres","away_ml":110,"home_ml":-130,"total":7.5,"over":-120,"under":-102,"raw_response_sha256":"7143a320e381b7bd2f44146f55bdcd1c0ff471a073849cc8f6f56cdd5ec739b9"},
+    {"event_id":"36030290","away":"St. Louis Cardinals","home":"Colorado Rockies","away_ml":-120,"home_ml":102,"total":10.5,"over":-118,"under":-104,"raw_response_sha256":"d8dab47bdb1156e40ccce559f0ddf7ae12332629e277e00e6ab491e84eb984f8"},
+    {"event_id":"36030293","away":"Washington Nationals","home":"Los Angeles Dodgers","away_ml":180,"home_ml":-215,"total":7.0,"over":-110,"under":-110,"raw_response_sha256":"74df0f0e0246e5e105853b7c725160695165e0aa582ce0d0e38b051cd6cfb86c"},
+    {"event_id":"36030300","away":"Athletics","home":"Seattle Mariners","away_ml":200,"home_ml":-245,"total":7.5,"over":-115,"under":-105,"raw_response_sha256":"4c2697830f280ec6d862347e827d9a8ce9b51b0e2653ff9c56142eeaea01e796"}
+  ]
+}

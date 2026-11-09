@@ -34,8 +34,8 @@ CARD = Path(__file__).parents[1] / "audit" / "v5_1_bt" / "model_card.json"
 HISTORY_COMPLETED = "2026-07-21T10:00:01Z"
 LIVE_COMPLETED = "2026-07-21T16:00:01Z"
 SEALED_SLATE_SHA256 = "2fce5639267743df26cc1bd036dfd275dbd613364c4ffc4fbfd083cced957684"
-GOLDEN_CONTENT_SHA256 = "0e86e97aebfa8ebcfe0a9021f65be2fbf3227aa728e44ef5216688a8caa8699b"
-GOLDEN_MARKDOWN_SHA256 = "4e2a16042bae65f0939577a954a11b8960042132d83122ab15109690dc04e6ec"
+GOLDEN_CONTENT_SHA256 = "e7567d3c68e9ca24563281c9c7e8d7b03442f6e31905a3885fa6a6a2899459ac"
+GOLDEN_MARKDOWN_SHA256 = "bc70de95a61255a611d20cca93c024959ed8eb6697ca8eab8bf6cc3d89f99393"
 
 
 class _FixedHistoryDateTime(datetime):
@@ -241,6 +241,25 @@ class SealedLiveFetcher:
             content_type="application/json", etag='"sealed"', last_modified=None,
             body=body,
         )
+
+
+class MixedInitialExclusionFetcher(SealedLiveFetcher):
+    """Make only the first current-slate game already past its start."""
+
+    def __call__(self, source: str, url: str, *, max_bytes: int) -> LiveHttpObservation:
+        observed = super().__call__(source, url, max_bytes=max_bytes)
+        if (
+            source == "stats_api"
+            and "/schedule" in url
+            and "startDate=2026-07-21" in url
+            and self.current_schedule_calls == 1
+        ):
+            payload = json.loads(observed.body)
+            payload["dates"][0]["games"][0]["gameDate"] = (
+                "2026-07-21T15:00:00Z"
+            )
+            observed = replace(observed, body=json.dumps(payload).encode())
+        return observed
 
 
 class SuccessiveObservationFetcher:
@@ -462,7 +481,6 @@ class DailyTop3EndToEndTests(unittest.TestCase):
             )
             expected_schedule_flags = {
                 "away": [
-                    "doubleheader_unsupported",
                     "home_city_unsupported",
                     "prior_innings_unsupported",
                     "rest_unsupported",
@@ -470,7 +488,6 @@ class DailyTop3EndToEndTests(unittest.TestCase):
                     "travel_neutral_missing_venue_coordinates",
                 ],
                 "home": [
-                    "doubleheader_unsupported",
                     "home_city_unsupported",
                     "prior_innings_unsupported",
                     "rest_unsupported",
@@ -730,6 +747,29 @@ class DailyTop3EndToEndTests(unittest.TestCase):
             self.assertNotEqual(first_json, middle_json)
             self.assertNotEqual(middle_json, last_json)
 
+    def test_mixed_initial_exclusion_persists_excluded_and_scored_games(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "root"
+            payload, json_path, _markdown_path, _fetcher = self.run_fixture(
+                root, fetcher=MixedInitialExclusionFetcher()
+            )
+
+            excluded = {
+                row["game_pk"]: row for row in payload["excluded_games"]
+            }
+            self.assertIn(880001, excluded)
+            self.assertEqual(
+                excluded[880001]["reason_codes"],
+                ["OBSERVATION_AT_OR_AFTER_START"],
+            )
+            self.assertIn(
+                880002, {row["game_pk"] for row in payload["preliminary_top3"]}
+            )
+            self.assertTrue(json_path.is_file())
+            self.assertEqual(json.loads(json_path.read_bytes()), payload)
+            self.assertNotIn("pick_probability", excluded[880001])
+            self.assertNotIn("rank", excluded[880001])
+
     def test_result_field_normalization_rejects_mlb_and_semantic_variants(self):
         rejected = (
             "home_score", "actual_winner", "market_odds", "isWinner",
@@ -745,7 +785,6 @@ class DailyTop3EndToEndTests(unittest.TestCase):
     def test_global_integrity_failures_write_no_ranking_report(self):
         cases = (
             ("card digest", {"tamper_card": True}, ValueError, "digest", False),
-            ("durable receipt at scheduled start", {"durable_at_start": True}, ValueError, "durable at or after", True),
             ("target-day Statcast poison", {"variant": "target_poison"}, ValueError, "same-day leakage", True),
             ("invalid history venue", {"variant": "invalid_venue"}, ValueError, "coordinates", True),
             ("incomplete current schedule", {"variant": "incomplete"}, ValueError, "scheduled games", True),

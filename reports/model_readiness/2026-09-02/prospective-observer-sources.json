@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "items": [{
+    "id": "ml-first-prospective-observer",
+    "title": "기존 경기 전 기록을 재사용하는 ML 검증 경로",
+    "queries": [{
+      "id": "existing-authority-and-gap",
+      "source": {
+        "label": "로컬 MLB 모델·시장 기록과 설계",
+        "files": [
+          {"label": "mlb_backtest/market_play_authorities.py"},
+          {"label": "mlb_backtest/daily_multibook_market_plays.py"},
+          {"label": "docs/superpowers/specs/2026-09-01-variable-multibook-market-plays-design.md"},
+          {"label": "docs/superpowers/specs/2026-09-02-prospective-ml-observation-design.md"},
+          {"label": "reports/experimental_daily/2026-09-02/20260902T18073555496Z-c39d0a281f899bbe.trace.json"},
+          {"label": "audit/market_observations/2026-09-02/generated/market-artifact-supersession.json"}
+        ],
+        "filters": ["현재 LFG 실행 작업트리의 코드·설계·경기 전 기록", "최종 경기 결과와 H24 자료는 읽지 않음"],
+        "caveats": [
+          "제안된 ML 관측·결과 연결 기능은 아직 구현하거나 활성화하지 않았습니다.",
+          "기존 기록의 저장 여부와 미래 관측 표본의 인정 여부는 다릅니다. 과거 기록을 새 사전 검증 표본으로 소급하지 않습니다.",
+          "배당이 없는 기록은 승률 검증용이며 베팅 판정이나 수익성 검증이 아닙니다."
+        ]
+      },
+      "summary": "기존 모듈은 경기 전 모델·참가자·시장 증적을 검증하고 저장합니다. 새로 필요한 범위는 ML-only 관측의 중복 없는 고정, 별도의 공식 결과 연결, 확률 성과 집계입니다. 배당·O/U 준비를 필수 조건으로 두지 않는 최소 설계를 제안합니다."
+    }]
+  }]
+}

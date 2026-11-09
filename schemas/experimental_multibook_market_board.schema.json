@@ -13,7 +13,7 @@
     "games"
   ],
   "properties": {
-    "schema": {"const": "PROVISIONAL_MULTIBOOK_MARKET_BOARD_V1"},
+    "schema": {"type": "string"},
     "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "target_date": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
     "schedule_receipt_relative": {
@@ -23,9 +23,42 @@
     "schedule_receipt_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "capture_outcomes": {
       "type": "array",
-      "minItems": 5,
-      "maxItems": 5,
       "items": {"type": "object"}
+    },
+    "capture_outcome_bindings": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["book_id", "capture_outcome_relative", "capture_outcome_sha256", "capture_outcome_sidecar_sha256"],
+        "properties": {
+          "book_id": {"type": "string"},
+          "capture_outcome_relative": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"},
+          "capture_outcome_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "capture_outcome_sidecar_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    },
+    "event_match_audit": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["book_id", "source_event_id", "raw_capture_relative", "raw_capture_sha256", "source_scheduled_start_utc", "official_scheduled_start_utc", "delta_nanoseconds", "game_pk", "rule"],
+        "properties": {
+          "book_id": {"type": "string"},
+          "source_event_id": {"type": "string", "minLength": 1},
+          "raw_capture_relative": {"type": "string"},
+          "raw_capture_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "source_scheduled_start_utc": {"type": "string"},
+          "official_scheduled_start_utc": {"type": "string"},
+          "delta_nanoseconds": {"type": "integer"},
+          "game_pk": {"type": "integer", "minimum": 1},
+          "rule": {"enum": ["EXACT", "UNIQUE_ORDERED_TEAMS_60S"]}
+        }
+      }
     },
     "games": {
       "type": "array",
@@ -51,5 +84,28 @@
         }
       }
     }
-  }
+  },
+  "oneOf": [
+    {
+      "not": {"anyOf": [{"required": ["capture_outcome_bindings"]}, {"required": ["event_match_audit"]}]},
+      "properties": {
+        "schema": {"const": "PROVISIONAL_MULTIBOOK_MARKET_BOARD_V1"},
+        "capture_outcomes": {"minItems": 5, "maxItems": 5}
+      }
+    },
+    {
+      "not": {"anyOf": [{"required": ["capture_outcome_bindings"]}, {"required": ["event_match_audit"]}]},
+      "properties": {
+        "schema": {"const": "PROVISIONAL_MULTIBOOK_MARKET_BOARD_V2"},
+        "capture_outcomes": {"minItems": 1, "maxItems": 5}
+      }
+    },
+    {
+      "required": ["capture_outcome_bindings", "event_match_audit"],
+      "properties": {
+        "schema": {"const": "PROVISIONAL_MULTIBOOK_MARKET_BOARD_V3"},
+        "capture_outcomes": {"minItems": 1, "maxItems": 5}
+      }
+    }
+  ]
 }

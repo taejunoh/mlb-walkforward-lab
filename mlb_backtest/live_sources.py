@@ -13,7 +13,7 @@ import threading
 import uuid
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType
@@ -29,6 +29,7 @@ from .live_top3_contracts import (
     validate_target_date,
 )
 from .models import RawArtifact
+from .competition_policy import CompetitionPolicy, REGULAR_SEASON_V1, policy_identity, research_source, validate_competition_policy
 from .secure_fs import (
     RegularFileSnapshot,
     RootBinding,
@@ -40,6 +41,7 @@ from .secure_fs import (
     write_exclusive,
 )
 from .source_parsers.schedule import (
+    OUT_OF_RANGE_UNPLAYED_STATUSES,
     parse_schedule,
     validate_schedule_query_coverage,
 )
@@ -79,7 +81,7 @@ ALLOWED_FINAL_HOSTS = MappingProxyType(
         "savant": frozenset({"baseballsavant.mlb.com"}),
     }
 )
-ACCEPTED_PREGAME_STATUSES = frozenset({"Scheduled", "Pre-Game"})
+ACCEPTED_PREGAME_STATUSES = frozenset({"Scheduled", "Pre-Game", "Warmup"})
 _LIVE_SCHEDULE_FIELDS = (
     "game_pk",
     "official_date",
@@ -245,6 +247,9 @@ class LiveSlateObservation:
     games: tuple[Mapping[str, object], ...]
     participants: Mapping[int, PregameParticipants]
     source_bindings: tuple[SourceBinding, ...]
+    initial_exclusion_reasons: Mapping[int, tuple[str, ...]] = field(
+        default_factory=dict
+    )
 
     def __post_init__(self) -> None:
         validate_target_date(self.target_date)
@@ -255,6 +260,30 @@ class LiveSlateObservation:
         )
         object.__setattr__(
             self, "participants", MappingProxyType(dict(self.participants))
+        )
+        if not isinstance(self.initial_exclusion_reasons, Mapping):
+            raise ValueError("initial exclusion reasons differ")
+        try:
+            normalized = {
+                game_pk: tuple(reasons)
+                for game_pk, reasons in self.initial_exclusion_reasons.items()
+            }
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("initial exclusion reasons differ") from exc
+        allowed = {int(game["game_pk"]) for game in self.games}
+        if (
+            any(
+                type(game_pk) is not int or game_pk not in allowed
+                for game_pk in normalized
+            )
+            or any(
+                reasons != ("OBSERVATION_AT_OR_AFTER_START",)
+                for reasons in normalized.values()
+            )
+        ):
+            raise ValueError("initial exclusion reasons differ")
+        object.__setattr__(
+            self, "initial_exclusion_reasons", MappingProxyType(normalized)
         )
 
 
@@ -272,6 +301,17 @@ class PersistedObservation:
     source_binding: SourceBinding
     payload_bytes: bytes
     payload_snapshot: RegularFileSnapshot
+
+
+@dataclass(frozen=True)
+class LoadedLiveSchedule:
+    """A read-only, fully rebound LIVE_SCHEDULE observation."""
+
+    target_date: str
+    games: tuple[dict[str, object], ...]
+    receipt_relative: Path
+    receipt_sha256: str
+    input_snapshots: tuple[RegularFileSnapshot, ...]
 
 
 def _deep_freeze(value: object) -> object:
@@ -464,12 +504,12 @@ def _decode_object(raw: bytes, label: str) -> dict[str, object]:
     return value
 
 
-def live_schedule_url(start: str, end: str) -> str:
+def live_schedule_url(start: str, end: str, *, competition_policy: CompetitionPolicy = REGULAR_SEASON_V1) -> str:
     """Build the result-free live schedule request used by both observations."""
     query = urlencode(
         {
             "sportId": 1,
-            "gameType": "R",
+            "gameType": ','.join(validate_competition_policy(competition_policy).target_game_types),
             "startDate": start,
             "endDate": end,
             "hydrate": "probablePitcher,venue",
@@ -478,7 +518,7 @@ def live_schedule_url(start: str, end: str) -> str:
     return f"{MLB_BASE}/schedule?{query}"
 
 
-def _validate_raw_live_schedule(payload: dict[str, object]) -> None:
+def _validate_raw_live_schedule(payload: dict[str, object], *, competition_policy: CompetitionPolicy = REGULAR_SEASON_V1) -> None:
     dates = payload.get("dates")
     if not isinstance(dates, list):
         raise ValueError("malformed live schedule: dates must be a list")
@@ -489,7 +529,7 @@ def _validate_raw_live_schedule(payload: dict[str, object]) -> None:
         for game in entry["games"]:
             if not isinstance(game, dict):
                 raise ValueError("malformed live schedule: game must be an object")
-            if game.get("gameType") != "R":
+            if competition_policy == REGULAR_SEASON_V1 and game.get("gameType") != "R":
                 raise ValueError("live schedule result must contain only regular games")
             game_pk = game.get("gamePk")
             if type(game_pk) is not int or game_pk <= 0:
@@ -500,19 +540,24 @@ def _validate_raw_live_schedule(payload: dict[str, object]) -> None:
 
 
 def parse_live_schedule(
-    raw: bytes, *, requested_date: str
+    raw: bytes, *, requested_date: str, competition_policy: CompetitionPolicy = REGULAR_SEASON_V1
 ) -> tuple[dict[str, object], ...]:
     """Project the schedule onto a closed, result-free field whitelist."""
     requested_date = validate_target_date(requested_date)
     payload = _decode_object(raw, "live schedule")
-    _validate_raw_live_schedule(payload)
-    validate_schedule_query_coverage(raw, requested_date, requested_date)
-    games = parse_schedule(raw)
+    competition_policy = validate_competition_policy(competition_policy)
+    _validate_raw_live_schedule(payload, competition_policy=competition_policy)
+    types = ('R',) if competition_policy == REGULAR_SEASON_V1 else None
+    validate_schedule_query_coverage(raw, requested_date, requested_date, game_types=types)
+    games = parse_schedule(raw, preserve_explicit_non_doubleheader=True, game_types=types)
     projected: list[dict[str, object]] = []
     for game in games:
-        if game["official_date"] != requested_date:
+        if (
+            game["official_date"] != requested_date
+            and game["status"] not in OUT_OF_RANGE_UNPLAYED_STATUSES
+        ):
             raise ValueError("live schedule official date differs from requested date")
-        if game["game_type"] != "R":
+        if competition_policy == REGULAR_SEASON_V1 and game["game_type"] != "R":
             raise ValueError("live schedule result must contain only regular games")
         if not _CANONICAL_UTC_RE.fullmatch(str(game["scheduled_start_utc"])):
             raise ValueError("live schedule start must be canonical UTC")
@@ -672,6 +717,16 @@ def boxscore_url(game_pk: int) -> str:
 
 def new_observation_id() -> str:
     return uuid.uuid4().hex
+
+
+def _policy_observation_id(value: str, policy: CompetitionPolicy) -> str:
+    suffix = '.postseason-research-v1' if policy != REGULAR_SEASON_V1 else ''
+    return _validate_observation_id(value + suffix)
+
+
+def _live_audit_namespace(name: str, observation_id: str) -> Path:
+    suffix = '_postseason_research_v1' if observation_id.endswith('.postseason-research-v1') else ''
+    return Path('audit/experimental_daily') / (name + suffix)
 
 
 def _validate_observation_id(value: object) -> str:
@@ -933,7 +988,7 @@ def _observation_claim_thread_lock(trusted: TrustedRoot, observation_id: str):
 @contextmanager
 def _observation_claim_lock(trusted: TrustedRoot, observation_id: str):
     relative = (
-        Path("audit/experimental_daily/live_observation_claims")
+        _live_audit_namespace('live_observation_claims', observation_id)
         / f"{observation_id}.lock"
     )
     descriptor = -1
@@ -995,7 +1050,7 @@ def _acquire_observation_claim(
     claim_bytes: bytes,
 ) -> tuple[Path, RegularFileSnapshot]:
     relative = (
-        Path("audit/experimental_daily/live_observation_claims")
+        _live_audit_namespace('live_observation_claims', observation_id)
         / f"{observation_id}.json"
     )
     snapshot = read_regular_snapshot(
@@ -1167,6 +1222,174 @@ def _acquire_observation_completion(
     return durable_at
 
 
+def load_live_schedule_observation(
+    root: Path, receipt_relative: Path
+) -> LoadedLiveSchedule:
+    """Load one admitted LIVE_SCHEDULE receipt without fetching or writing.
+
+    This intentionally mirrors the persistence chain: receipt, optional claim,
+    raw payload, manifest and seal, then completion and its seal are all read
+    through one trusted root and rebound before being returned to another
+    authority consumer.
+    """
+    receipt_relative = Path(receipt_relative)
+    with open_trusted_root(root) as trusted:
+        receipt_snapshot = read_regular_snapshot(
+            trusted, receipt_relative, "live schedule receipt", max_bytes=MAX_JSON_BYTES
+        )
+        assert receipt_snapshot is not None
+        receipt = _decode_object(receipt_snapshot.contents, "live schedule receipt")
+        optional_claim = {"claim_relative", "claim_sha256"}
+        required = {
+            "schema_version", "source", "binding_role", "observation_id",
+            "query_identity_json", "requested_url", "final_url", "started_at_utc",
+            "response_completed_at_utc", "http_status", "content_type", "etag",
+            "last_modified", "payload_sha256", "byte_length", "payload_relative",
+            "manifest_sha256", "manifest_relative",
+        }
+        keys = set(receipt)
+        if keys != required and keys != required | optional_claim:
+            raise ValueError("live schedule receipt fields differ")
+        if canonical_json_bytes(receipt) != receipt_snapshot.contents:
+            raise ValueError("live schedule receipt is not canonical")
+        if receipt["schema_version"] != 1 or receipt["source"] != "stats_api" or receipt["binding_role"] != "LIVE_SCHEDULE":
+            raise ValueError("live schedule receipt identity differs")
+        observation_id = _validate_observation_id(receipt["observation_id"])
+        expected_receipt = Path("audit/experimental_daily/live_receipts") / f"{observation_id}.json"
+        if receipt_relative != expected_receipt:
+            raise ValueError("live schedule receipt path differs")
+        query_identity_json = receipt["query_identity_json"]
+        if not isinstance(query_identity_json, str):
+            raise ValueError("live schedule query identity differs")
+        try:
+            query = json.loads(query_identity_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError("live schedule query identity differs") from exc
+        if not isinstance(query, dict):
+            raise ValueError("live schedule query identity differs")
+        query = _normalize_query(query)
+        target_date = query.get("target_date")
+        if not isinstance(target_date, str):
+            raise ValueError("live schedule query target date differs")
+        target_date = validate_target_date(target_date)
+        expected_url = live_schedule_url(target_date, target_date)
+        expected_query = {
+            "observation_id": observation_id,
+            "target_date": target_date,
+            "url": expected_url,
+        }
+        expected_query_json = canonical_json_bytes(expected_query).decode("utf-8").removesuffix("\n")
+        if query != expected_query or query_identity_json != expected_query_json:
+            raise ValueError("live schedule query identity differs")
+        if receipt["requested_url"] != expected_url or receipt["final_url"] != expected_url:
+            raise ValueError("live schedule URL differs")
+        for timestamp in (receipt["started_at_utc"], receipt["response_completed_at_utc"]):
+            if not isinstance(timestamp, str) or _CANONICAL_UTC_RE.fullmatch(timestamp) is None:
+                raise ValueError("live schedule receipt time differs")
+        if _utc_instant(receipt["started_at_utc"], "live schedule start time") > _utc_instant(receipt["response_completed_at_utc"], "live schedule response time"):
+            raise ValueError("live schedule receipt time differs")
+        payload_sha256 = receipt["payload_sha256"]
+        if not isinstance(payload_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", payload_sha256) is None:
+            raise ValueError("live schedule payload sha differs")
+        expected_payload = Path("data/experimental_daily/live_observations/mlb_live_schedule") / f"{payload_sha256}.raw"
+        query_sha256 = hashlib.sha256(_query_bytes(query)).hexdigest()
+        expected_manifest = expected_payload.parent / f"{payload_sha256}.{query_sha256}.manifest.json"
+        if receipt["payload_relative"] != expected_payload.as_posix() or receipt["manifest_relative"] != expected_manifest.as_posix():
+            raise ValueError("live schedule artifact path differs")
+        payload_snapshot = read_regular_snapshot(
+            trusted, expected_payload, "live schedule raw payload", max_bytes=MAX_JSON_BYTES
+        )
+        manifest_snapshot = read_regular_snapshot(
+            trusted, expected_manifest, "live schedule raw manifest", max_bytes=MAX_JSON_BYTES
+        )
+        manifest_seal_relative = expected_manifest.with_name(expected_manifest.name[:-5] + ".sha256")
+        manifest_seal_snapshot = read_regular_snapshot(
+            trusted, manifest_seal_relative, "live schedule raw manifest seal", max_bytes=1024
+        )
+        assert payload_snapshot is not None and manifest_snapshot is not None and manifest_seal_snapshot is not None
+        if hashlib.sha256(payload_snapshot.contents).hexdigest() != payload_sha256 or receipt["byte_length"] != len(payload_snapshot.contents):
+            raise ValueError("live schedule payload binding differs")
+        manifest = _decode_object(manifest_snapshot.contents, "live schedule raw manifest")
+        artifact = RawArtifact(
+            "mlb_live_schedule", payload_sha256, trusted.path / expected_payload,
+            trusted.path / expected_manifest, str(manifest.get("retrieved_at_utc")),
+            manifest.get("row_count") if type(manifest.get("row_count")) is int else -1,
+        )
+        manifest_sha256 = _validate_raw_manifest(
+            manifest_bytes=manifest_snapshot.contents,
+            seal_bytes=manifest_seal_snapshot.contents,
+            raw_source="mlb_live_schedule", query=query,
+            payload_bytes=payload_snapshot.contents, artifact=artifact,
+        )
+        if receipt["manifest_sha256"] != manifest_sha256:
+            raise ValueError("live schedule manifest binding differs")
+        http = LiveHttpObservation(
+            requested_url=str(receipt["requested_url"]), final_url=str(receipt["final_url"]),
+            started_at_utc=str(receipt["started_at_utc"]),
+            response_completed_at_utc=str(receipt["response_completed_at_utc"]),
+            http_status=receipt["http_status"], content_type=receipt["content_type"],
+            etag=receipt["etag"], last_modified=receipt["last_modified"], body=payload_snapshot.contents,
+        )
+        _validate_http_observation(http, source="stats_api", requested_url=expected_url)
+        snapshots: list[RegularFileSnapshot] = [receipt_snapshot]
+        if optional_claim <= keys:
+            claim_relative = receipt["claim_relative"]
+            claim_sha256 = receipt["claim_sha256"]
+            if not isinstance(claim_relative, str) or not isinstance(claim_sha256, str):
+                raise ValueError("live schedule claim binding differs")
+            if claim_relative != (Path("audit/experimental_daily/live_observation_claims") / f"{observation_id}.json").as_posix():
+                raise ValueError("live schedule claim path differs")
+            claim_snapshot = read_regular_snapshot(
+                trusted, Path(claim_relative), "live schedule claim", max_bytes=MAX_JSON_BYTES
+            )
+            assert claim_snapshot is not None
+            expected_claim = _claim_bytes(
+                raw_source="mlb_live_schedule", source="stats_api", binding_role="LIVE_SCHEDULE",
+                observation_id=observation_id, query_identity_json=query_identity_json, http=http,
+            )
+            if claim_snapshot.contents != expected_claim or hashlib.sha256(claim_snapshot.contents).hexdigest() != claim_sha256:
+                raise ValueError("live schedule claim binding differs")
+            snapshots.append(claim_snapshot)
+        receipt_sha256 = hashlib.sha256(receipt_snapshot.contents).hexdigest()
+        completion_relative = receipt_relative.with_name(f"{receipt_relative.name.removesuffix('.json')}.completion.json")
+        completion_snapshot = read_regular_snapshot(
+            trusted, completion_relative, "live schedule completion", max_bytes=MAX_JSON_BYTES
+        )
+        completion_seal_snapshot = read_regular_snapshot(
+            trusted, completion_relative.with_suffix(".sha256"), "live schedule completion seal", max_bytes=1024
+        )
+        assert completion_snapshot is not None and completion_seal_snapshot is not None
+        durable_at = _validate_observation_completion(completion_snapshot.contents, {
+            "schema_version": 1, "source": "stats_api", "binding_role": "LIVE_SCHEDULE",
+            "observation_id": observation_id, "query_identity_json": query_identity_json,
+            "receipt_relative": receipt_relative.as_posix(), "receipt_sha256": receipt_sha256,
+            "payload_sha256": payload_sha256, "manifest_sha256": manifest_sha256,
+        })
+        if _utc_instant(http.response_completed_at_utc, "live schedule response time") > _utc_instant(durable_at, "live schedule durable time"):
+            raise ValueError("live schedule completion precedes response")
+        expected_completion_seal = f"{hashlib.sha256(completion_snapshot.contents).hexdigest()}\n".encode()
+        if completion_seal_snapshot.contents != expected_completion_seal:
+            raise ValueError("live schedule completion seal differs")
+        snapshots.extend((payload_snapshot, manifest_snapshot, manifest_seal_snapshot, completion_snapshot, completion_seal_snapshot))
+        parsed_games = parse_live_schedule(
+            payload_snapshot.contents, requested_date=target_date
+        )
+        target_games = tuple(
+            game for game in parsed_games if game["official_date"] == target_date
+        )
+        games = tuple(
+            {
+                "game_pk": game["game_pk"], "away_team": game["away_team"],
+                "home_team": game["home_team"], "scheduled_start_utc": game["scheduled_start_utc"],
+            }
+            for game in target_games
+        )
+        games = tuple(sorted(games, key=lambda game: int(game["game_pk"])))
+        for snapshot in snapshots:
+            rebind_regular_snapshot(trusted, snapshot, "live schedule input", max_bytes=MAX_JSON_BYTES)
+        return LoadedLiveSchedule(target_date, games, receipt_relative, receipt_sha256, tuple(snapshots))
+
+
 def _persist_observation(
     root: Path,
     *,
@@ -1204,7 +1427,7 @@ def _persist_observation(
     ):
         raise ValueError("raw observation query identity differs")
     receipt_relative = (
-        Path("audit/experimental_daily/live_receipts") / f"{observation_id}.json"
+        _live_audit_namespace('live_receipts', observation_id) / f"{observation_id}.json"
     )
     query_identity_json = (
         canonical_json_bytes(normalized_query).decode("utf-8").removesuffix("\n")
@@ -1218,6 +1441,10 @@ def _persist_observation(
         http=http,
     )
     raw_store = _capability_raw_store(root, trusted)
+    if normalized_query.get('competition_scope') == 'postseason-research-v1':
+        for name in ('live_receipts','live_observation_claims'):
+            with open_parent(trusted, _live_audit_namespace(name, observation_id) / '.anchor', create=True):
+                pass
     with _observation_claim_lock(trusted, observation_id):
             claim_relative, claim_snapshot = _acquire_observation_claim(
                 trusted,
@@ -1411,13 +1638,19 @@ def _utc_instant(value: object, label: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+class _PregameBoundaryError(ValueError):
+    """A valid observation receipt crossed its game's scheduled start."""
+
+
 def _require_pregame_boundary(
     binding: SourceBinding, game: Mapping[str, object]
 ) -> None:
     durable = _utc_instant(binding.durable_at_utc, "durable observation time")
     scheduled_start = _utc_instant(game.get("scheduled_start_utc"), "scheduled start")
     if durable >= scheduled_start:
-        raise ValueError("live observation became durable at or after scheduled start")
+        raise _PregameBoundaryError(
+            "live observation became durable at or after scheduled start"
+        )
 
 
 def observe_live_slate(
@@ -1428,17 +1661,20 @@ def observe_live_slate(
     observation_id_factory: Callable[[], str] = new_observation_id,
     durable_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     expected_root_binding: RootBinding | None = None,
+    competition_policy: CompetitionPolicy = REGULAR_SEASON_V1,
 ) -> LiveSlateObservation:
     target_date = validate_target_date(target_date)
+    competition_policy = validate_competition_policy(competition_policy)
     with _live_root_session(root, expected_root_binding) as trusted:
-        request = live_schedule_url(target_date, target_date)
+        request = live_schedule_url(target_date, target_date, competition_policy=competition_policy)
         http = _validate_http_observation(
             fetcher("stats_api", request, max_bytes=MAX_JSON_BYTES),
             source="stats_api",
             requested_url=request,
         )
-        schedule_id = _validate_observation_id(observation_id_factory())
+        schedule_id = _policy_observation_id(observation_id_factory(), competition_policy)
         schedule_query = {
+            **policy_identity(competition_policy),
             "observation_id": schedule_id,
             "target_date": target_date,
             "url": request,
@@ -1446,7 +1682,7 @@ def observe_live_slate(
         schedule_persisted = _persist_observation(
             trusted.path,
             trusted=trusted,
-            raw_source="mlb_live_schedule",
+            raw_source=research_source('mlb_live_schedule', competition_policy),
             source="stats_api",
             binding_role="LIVE_SCHEDULE",
             game_pks=(),
@@ -1456,39 +1692,55 @@ def observe_live_slate(
             durable_clock=durable_clock,
         )
         games = parse_live_schedule(
-            schedule_persisted.payload_bytes, requested_date=target_date
+            schedule_persisted.payload_bytes, requested_date=target_date,
+            **({} if competition_policy == REGULAR_SEASON_V1 else {'competition_policy': competition_policy}),
         )
         schedule_persisted = _rescope_persisted_observation(
             schedule_persisted,
             tuple(sorted(int(game["game_pk"]) for game in games)),
         )
         schedule_binding = schedule_persisted.source_binding
+        initial_exclusions: dict[int, tuple[str, ...]] = {}
         for game in games:
+            if game['game_type'] not in competition_policy.target_game_types:
+                continue
             if game["status"] in ACCEPTED_PREGAME_STATUSES:
-                _require_pregame_boundary(schedule_binding, game)
+                try:
+                    _require_pregame_boundary(schedule_binding, game)
+                except _PregameBoundaryError:
+                    initial_exclusions[int(game["game_pk"])] = (
+                        "OBSERVATION_AT_OR_AFTER_START",
+                    )
         bindings = [schedule_binding]
         participants: dict[int, PregameParticipants] = {}
         for game in games:
+            if game['game_type'] not in competition_policy.target_game_types:
+                continue
             if game["status"] not in ACCEPTED_PREGAME_STATUSES:
                 continue
             game_pk = int(game["game_pk"])
+            if game_pk in initial_exclusions:
+                continue
             request = boxscore_url(game_pk)
             http = _validate_http_observation(
                 fetcher("stats_api", request, max_bytes=MAX_JSON_BYTES),
                 source="stats_api",
                 requested_url=request,
             )
-            observation_id = _validate_observation_id(observation_id_factory())
+            observation_id = _policy_observation_id(observation_id_factory(), competition_policy)
             query = {
+                **policy_identity(competition_policy),
                 "game_pk": game_pk,
                 "observation_id": observation_id,
                 "target_date": target_date,
                 "url": request,
             }
+            if competition_policy != REGULAR_SEASON_V1:
+                query.update({key: game[key] for key in ('game_type','away_team_id','home_team_id')})
             persisted = _persist_observation(
                 trusted.path,
                 trusted=trusted,
-                raw_source="mlb_live_boxscore",
+                raw_source=research_source('mlb_live_boxscore', competition_policy),
                 source="stats_api",
                 binding_role="LIVE_PARTICIPANTS",
                 game_pks=(game_pk,),
@@ -1497,14 +1749,26 @@ def observe_live_slate(
                 http=http,
                 durable_clock=durable_clock,
             )
-            _require_pregame_boundary(persisted.source_binding, game)
+            try:
+                _require_pregame_boundary(persisted.source_binding, game)
+            except _PregameBoundaryError:
+                initial_exclusions[game_pk] = (
+                    "OBSERVATION_AT_OR_AFTER_START",
+                )
+                continue
             parsed = compare_probable_pitchers(
                 game,
                 parse_pregame_boxscore(persisted.payload_bytes, game_pk=game_pk),
             )
             participants[game_pk] = parsed
             bindings.append(persisted.source_binding)
-        return LiveSlateObservation(target_date, games, participants, tuple(bindings))
+        return LiveSlateObservation(
+            target_date,
+            games,
+            participants,
+            tuple(bindings),
+            initial_exclusions,
+        )
 
 
 def _final_mismatch_reasons(
@@ -1515,6 +1779,7 @@ def _final_mismatch_reasons(
         saved.get(field) != current.get(field)
         for field in (
             "game_pk",
+            "game_type",
             "away_team_id",
             "home_team_id",
             "away_team",
@@ -1576,27 +1841,32 @@ def observe_final_game_schedule(
     observation_id_factory: Callable[[], str] = new_observation_id,
     durable_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     expected_root_binding: RootBinding | None = None,
+    competition_policy: CompetitionPolicy = REGULAR_SEASON_V1,
 ) -> FinalGameObservation | FinalGameScheduleDisposition:
     target_date = validate_target_date(target_date)
+    competition_policy = validate_competition_policy(competition_policy)
     game_pk = _positive_int(saved_game.get("game_pk"), "game_pk")
     with _live_root_session(root, expected_root_binding) as trusted:
-        request = live_schedule_url(target_date, target_date)
+        request = live_schedule_url(target_date, target_date, competition_policy=competition_policy)
         http = _validate_http_observation(
             fetcher("stats_api", request, max_bytes=MAX_JSON_BYTES),
             source="stats_api",
             requested_url=request,
         )
-        observation_id = _validate_observation_id(observation_id_factory())
+        observation_id = _policy_observation_id(observation_id_factory(), competition_policy)
         query = {
+            **policy_identity(competition_policy),
             "game_pk": game_pk,
             "observation_id": observation_id,
             "target_date": target_date,
             "url": request,
         }
+        if competition_policy != REGULAR_SEASON_V1:
+            query.update({key: saved_game[key] for key in ('game_type','away_team_id','home_team_id')})
         persisted = _persist_observation(
             trusted.path,
             trusted=trusted,
-            raw_source="mlb_live_final_schedule",
+            raw_source=research_source('mlb_live_final_schedule', competition_policy),
             source="stats_api",
             binding_role="FINAL_SCHEDULE",
             game_pks=(game_pk,),
@@ -1608,7 +1878,8 @@ def observe_final_game_schedule(
         binding = persisted.source_binding
         try:
             games = parse_live_schedule(
-                persisted.payload_bytes, requested_date=target_date
+                persisted.payload_bytes, requested_date=target_date,
+                **({} if competition_policy == REGULAR_SEASON_V1 else {'competition_policy': competition_policy}),
             )
         except ValueError:
             return FinalGameScheduleDisposition(
@@ -1654,6 +1925,7 @@ __all__ = [
     "ALLOWED_FINAL_HOSTS",
     "FinalGameScheduleDisposition",
     "LiveHttpObservation",
+    "LoadedLiveSchedule",
     "LiveSlateObservation",
     "MAX_JSON_BYTES",
     "ObservationFetcher",
@@ -1664,6 +1936,7 @@ __all__ = [
     "compare_probable_pitchers",
     "fetch_live_http",
     "live_schedule_url",
+    "load_live_schedule_observation",
     "new_observation_id",
     "normalize_live_root_path",
     "observe_final_game_schedule",

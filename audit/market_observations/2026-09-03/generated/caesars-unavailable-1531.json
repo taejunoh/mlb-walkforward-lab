@@ -1,0 +1,1 @@
+{"schema":"PROVISIONAL_MULTIBOOK_MARKET_UNAVAILABLE_V1","source_book":"CAESARS","recorded_at_utc":"2026-09-03T15:32:19.881Z","reason":"COLLECTOR_REJECTED","detail":"Public page loaded but no genuine MLB event IDs or ML/O-U rows exposed; identity not invented. Source observation: audit/market_observations/2026-09-03/20260903T1531-browser-public-sources.json"}

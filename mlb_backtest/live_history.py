@@ -13,6 +13,7 @@ import time
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import MappingProxyType
@@ -21,6 +22,7 @@ from urllib.parse import urlencode
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .clock import assert_feature_dates
+from .competition_policy import CompetitionPolicy, REGULAR_SEASON_V1, POSTSEASON_ML_RESEARCH_V1, policy_identity, validate_competition_policy, research_source
 from .live_model_card import FrozenLiveCard
 from .live_sources import (
     MAX_JSON_BYTES,
@@ -34,6 +36,7 @@ from .live_top3_contracts import (
     SourceBinding,
     canonical_json_bytes,
     validate_target_date,
+    _freeze,
 )
 from .manifest import RawStore
 from .models import RawArtifact
@@ -50,6 +53,7 @@ from .statcast import (
     is_statcast_row_capped_manifest,
     monthly_ranges,
     parse_statcast,
+    statcast_url,
 )
 from .secure_fs import (
     RootBinding,
@@ -88,6 +92,181 @@ _ACTIVE_HISTORY_ROOT: ContextVar[TrustedRoot | None] = ContextVar(
 )
 
 
+def _plain_research(value):
+    if isinstance(value, Mapping):
+        return {key: _plain_research(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_research(item) for item in value]
+    return value
+
+
+def validate_research_history_authority(authority, cutoff):
+    value = _plain_research(authority)
+    if not isinstance(value, dict) or set(value) != {'namespace','cutoff_date','catalog_sha256','competition_scope','research_policy_version','history_population','coverage','coverage_sha256'}:
+        raise ValueError('RESEARCH_HISTORY_POLICY_MISMATCH')
+    if value['namespace'] != 'experimental_daily/history_cache_postseason_research_v1' or value['cutoff_date'] != cutoff:
+        raise ValueError('RESEARCH_HISTORY_POLICY_MISMATCH')
+    if any(value.get(key) != item for key, item in policy_identity(POSTSEASON_ML_RESEARCH_V1).items()):
+        raise ValueError('RESEARCH_HISTORY_POPULATION_MISMATCH')
+    coverage = value['coverage']
+    if not isinstance(coverage, dict) or set(coverage) != {'start_date','cutoff_date','game_identities','played_game_pks'} or coverage['cutoff_date'] != cutoff:
+        raise ValueError('research history coverage differs')
+    start = date.fromisoformat(validate_target_date(coverage['start_date']))
+    end = date.fromisoformat(cutoff)
+    if start.year != end.year or start > end:
+        raise ValueError('research history coverage range differs')
+    identities = coverage['game_identities']
+    if not isinstance(identities, list) or not identities:
+        raise ValueError('research history coverage empty')
+    played, seen = [], set()
+    for row in identities:
+        if not isinstance(row, dict) or set(row) != {'game_pk','official_date','status','game_type','away_team_id','home_team_id','doubleheader_marker'}:
+            raise ValueError('research history coverage identity differs')
+        if any(type(row[key]) is not int or row[key] <= 0 for key in ('game_pk','away_team_id','home_team_id')) or row['away_team_id'] == row['home_team_id'] or row['game_pk'] in seen:
+            raise ValueError('research history coverage identity differs')
+        seen.add(row['game_pk'])
+        if not start.isoformat() <= validate_target_date(row['official_date']) <= cutoff or row['game_type'] not in POSTSEASON_ML_RESEARCH_V1.recent_game_types:
+            raise ValueError('research history coverage population differs')
+        if row['status'] in _PLAYED_TERMINAL_STATUSES:
+            played.append(row['game_pk'])
+        elif row['status'] not in _UNPLAYED_TERMINAL_STATUSES:
+            raise ValueError('research history coverage unresolved')
+    if identities != sorted(identities, key=lambda row: (row['official_date'], row['game_pk'])) or coverage['played_game_pks'] != sorted(played):
+        raise ValueError('research history coverage game set differs')
+    if value['coverage_sha256'] != hashlib.sha256(canonical_json_bytes(coverage)).hexdigest():
+        raise ValueError('research history coverage digest differs')
+    for key in ('catalog_sha256','coverage_sha256'):
+        digest = value[key]
+        if not isinstance(digest, str) or len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
+            raise ValueError('research history coverage digest differs')
+    return value
+
+
+@dataclass(frozen=True)
+class ResearchLiveHistoryBundle:
+    target_date: str
+    cutoff_date: str
+    feature_history: object
+    league_era_by_asof: Mapping[str, Mapping[str, object]]
+    team_code_by_name: Mapping[str, str]
+    venue_references: Mapping[int, Mapping[str, object]]
+    cache_authority: Mapping[str, object]
+    source_bindings: tuple[SourceBinding, ...]
+
+    def __post_init__(self):
+        target = date.fromisoformat(validate_target_date(self.target_date))
+        if self.cutoff_date != (target - timedelta(days=1)).isoformat():
+            raise ValueError('research history cutoff differs')
+        authority = validate_research_history_authority(self.cache_authority, self.cutoff_date)
+        if not isinstance(self.source_bindings, tuple) or any(not isinstance(binding, SourceBinding) for binding in self.source_bindings):
+            raise ValueError('research history source bindings differ')
+        if {binding.binding_role for binding in self.source_bindings} != {'HISTORY_SCHEDULE','HISTORY_STATCAST','HISTORY_ERA','HISTORY_VENUE'}:
+            raise ValueError('research history source roles differ')
+        for binding in self.source_bindings:
+            query = json.loads(binding.query_identity_json)
+            if query.get('as_of_date') != self.cutoff_date or any(query.get(key) != value for key, value in policy_identity(POSTSEASON_ML_RESEARCH_V1).items()):
+                raise ValueError('RESEARCH_HISTORY_POLICY_MISMATCH')
+            if binding.binding_role in {'HISTORY_SCHEDULE','HISTORY_STATCAST'} and any(query.get(key) != value for key, value in _research_coverage_identity(authority['coverage']).items()):
+                raise ValueError('research history coverage source binding differs')
+        for field in ('league_era_by_asof','team_code_by_name','venue_references','cache_authority'):
+            object.__setattr__(self, field, _freeze(getattr(self, field)))
+
+
+def _research_coverage_identity(coverage):
+    digest = hashlib.sha256(canonical_json_bytes(coverage)).hexdigest()
+    return {'coverage': coverage, 'coverage_sha256': digest, 'schedule_coverage_sha256': digest, 'coverage_game_pks': coverage['played_game_pks']}
+
+
+def _research_schedule(raw, target):
+    cutoff = target - timedelta(days=1)
+    start = date(target.year, 1, 1).isoformat()
+    types = POSTSEASON_ML_RESEARCH_V1.recent_game_types
+    validate_schedule_query_coverage(raw, start, cutoff.isoformat(), game_types=types)
+    payload = json.loads(raw)
+    seen = set()
+    for entry in payload['dates']:
+        for game in entry['games']:
+            if game.get('gameType') in types:
+                pk = game.get('gamePk')
+                if pk in seen:
+                    raise ValueError('research schedule duplicate coverage gamePk')
+                seen.add(pk)
+    games = tuple(parse_schedule(raw, game_types=types))
+    games = tuple(game for game in games if start <= game['official_date'] <= cutoff.isoformat())
+    if not games:
+        raise ValueError('research history schedule coverage empty')
+    opening = min(game['official_date'] for game in games)
+    fields = ('game_pk','official_date','status','game_type','away_team_id','home_team_id','doubleheader_marker')
+    identities = sorted(({key: game[key] for key in fields} for game in games), key=lambda row: (row['official_date'], row['game_pk']))
+    coverage = {'start_date': opening, 'cutoff_date': cutoff.isoformat(), 'game_identities': identities, 'played_game_pks': sorted(game['game_pk'] for game in games if game['status'] in _PLAYED_TERMINAL_STATUSES)}
+    authority = {'namespace': 'experimental_daily/history_cache_postseason_research_v1', 'cutoff_date': cutoff.isoformat(), 'catalog_sha256': '0'*64, **policy_identity(POSTSEASON_ML_RESEARCH_V1), 'coverage': coverage, 'coverage_sha256': hashlib.sha256(canonical_json_bytes(coverage)).hexdigest()}
+    validate_research_history_authority(authority, cutoff.isoformat())
+    return games, coverage
+
+
+def _load_research_history(store, target, *, fetcher, sleeper):
+    policy = POSTSEASON_ML_RESEARCH_V1
+    cutoff = target - timedelta(days=1)
+    root = _store_history_root(store)
+    with open_parent(store._trusted, Path('audit/experimental_daily/history_receipts_postseason_research_v1/.anchor'), create=True):
+        pass
+    start = date(target.year, 1, 1).isoformat()
+    request = MLB_BASE + '/schedule?' + urlencode({'sportId': 1, 'gameType': ','.join(policy.recent_game_types), 'startDate': start, 'endDate': cutoff.isoformat(), 'hydrate': 'probablePitcher,venue,linescore'})
+    base = {**policy_identity(policy), 'start': start, 'end': cutoff.isoformat(), 'gameType': ','.join(policy.recent_game_types), 'role': 'history', 'as_of_date': cutoff.isoformat(), 'url': request}
+    source = research_source(_SCHEDULE_SOURCE, policy)
+    candidates = [row for row in _verified_artifacts(store) if row['manifest']['source'] == source and all(row['manifest']['query'].get(key) == value for key, value in base.items())]
+    if len(candidates) > 1:
+        raise ValueError('research schedule coverage cache ambiguous')
+    if candidates:
+        row = candidates[0]
+        games, coverage = _research_schedule(bytes(row['payload_bytes']), target)
+        query = row['manifest']['query']
+        if query != {**base, **_research_coverage_identity(coverage)}:
+            raise ValueError('research cached coverage identity differs')
+        schedule_http = None
+    else:
+        schedule_http = _fetch_with_retry('stats_api', request, fetcher, MAX_JSON_BYTES, sleeper)
+        games, coverage = _research_schedule(schedule_http.body, target)
+        query = {**base, **_research_coverage_identity(coverage)}
+    def admitted(source, url, *, max_bytes):
+        return schedule_http if schedule_http is not None else fetcher(source, url, max_bytes=max_bytes)
+    _, schedule_binding = _store_history_observation(root, store, raw_source=source, source='stats_api', binding_role='HISTORY_SCHEDULE', query=query, game_pks=(), fetcher=admitted, sleeper=sleeper)
+    pitches, bindings = [], []
+    def chunk(first, last):
+        url = statcast_url(first, last, game_types=policy.recent_game_types)
+        query = {**policy_identity(policy), **_research_coverage_identity(coverage), 'start': first, 'end': last, 'game_type': ','.join(policy.recent_game_types), 'as_of_date': cutoff.isoformat(), 'url': url}
+        raw_source = research_source(_STATCAST_SOURCE, policy)
+        cached = _find_artifact(store, raw_source, query)
+        http = None if cached else _fetch_with_retry('savant', url, fetcher, MAX_STATCAST_BYTES, sleeper)
+        payload = bytes(cached['payload_bytes']) if cached else http.body
+        parsed = parse_statcast(payload, game_types=policy.recent_game_types)
+        if sum(bool(line.strip()) for line in payload.splitlines()) - 1 >= STATCAST_ROW_CAP:
+            if first == last:
+                raise ValueError('research Statcast single-day row-cap coverage incomplete')
+            first_day, last_day = date.fromisoformat(first), date.fromisoformat(last)
+            midpoint = first_day + timedelta(days=(last_day-first_day).days//2)
+            chunk(first, midpoint.isoformat())
+            chunk((midpoint+timedelta(days=1)).isoformat(), last)
+            return
+        if any(not first <= pitch['game_date'] <= last for pitch in parsed.pitches):
+            raise ValueError('research Statcast query coverage differs')
+        def admitted_pitch(source, url, *, max_bytes):
+            return http if http is not None else fetcher(source, url, max_bytes=max_bytes)
+        _, binding = _store_history_observation(root, store, raw_source=raw_source, source='savant', binding_role='HISTORY_STATCAST', query=query, game_pks=(), fetcher=admitted_pitch, sleeper=sleeper, max_bytes=MAX_STATCAST_BYTES)
+        pitches.extend(parsed.pitches)
+        bindings.append(binding)
+    for first, last in monthly_ranges(coverage['start_date'], cutoff.isoformat()):
+        chunk(first, last)
+    by_pk = {game['game_pk']: game for game in games}
+    if {pitch['game_pk'] for pitch in pitches} != set(coverage['played_game_pks']):
+        raise ValueError('research full-range Statcast coverage differs')
+    for pitch in pitches:
+        game = by_pk[pitch['game_pk']]
+        if pitch['game_type'] != game['game_type'] or pitch['game_date'] != game['official_date']:
+            raise ValueError('research Statcast coverage game identity differs')
+    return games, [schedule_binding], StatcastData(tuple(pitches), ()), bindings, coverage
+
+
 def _canonical_utc_now() -> str:
     value = datetime.now(timezone.utc)
     base = value.strftime("%Y-%m-%dT%H:%M:%S")
@@ -100,7 +279,8 @@ def _query_json(query: Mapping[str, object]) -> str:
 
 def _observation_id(role: str, query: Mapping[str, object]) -> str:
     digest = hashlib.sha256(_query_json(query).encode("utf-8")).hexdigest()
-    return f"history-{role.lower()}-{digest[:32]}"
+    suffix = '-postseason-research-v1' if query.get('competition_scope') == POSTSEASON_ML_RESEARCH_V1.competition_scope else ''
+    return f"history-{role.lower()}-{digest[:32]}{suffix}"
 
 
 def _history_root_test_hook(stage: str, root: Path) -> None:
@@ -585,7 +765,8 @@ def _relative(root: Path, path: Path) -> str:
 
 
 def _receipt_path(root: Path, observation_id: str) -> Path:
-    return root / "audit/experimental_daily/history_receipts" / f"{observation_id}.json"
+    namespace = 'history_receipts_postseason_research_v1' if observation_id.endswith('-postseason-research-v1') else 'history_receipts'
+    return root / 'audit/experimental_daily' / namespace / f"{observation_id}.json"
 
 
 def _receipt_claim_path(receipt_path: Path) -> Path:
@@ -1960,7 +2141,8 @@ def _parse_venue(payload: bytes, venue_id: int) -> dict[str, object]:
 
 
 def _load_or_fetch_venue_references(
-    store: RawStore, schedule: Iterable[Mapping[str, object]], cutoff: date, *, fetcher: ObservationFetcher
+    store: RawStore, schedule: Iterable[Mapping[str, object]], cutoff: date, *, fetcher: ObservationFetcher,
+    competition_policy: CompetitionPolicy = REGULAR_SEASON_V1,
 ) -> tuple[dict[int, dict[str, object]], list[SourceBinding]]:
     root = _store_history_root(store)
     venue_ids = sorted({row.get("venue_id") for row in schedule if type(row.get("venue_id")) is int and row["venue_id"] > 0})
@@ -1968,9 +2150,9 @@ def _load_or_fetch_venue_references(
         raise ValueError("history schedule has no authenticated venue identities")
     references, bindings = {}, []
     for venue_id in venue_ids:
-        query = {"venue_id": venue_id, "as_of_date": cutoff.isoformat(), "url": _venue_url(venue_id)}
+        query = {**policy_identity(competition_policy), "venue_id": venue_id, "as_of_date": cutoff.isoformat(), "url": _venue_url(venue_id)}
         payload, binding = _store_history_observation(
-            root, store, raw_source=_VENUE_SOURCE, source="stats_api", binding_role="HISTORY_VENUE",
+            root, store, raw_source=research_source(_VENUE_SOURCE, competition_policy), source="stats_api", binding_role="HISTORY_VENUE",
             query=query, game_pks=(), fetcher=fetcher,
         )
         references[venue_id] = _parse_venue(payload, venue_id)
@@ -1982,6 +2164,7 @@ def _build_result_free_live_schedule_history(
     schedule: Iterable[Mapping[str, object]], statcast: StatcastData,
     team_map: Mapping[str, str], venue_refs: Mapping[int, Mapping[str, object]],
     opening: date, cutoff: date, source_manifest_sha256: str,
+    competition_policy: CompetitionPolicy = REGULAR_SEASON_V1,
 ) -> ScheduleHistoryBuild:
     schedule_by_pk = {int(row["game_pk"]): row for row in schedule}
     statcast_dates: dict[int, str] = {}
@@ -2014,6 +2197,7 @@ def _build_result_free_live_schedule_history(
             "team_codes": [team_map[away], team_map[home]], "home_team_code": team_map[home],
             "venue_name": game["venue_name"], "innings": max_inning_by_game[game_pk],
             "doubleheader_marker": game.get("doubleheader_marker"), **dict(reference),
+            **({'game_type':game['game_type'], 'away_team_code':team_map[away], 'away_team_id':game['away_team_id'], 'home_team_id':game['home_team_id']} if competition_policy == POSTSEASON_ML_RESEARCH_V1 else {}),
         })
     if not rows:
         raise ValueError("result-free schedule history has no Statcast-proven games")
@@ -2025,10 +2209,11 @@ def _build_result_free_live_schedule_history(
 def _load_or_fetch_league_era(
     store: RawStore, opening: date, cutoff: date, *, fetcher: ObservationFetcher,
     sleeper: Callable[[float], None],
+    competition_policy: CompetitionPolicy = REGULAR_SEASON_V1,
 ) -> tuple[dict[str, dict[str, object]], list[SourceBinding]]:
-    root = store.root.parents[2]
-    query = {"season_open": opening.isoformat(), "as_of_date": cutoff.isoformat(), "url": league_era_url(opening.isoformat(), cutoff.isoformat())}
-    payload, binding = _store_history_observation(root, store, raw_source=_ERA_SOURCE, source="stats_api", binding_role="HISTORY_ERA", query=query, game_pks=(), fetcher=fetcher, sleeper=sleeper)
+    root = _store_history_root(store)
+    query = {**policy_identity(competition_policy), "season_open": opening.isoformat(), "as_of_date": cutoff.isoformat(), "url": league_era_url(opening.isoformat(), cutoff.isoformat())}
+    payload, binding = _store_history_observation(root, store, raw_source=research_source(_ERA_SOURCE, competition_policy), source="stats_api", binding_role="HISTORY_ERA", query=query, game_pks=(), fetcher=fetcher, sleeper=sleeper)
     parsed = parse_league_era(payload)
     return {cutoff.isoformat(): {"as_of_date": cutoff.isoformat(), **parsed, "source": "mlb_stats_api", "manifest_sha256": binding.manifest_sha256}}, [binding]
 
@@ -2060,7 +2245,9 @@ def build_live_history(
     fetcher: ObservationFetcher = fetch_live_http,
     sleeper: Callable[[float], None] = time.sleep,
     expected_root_binding: RootBinding | None = None,
-) -> LiveHistoryBundle:
+    competition_policy: CompetitionPolicy = REGULAR_SEASON_V1,
+) -> LiveHistoryBundle | ResearchLiveHistoryBundle:
+    competition_policy = validate_competition_policy(competition_policy)
     with _history_root_session(
         Path(root), expected_root_binding
     ) as (bound_root, trusted):
@@ -2071,6 +2258,7 @@ def build_live_history(
             card,
             fetcher=fetcher,
             sleeper=sleeper,
+            competition_policy=competition_policy,
         )
 
 
@@ -2082,10 +2270,27 @@ def _build_live_history_bound(
     *,
     fetcher: ObservationFetcher,
     sleeper: Callable[[float], None],
-) -> LiveHistoryBundle:
+    competition_policy: CompetitionPolicy = REGULAR_SEASON_V1,
+) -> LiveHistoryBundle | ResearchLiveHistoryBundle:
     target = date.fromisoformat(validate_target_date(target_date))
     if not isinstance(card, FrozenLiveCard):
         raise ValueError("card must be a FrozenLiveCard")
+    cutoff = target - timedelta(days=1)
+    store = _CapabilityRawStore(root, trusted)
+    if competition_policy == POSTSEASON_ML_RESEARCH_V1:
+        store._relative_root = Path('data/experimental_daily/history_cache_postseason_research_v1')
+        store.root = root / store._relative_root
+        with open_parent(trusted, Path('audit/experimental_daily/history_receipts_postseason_research_v1/.anchor'), create=True):
+            pass
+        schedule, schedule_bindings, raw_statcast, statcast_bindings, research_coverage = _load_research_history(store, target, fetcher=fetcher, sleeper=sleeper)
+        opening = date.fromisoformat(research_coverage['start_date'])
+    else:
+        return _build_regular_live_history_bound(root, trusted, target_date, card, fetcher=fetcher, sleeper=sleeper)
+    return _finish_live_history(store, schedule, schedule_bindings, raw_statcast, statcast_bindings, opening, cutoff, target_date, card, fetcher, sleeper, competition_policy, research_coverage)
+
+
+def _build_regular_live_history_bound(root, trusted, target_date, card, *, fetcher, sleeper):
+    target = date.fromisoformat(validate_target_date(target_date))
     cutoff = target - timedelta(days=1)
     store = _CapabilityRawStore(root, trusted)
     (
@@ -2127,13 +2332,19 @@ def _build_live_history_bound(
                 provisional_schedule_http,
             )
         ]
+    return _finish_live_history(store, schedule, schedule_bindings, raw_statcast, statcast_bindings, opening, cutoff, target_date, card, fetcher, sleeper, REGULAR_SEASON_V1, None)
+
+
+def _finish_live_history(store, schedule, schedule_bindings, raw_statcast, statcast_bindings, opening, cutoff, target_date, card, fetcher, sleeper, competition_policy, coverage):
+    target = date.fromisoformat(target_date)
     # The Statcast data is date-safe before any schedule/result construction.
     assert_feature_dates(target_date, (str(row["game_date"]) for row in raw_statcast.pitches))
     team_map = derive_team_code_map(schedule, raw_statcast, target.year).mapping
-    venue_refs, venue_bindings = _load_or_fetch_venue_references(store, schedule, cutoff, fetcher=fetcher)
+    venue_refs, venue_bindings = _load_or_fetch_venue_references(store, schedule, cutoff, fetcher=fetcher, competition_policy=competition_policy)
     schedule_build = _build_result_free_live_schedule_history(
         schedule, raw_statcast, team_map, venue_refs, opening, cutoff,
         schedule_bindings[0].manifest_sha256,
+        competition_policy=competition_policy,
     )
     schedule_by_pk = {int(row["game_pk"]): row for row in schedule}
     final_outs = {
@@ -2147,17 +2358,22 @@ def _build_live_history_bound(
         and schedule_by_pk[game_pk].get("final_inning_topbot") in {"Top", "Bot"}
     }
     statcast = derive_outs_recorded(raw_statcast, final_outs, final_half_by_game=final_halves)
-    era, era_bindings = _load_or_fetch_league_era(store, opening, cutoff, fetcher=fetcher, sleeper=sleeper)
+    era, era_bindings = _load_or_fetch_league_era(store, opening, cutoff, fetcher=fetcher, sleeper=sleeper, competition_policy=competition_policy)
     history = build_feature_history(statcast, card.slot_weights, schedule_build)
     assert_feature_dates(target_date, _bound_source_dates(history, cutoff))
     source_bindings = tuple(
         schedule_bindings + statcast_bindings + venue_bindings + era_bindings
     )
-    return LiveHistoryBundle(
+    authority = _authenticated_history_catalog(store, cutoff, source_bindings)
+    bundle_type = LiveHistoryBundle
+    if competition_policy == POSTSEASON_ML_RESEARCH_V1:
+        bundle_type = ResearchLiveHistoryBundle
+        authority = {**authority, **policy_identity(competition_policy), 'namespace': 'experimental_daily/history_cache_postseason_research_v1', 'coverage': coverage, 'coverage_sha256': hashlib.sha256(canonical_json_bytes(coverage)).hexdigest()}
+    return bundle_type(
         target_date=target_date, cutoff_date=cutoff.isoformat(), feature_history=history,
         league_era_by_asof=MappingProxyType(era), team_code_by_name=MappingProxyType(dict(team_map)),
         venue_references=MappingProxyType(dict(venue_refs)),
-        cache_authority=_authenticated_history_catalog(store, cutoff, source_bindings),
+        cache_authority=authority,
         source_bindings=source_bindings,
     )
 
@@ -2180,7 +2396,9 @@ def load_live_career_bf(
     fetcher: ObservationFetcher = fetch_live_http,
     sleeper: Callable[[float], None] = time.sleep,
     expected_root_binding: RootBinding | None = None,
+    competition_policy: CompetitionPolicy = REGULAR_SEASON_V1,
 ) -> tuple[Mapping[int, int], tuple[SourceBinding, ...]]:
+    competition_policy = validate_competition_policy(competition_policy)
     with _history_root_session(
         Path(root), expected_root_binding
     ) as (bound_root, trusted):
@@ -2191,6 +2409,7 @@ def load_live_career_bf(
             pitcher_ids,
             fetcher=fetcher,
             sleeper=sleeper,
+            competition_policy=competition_policy,
         )
 
 
@@ -2202,18 +2421,24 @@ def _load_live_career_bf_bound(
     *,
     fetcher: ObservationFetcher,
     sleeper: Callable[[float], None],
+    competition_policy: CompetitionPolicy = REGULAR_SEASON_V1,
 ) -> tuple[Mapping[int, int], tuple[SourceBinding, ...]]:
     target = date.fromisoformat(validate_target_date(target_date))
     cutoff = target - timedelta(days=1)
     store = _CapabilityRawStore(root, trusted)
+    if competition_policy == POSTSEASON_ML_RESEARCH_V1:
+        store._relative_root = Path('data/experimental_daily/history_cache_postseason_research_v1')
+        store.root = root / store._relative_root
+        with open_parent(trusted, Path('audit/experimental_daily/history_receipts_postseason_research_v1/.anchor'), create=True):
+            pass
     values: dict[int, int] = {}
     bindings: list[SourceBinding] = []
     for pitcher_id in sorted(set(pitcher_ids)):
         if type(pitcher_id) is not int or pitcher_id <= 0:
             raise ValueError("pitcher_id must be a positive integer")
         request = live_career_bf_url(pitcher_id, cutoff.isoformat())
-        query = {"pitcher_id": pitcher_id, "as_of_date": cutoff.isoformat(), "url": request}
-        payload, binding = _store_history_observation(root, store, raw_source=_CAREER_SOURCE, source="stats_api", binding_role="CAREER_BF", query=query, game_pks=(), fetcher=fetcher, sleeper=sleeper)
+        query = {**policy_identity(competition_policy), "pitcher_id": pitcher_id, "as_of_date": cutoff.isoformat(), "url": request}
+        payload, binding = _store_history_observation(root, store, raw_source=research_source(_CAREER_SOURCE, competition_policy), source="stats_api", binding_role="CAREER_BF", query=query, game_pks=(), fetcher=fetcher, sleeper=sleeper)
         if date.fromisoformat(query["as_of_date"]) >= target:
             raise ValueError("career BF as_of must precede target date")
         values[pitcher_id] = parse_prior_career_bf(payload, pitcher_id)

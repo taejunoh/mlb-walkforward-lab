@@ -573,7 +573,7 @@ def build_live_top3_run(
         tuple[
             Mapping[str, object],
             object,
-            object,
+            FinalGameObservation | FinalGameScheduleDisposition | None,
             list[SourceBinding],
             str,
             set[str],
@@ -596,11 +596,32 @@ def build_live_top3_run(
         relevant = _relevant_slate_bindings(slate, game_pk)
         relevant.extend(history.source_bindings)
         relevant.extend(_participant_career_bindings(participant, career_by_pitcher))
-        exclusion_reasons: set[str] = set()
+        exclusion_reasons: set[str] = set(
+            slate.initial_exclusion_reasons.get(game_pk, ())
+        )
+        initially_excluded = bool(exclusion_reasons)
         if game.get("official_date") != slate.target_date:
             exclusion_reasons.add("OFFICIAL_DATE_CHANGED")
         if game.get("status") not in ACCEPTED_PREGAME_STATUSES:
             exclusion_reasons.add("PREGAME_STATUS_NOT_ACCEPTED")
+
+        if initially_excluded:
+            relevant = _unique_bindings(relevant)
+            boundary_utc, boundary_time = _boundary(relevant)
+            start_time = _parse_utc(str(game["scheduled_start_utc"]))
+            if boundary_time >= start_time:
+                exclusion_reasons.add("OBSERVATION_AT_OR_AFTER_START")
+            observed_games.append(
+                (
+                    game,
+                    participant,
+                    None,
+                    relevant,
+                    boundary_utc,
+                    exclusion_reasons,
+                )
+            )
+            continue
 
         final = final_schedule_observer(game_pk, slate.target_date)
         if isinstance(final, FinalGameScheduleDisposition):

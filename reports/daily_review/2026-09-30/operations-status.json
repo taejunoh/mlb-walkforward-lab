@@ -1,0 +1,504 @@
+{
+  "schema": "MLB_DAILY_OPERATIONS_STATUS_V1",
+  "local_date": "2026-09-30",
+  "timezone": "America/New_York",
+  "checked_at_utc": "2026-09-30T19:51:43Z",
+  "automation": {
+    "id": "mlb",
+    "name": "MLB 매일 평가·정산·오답노트",
+    "status": "ACTIVE",
+    "interval_minutes": 30,
+    "date_limited": false,
+    "configuration_verified": true,
+    "first_scheduled_run_verified": true,
+    "first_scheduled_run_trigger_at_utc": "2026-09-29T21:04:45.586Z",
+    "local_computer_and_app_must_remain_running": true
+  },
+  "last_successful_operation": {
+    "stage": "POSTGAME_SETTLEMENT_AND_REVIEW_COMPLETED",
+    "completed_at_utc": "2026-09-30T11:56:58Z",
+    "target_date": "2026-09-16",
+    "primary_claims": 4,
+    "final_settlements": 4,
+    "totals_diagnostic_games": 15,
+    "totals_diagnostic_is_formal_ou_settlement": false,
+    "errors": [],
+    "workflow_complete": true,
+    "workflow_processed": true,
+    "complete_evidence": false,
+    "incomplete_evidence_reason": "Formal admitted market evidence is absent; this is not a betting ledger.",
+    "review": "reports/daily_review/2026-09-16/prospective_ml_settlement.json",
+    "postgame_receipts": [
+      "audit/prospective_ml_daily_flow/2026-09-16/ba95bf781edc5f9b0b40773dfde04ac221136fa1ec61234a1d943e083c4bf1ba.json"
+    ],
+    "pregame_receipts": [
+      "audit/prospective_ml_daily_flow/2026-09-16/4460f40785699ffedfa8a6a0def91a1bbe5386f6fbea0f264b5dc8a89b1b3797.json",
+      "audit/prospective_ml_daily_flow/2026-09-16/a1751cdc88929bf44706883d3ed04f0f01d7d51673cc415bcfaccec05af73092.json",
+      "audit/prospective_ml_daily_flow/2026-09-16/db8ac60c2bc5ddd8850e0febc2c02f711a16f685ed392992d37ff703a1ddf69d.json"
+    ],
+    "newly_settled_primary_claims": 4,
+    "metrics": {
+      "n": 4,
+      "winner_hits": 1,
+      "winner_misses": 3,
+      "accuracy": 0.25,
+      "brier": 0.24556147494789493,
+      "log_loss": 0.6825164251651317
+    }
+  },
+  "current_slate": {
+    "target_date": "2026-09-30",
+    "schedule_observed_at_utc": "2026-09-30T19:50:34Z",
+    "source_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&startDate=2026-09-29&endDate=2026-10-01&fields=totalGames,dates,date,games,gamePk,gameType,gameDate,status,abstractGameState,detailedState,codedGameState,teams,away,home,team,id,name",
+    "game_count": 4,
+    "game_type": "F",
+    "at_observation": {
+      "final": 0,
+      "in_progress": 1,
+      "warmup": 0,
+      "abstract_live": 1,
+      "pregame_or_scheduled_before_start": 3,
+      "pre_game": 2,
+      "scheduled": 1,
+      "actual_first_pitch_verified": false
+    },
+    "pregame_deadline_elapsed_without_prediction": 1,
+    "new_deadline_elapsed_since_prior_check": [],
+    "model_run_status": "BLOCKED_HISTORY_DUPLICATE_GAME_ID",
+    "new_pregame_claims": 0,
+    "prediction_coverage_status": "PARTIAL_NO_PREGAME_PREDICTION",
+    "missed_pregame_prediction_game_pks": [
+      849841
+    ],
+    "remaining_scheduled_cutoffs": 3,
+    "actual_first_pitch_verified": false,
+    "actual_first_pitch_time_utc": null,
+    "new_validation_samples": 0,
+    "first_scheduled_start_utc": "2026-09-30T18:00:00Z",
+    "preparation_target_utc": "2026-09-30T15:00:00Z",
+    "reason": "Human authorized research live activation. First live run exited 2 before any report/trace/receipt: historical postponed-original and rescheduled-final entries repeat gamePk and the research coverage parser rejects all duplicate IDs. No predictions saved; no bypass or unchanged retry.",
+    "preparation_target_elapsed": true,
+    "preparation_warning_first_notified_at_utc": "2026-09-30T15:08:03Z",
+    "latest_participant_availability": {
+      "record": "reports/daily_review/2026-09-30/operations-check-20260930T195003Z.json",
+      "observed_at_utc": "2026-09-30T19:50:54Z",
+      "game_pk": 849846,
+      "away_starting_nine_count": 9,
+      "home_starting_nine_count": 0,
+      "model_input_admitted": false,
+      "unchanged_from_record": "reports/daily_review/2026-09-30/operations-check-20260930T192003Z.json"
+    }
+  },
+  "latest_operational_check": {
+    "record": "reports/daily_review/2026-09-30/operations-check-20260930T195003Z.json",
+    "stage": "SOURCE_BLOCKERS_UNCHANGED_ROUTINE_PRESTART_STATE_TRANSITION",
+    "automation_dispatch_verified": true,
+    "matching_model_process_count": 0,
+    "new_model_runs": 0,
+    "new_primary_claims": 0,
+    "new_settlements": 0,
+    "preserved_sep24_final_settlements": 4,
+    "new_settlement_errors": 0,
+    "known_sep23_failure_retried": false,
+    "postseason_implementation_status": "IMPLEMENTED_TESTED_LIVE_VALIDATION_FAILED",
+    "notifiable_material_change": false,
+    "last_full_settlement_status_check": "reports/daily_review/2026-09-30/operations-check-20260930T150302Z.json",
+    "new_coverage_reviews": 0,
+    "coverage_review_paths": [
+      "reports/daily_review/2026-09-30/no_pregame_prediction_review.json",
+      "reports/daily_review/2026-09-30/no_pregame_prediction_review.md"
+    ],
+    "new_settlement_reviews": 0,
+    "new_review_artifacts": 0,
+    "new_totals_diagnostic_games": 0,
+    "last_full_settlement_status_target_date": "2026-09-16",
+    "settlement_review_paths": [
+      "reports/daily_review/2026-09-16/prospective_ml_settlement.json",
+      "reports/daily_review/2026-09-16/prospective_ml_settlement.md"
+    ],
+    "preserved_sep16_final_settlements": 4,
+    "last_full_settlement_status_target_dates": [
+      "2026-09-16",
+      "2026-09-24"
+    ],
+    "schedule_state_changes": [
+      {
+        "game_pk": 849848,
+        "previous": {
+          "abstractGameState": "Preview",
+          "codedGameState": "S",
+          "detailedState": "Scheduled"
+        },
+        "current": {
+          "abstractGameState": "Preview",
+          "codedGameState": "P",
+          "detailedState": "Pre-Game"
+        }
+      }
+    ],
+    "new_preparation_warnings": 0,
+    "new_near_start_warnings": 0,
+    "new_missed_pregame_cutoff_warnings": 0,
+    "new_model_reports": 0,
+    "participant_availability_checked_game_pks": [
+      849846
+    ],
+    "receipt_counts_unchanged": {
+      "2026-09-16": 4,
+      "2026-09-23": 16,
+      "2026-09-24": 4
+    },
+    "source_guards_unchanged": true,
+    "official_schedule_observed_by_utc": "2026-09-30T19:50:34Z",
+    "participant_availability_summary": {
+      "game_pk": 849846,
+      "away_starting_nine_count": 9,
+      "home_starting_nine_count": 0,
+      "away_probable_pitcher": {
+        "id": 680732,
+        "fullName": "Sean Burke"
+      },
+      "home_probable_pitcher": {
+        "id": 686613,
+        "fullName": "Hunter Brown"
+      },
+      "status": "UNSCORED_WAITING_FOR_HOME_LINEUP",
+      "limitation": "The masked official boxscore has no home batting-order slots at observation. Probable starters are available; do not misclassify an empty pitcher list in that boxscore as missing probable-starter data."
+    },
+    "participant_observed_by_utc": "2026-09-30T19:50:54Z"
+  },
+  "near_start_warnings_sent": [
+    {
+      "kind": "PREPARATION_TARGET_PASSED_WITHOUT_FORECAST",
+      "target_date": "2026-09-30",
+      "game_pk": 849841,
+      "preparation_target_utc": "2026-09-30T15:00:00Z",
+      "game_start_utc": "2026-09-30T18:00:00Z",
+      "first_notified_at_utc": "2026-09-30T15:08:03Z",
+      "record": "reports/daily_review/2026-09-30/operations-check-20260930T150302Z.json",
+      "reason": "Postseason ML research is implemented and offline tested, but live execution and automation adoption remain explicitly unactivated. No pregame forecasts saved. Preparation target elapsed, not a missed game-start cutoff.",
+      "required_user_action": "Authorize research-only live validation and subsequent automated ML recording/settlement if validation passes; no betting, totals, model refit or gate weakening.",
+      "repeat_notification": "Do not repeat this preparation warning while unchanged; report only a new actionable change or an actual missed game-start cutoff."
+    },
+    {
+      "kind": "NEAR_START_WITHOUT_FORECAST",
+      "target_date": "2026-09-30",
+      "game_pk": 849841,
+      "game_start_utc": "2026-09-30T18:00:00Z",
+      "threshold_minutes": 60,
+      "minutes_until_start_at_check": 37.1,
+      "first_notified_at_utc": "2026-09-30T17:22:57Z",
+      "record": "reports/daily_review/2026-09-30/operations-check-20260930T172003Z.json",
+      "reason": "First check within one hour of PHI@ATL start with no saved research forecast. Both starting nines are present and unchanged; historical duplicate-ID source failure remains unresolved.",
+      "required_user_action": "Existing scoped source-repair direction remains pending. Research live activation itself is already authorized; do not request that approval again.",
+      "repeat_notification": "Do not repeat this warning while unchanged; report a resolution, changed schedule, saved forecast or actual missed start cutoff."
+    },
+    {
+      "kind": "MISSED_PREGAME_CUTOFF",
+      "target_date": "2026-09-30",
+      "game_pk": 849841,
+      "game_start_utc": "2026-09-30T18:00:00Z",
+      "observed_at_utc": "2026-09-30T18:20:50Z",
+      "official_status": "In Progress",
+      "actual_first_pitch_time_utc": null,
+      "first_notified_at_utc": "2026-09-30T18:27:22Z",
+      "record": "reports/daily_review/2026-09-30/operations-check-20260930T182003Z.json",
+      "reason": "Scheduled pregame cutoff elapsed without a saved forecast. The score-free schedule is In Progress; no actual first-pitch timestamp is known. Coverage-only notification, not a model result.",
+      "repeat_notification": "Do not repeat this warning while unchanged; report only a new saved prediction, source resolution, or changed official status."
+    }
+  ],
+  "next_day_slate": {
+    "target_date": "2026-10-01",
+    "game_count": 4,
+    "game_type": "F",
+    "scheduled_starts_edt": [
+      "14:00",
+      "17:00",
+      "20:00",
+      "22:00"
+    ],
+    "status": "BLOCKED_HISTORY_DUPLICATE_GAME_ID",
+    "d_minus_one_ready": false,
+    "reason": "Research activation is authorized but initial live validation failed at historical schedule identity parsing. Sep30 inputs are not complete; do not retry unchanged failure.",
+    "schedule_observed_at_utc": "2026-09-30T19:50:34Z"
+  },
+  "known_blockers": [
+    {
+      "id": "postseason-f-not-supported",
+      "status": "SUPERSEDED_BY_AUTHORIZED_ACTIVATION_ATTEMPT",
+      "already_reported_to_user": true,
+      "evidence": [
+        "docs/postseason_ml_research.md",
+        "docs/superpowers/plans/2026-09-30-postseason-ml-research-verification.md",
+        "mlb_backtest/competition_policy.py",
+        "mlb_backtest/experimental_totals_sources.py"
+      ],
+      "source_sha256": {
+        "mlb_backtest/live_sources.py": "5111ba6ae9b7fc907697f3234114ac2de654719a8692a7dccb1dadea75cae98e",
+        "mlb_backtest/live_features.py": "297f864e7ca873a2066e7c84cee3c3dfdf6e030f8d8640cd537250fed7ef5e72",
+        "mlb_backtest/experimental_totals_sources.py": "f6fcf5c12538495db06e5549b1e9c341657ed1599b4db773d648b8f8fd6eeac9"
+      },
+      "action": "Preserve regular defaults; do not treat changed source hashes or this heartbeat as an activation handoff.",
+      "research_support": "IMPLEMENTED_TESTED_NOT_ACTIVATED",
+      "reason": "Research support implemented; human now authorized activation. See research-history-duplicate-game-pk for current execution blocker."
+    },
+    {
+      "id": "sep23-824785-multi-date-result",
+      "status": "OPEN",
+      "target_date": "2026-09-23",
+      "game_pk": 824785,
+      "already_reported_to_user": true,
+      "reason": "Official result schedule contains postponed and rescheduled date buckets; the existing strict parser rejects the shape.",
+      "review": "reports/daily_review/2026-09-23/prospective_ml_settlement.json",
+      "action": "Keep raw evidence and diagnostic outcome separate; do not alter the payload or bypass formal settlement validation."
+    },
+    {
+      "id": "research-history-duplicate-game-pk",
+      "status": "OPEN",
+      "already_reported_to_user": true,
+      "evidence": [
+        "reports/daily_review/2026-09-30/postseason-live-activation-attempt-20260930T1521Z.json",
+        "mlb_backtest/live_history.py"
+      ],
+      "reason": "Human authorized research live activation. First live run exited 2 before any report/trace/receipt: historical postponed-original and rescheduled-final entries repeat gamePk and the research coverage parser rejects all duplicate IDs. No predictions saved; no bypass or unchanged retry.",
+      "action": "Review and repair legitimate postponed/rescheduled history identity handling under separately authorized source-change scope; do not weaken gates, tamper raw responses, or repeat unchanged failure."
+    }
+  ],
+  "coverage_gap_scope": "No saved pregame prediction was found for these dates. This is not proof that a scheduled game was missed; off-days must be distinguished using official schedules. No absent prediction is scored as a loss.",
+  "coverage_gaps": [
+    {
+      "date": "2026-09-25",
+      "status": "NO_PREGAME_PREDICTION",
+      "backfilled": false
+    },
+    {
+      "date": "2026-09-26",
+      "status": "NO_PREGAME_PREDICTION",
+      "backfilled": false
+    },
+    {
+      "date": "2026-09-27",
+      "status": "NO_PREGAME_PREDICTION",
+      "backfilled": false
+    },
+    {
+      "date": "2026-09-28",
+      "status": "OFF_DAY",
+      "official_game_count": 0,
+      "source_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-28&fields=totalGames,dates,date,games,gamePk,gameType,gameDate,status,abstractGameState,detailedState",
+      "backfilled": false
+    },
+    {
+      "date": "2026-09-29",
+      "status": "NO_PREGAME_PREDICTION",
+      "official_game_count": 4,
+      "scheduled_cutoffs_elapsed": 4,
+      "saved_pregame_predictions": 0,
+      "added_validation_samples": 0,
+      "reason": "POSTSEASON_F_NOT_SUPPORTED",
+      "record": "reports/daily_review/2026-09-29/operations-check-20260930T020446Z.json",
+      "backfilled": false,
+      "coverage_review_paths": [
+        "reports/daily_review/2026-09-29/no_pregame_prediction_review.json",
+        "reports/daily_review/2026-09-29/no_pregame_prediction_review.md"
+      ]
+    },
+    {
+      "date": "2026-09-30",
+      "status": "PARTIAL_NO_PREGAME_PREDICTION",
+      "official_game_count": 4,
+      "scheduled_cutoffs_elapsed": 1,
+      "saved_pregame_predictions": 0,
+      "added_validation_samples": 0,
+      "missed_game_pks": [
+        849841
+      ],
+      "remaining_future_cutoffs": 3,
+      "accuracy": null,
+      "brier_score": null,
+      "log_loss": null,
+      "reason": "MISSED_PREGAME_CUTOFF_NO_PREDICTION",
+      "record": "reports/daily_review/2026-09-30/operations-check-20260930T182003Z.json",
+      "coverage_review_paths": [
+        "reports/daily_review/2026-09-30/no_pregame_prediction_review.json",
+        "reports/daily_review/2026-09-30/no_pregame_prediction_review.md"
+      ],
+      "backfilled": false
+    }
+  ],
+  "next_run": {
+    "trigger": "Next existing app-managed heartbeat.",
+    "checks": [
+      "Read research_activation: human approval is granted. Do not ask activation permission again or interpret historical manual_implementation as the current authority.",
+      "Do not repeat the live history duplicate-gamePk failure without a verified source/contract repair. Preserve raw evidence and strict identity gates.",
+      "Continue schedule/artifact checks and separately admitted settlement work; preserve terminal claims and known Sep23 game 824785 failure.",
+      "Historical analysis must use the isolated outcome-blind poststart workflow only with valid explicit inputs. Never turn hindsight reconstruction into prospective claims.",
+      "Notify only meaningful new completion/failure/missed cutoffs; do not repeat the same warning.",
+      "Poststart reconstruction is also blocked: authentic collector history has multiple Statcast/venue bindings (91 in verified Sep24 report), but evaluator requires exactly four. Do not discard/merge bindings or repeat the unchanged preparation. Standalone scaffold is unexecuted/not pilot-ready."
+    ]
+  },
+  "model_refit_performed": false,
+  "source_code_modified": false,
+  "manual_implementation": {
+    "status": "IMPLEMENTED_TESTED_NOT_ACTIVATED",
+    "completed_at_utc": "2026-09-30T13:59:47Z",
+    "verification": "docs/superpowers/plans/2026-09-30-postseason-ml-research-verification.md",
+    "offline_verification": {
+      "tests_passed": 508,
+      "subtests_passed": 427,
+      "independent_integration_review": "PASS",
+      "live_upstream_verified": false,
+      "full_season_performance_verified": false
+    },
+    "source_code_modified": true,
+    "human_approval_date_local": "2026-09-30",
+    "scope": "Existing postseason ML research design: implementation and offline tests without intermediate approval",
+    "plan": "docs/superpowers/plans/2026-09-30-postseason-ml-research.md",
+    "ledger": ".superpowers/sdd/2026-09-30-postseason-ml-research/progress.md",
+    "automation_adoption_authorized": false,
+    "guard": "Offline implementation and independent review passed. This is not live validation or authorization for automation adoption. Preserve regular default behavior; do not launch the opt-in research path until a separately authorized activation handoff. Incomplete claim reservations fail closed and require separately scoped recovery; never backdate a claim."
+  },
+  "current_day_prediction_coverage": {
+    "target_date": "2026-09-30",
+    "status": "PARTIAL_NO_PREGAME_PREDICTION",
+    "official_game_count": 4,
+    "scheduled_cutoffs_elapsed": 1,
+    "saved_pregame_predictions": 0,
+    "added_validation_samples": 0,
+    "missed_game_pks": [
+      849841
+    ],
+    "remaining_future_cutoffs": 3,
+    "accuracy": null,
+    "brier_score": null,
+    "log_loss": null,
+    "reason": "MISSED_PREGAME_CUTOFF_NO_PREDICTION",
+    "note_ko": "PHI@ATL(849841)의 예정 사전 예측 cutoff가 지났고 저장된 예측은 없습니다. 이는 커버리지 공백일 뿐이며 모델 PASS/실패나 적중률 0%를 뜻하지 않습니다. 경기 결과와 실제 첫 투구 시각은 확인하지 않았습니다.",
+    "preparation_target_elapsed": true
+  },
+  "previous_operations_status": {
+    "path": "reports/daily_review/2026-09-29/operations-status.json",
+    "sha256": "e7bf3e8916ae5148d890d482b670b423790b18167d96641251859caaab1d7834",
+    "record": "reports/daily_review/2026-09-29/operations-check-20260930T033446Z.json"
+  },
+  "previous_day_slate": {
+    "target_date": "2026-09-29",
+    "game_count": 4,
+    "at_observation": {
+      "final": 4,
+      "in_progress": 0
+    },
+    "prediction_coverage_status": "NO_PREGAME_PREDICTION",
+    "saved_pregame_predictions": 0,
+    "added_validation_samples": 0,
+    "record": "reports/daily_review/2026-09-29/operations-check-20260930T020446Z.json",
+    "schedule_observed_at_utc": "2026-09-30T19:50:34Z",
+    "coverage_review_paths": [
+      "reports/daily_review/2026-09-29/no_pregame_prediction_review.json",
+      "reports/daily_review/2026-09-29/no_pregame_prediction_review.md"
+    ]
+  },
+  "previous_successful_operation": {
+    "stage": "POSTGAME_SETTLEMENT_STATUS_VERIFIED",
+    "target_date": "2026-09-24",
+    "primary_claims": 4,
+    "final_settlements": 4,
+    "totals_diagnostic_games": 7,
+    "totals_diagnostic_is_formal_ou_settlement": false,
+    "errors": [],
+    "workflow_complete": true,
+    "complete_evidence": false,
+    "incomplete_evidence_reason": "Formal admitted market evidence is absent; this is not a betting ledger.",
+    "review": "reports/daily_review/2026-09-24/prospective_ml_settlement.json",
+    "postgame_receipts": [
+      "audit/prospective_ml_daily_flow/2026-09-24/62aa20b134c83dd19f12413f269d3614bdab22dca311104a52a0dd7f6f748c46.json",
+      "audit/prospective_ml_daily_flow/2026-09-24/919ae756f84b2da8fe52de29e5ed72aa29fef36ce9e82ebb7fe0be13e4f7bac9.json"
+    ]
+  },
+  "receipt_inventory": {
+    "dates": [
+      {
+        "target_date": "2026-09-16",
+        "pregame_receipts": 3,
+        "distinct_primary_claims": 4,
+        "postgame_receipts": 1
+      },
+      {
+        "target_date": "2026-09-23",
+        "pregame_receipts": 8,
+        "distinct_primary_claims": 16,
+        "postgame_receipts": 8
+      },
+      {
+        "target_date": "2026-09-24",
+        "pregame_receipts": 2,
+        "distinct_primary_claims": 4,
+        "postgame_receipts": 2
+      }
+    ],
+    "sep25_through_oct1": "NO_FLOW_DIRECTORIES"
+  },
+  "research_activation": {
+    "authorization_status": "AUTHORIZED_BY_USER",
+    "authorization_date_local": "2026-09-30",
+    "authorization_evidence": {
+      "preceding_question": "베팅·총점 예측은 제외하고, 실데이터 검증 후 자동 예측·기록·정산까지 활성화할까요?",
+      "user_reply": "계속 진행해"
+    },
+    "scope": "Research-only postseason live verification; adopt automatic ML prediction/recording/settlement after validation passes. No betting, totals, refit, recalibration or prospective backfill.",
+    "status": "LIVE_VALIDATION_FAILED_SOURCE_CONTRACT",
+    "live_validation_passed": false,
+    "automation_prompt_updated": true,
+    "failure": "research schedule duplicate coverage gamePk",
+    "exit_code": 2,
+    "attempt_record": "reports/daily_review/2026-09-30/postseason-live-activation-attempt-20260930T1521Z.json",
+    "new_model_reports": 0,
+    "new_primary_claims": 0,
+    "next_action": "Review and repair legitimate postponed/rescheduled history identity handling under separately authorized source-change scope; do not weaken gates, tamper raw responses, or repeat unchanged failure.",
+    "no_repeat_activation_approval": true
+  },
+  "historical_reconstruction_request": {
+    "requested_through_date": "2026-09-30",
+    "review_range_start": "2026-09-01",
+    "status": "BLOCKED_EXISTING_EVALUATOR_HISTORY_BINDING_CARDINALITY",
+    "outcomes_excluded": true,
+    "classification": "POSTSTART_RECONSTRUCTED_RESEARCH_NOT_PROSPECTIVE",
+    "prospective_backfill_authorized": false,
+    "active_owner": null,
+    "initial_dates": [
+      "2026-09-25",
+      "2026-09-26",
+      "2026-09-27"
+    ],
+    "pilot_gate": "Not executed: independent review identified authentic multi-binding history rejected by existing evaluator.",
+    "scope": "Existing evaluator and collectors only; standalone analysis preparation script under reports, no application source change.",
+    "preparation_script": "reports/daily_review/2026-09-30/reconstruction-preparation/prepare_poststart_research_inputs.py",
+    "existing_prediction_inventory_status": "VERIFIED_EXISTING_PRELIMINARY",
+    "no_duplicate_work": "Do not start collection or model reconstruction until the input contract is repaired and verified. Repeating preparation or selecting four bindings is not an allowed workaround.",
+    "source_repair_approval": "Awaiting scoped human direction for application source repairs: live postponed/rescheduled identity handling and poststart authentic multi-binding history closure.",
+    "existing_prediction_verification": {
+      "trace_count": 33,
+      "replayed_rows": 121,
+      "unique_date_game_forecasts": 89,
+      "failed": 0,
+      "source": "reports/daily_review/2026-09-30/existing-september-prediction-verification.json"
+    },
+    "coverage_report": "reports/daily_review/2026-09-30/september-analysis-coverage-20260930.json",
+    "coverage_markdown": "reports/daily_review/2026-09-30/september-analysis-coverage-20260930.md",
+    "new_reconstructed_forecasts": 0,
+    "preparation_status": "UNEXECUTED_NOT_PILOT_READY",
+    "blocker_evidence": "reports/daily_review/2026-09-30/reconstruction-preparation/input-contract-blocker.json",
+    "history_binding_contract": {
+      "evaluator_required_total": 4,
+      "observed_authentic_total": 91,
+      "by_role": {
+        "HISTORY_SCHEDULE": 1,
+        "HISTORY_ERA": 1,
+        "HISTORY_STATCAST": 55,
+        "HISTORY_VENUE": 34
+      },
+      "source_report": "reports/experimental_daily/2026-09-24/20260924T203303766913Z-095c7301fcd8a3f4.json"
+    },
+    "checked_at_utc": "2026-09-30T15:47:02Z"
+  }
+}

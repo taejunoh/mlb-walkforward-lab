@@ -1,0 +1,18 @@
+{
+  "schema": "MANUAL_PUBLIC_MARKET_REVIEW_ADDENDUM_V1",
+  "target_date": "2026-09-24",
+  "recorded_at_utc": "2026-09-24T20:33:00Z",
+  "time_precision": "minute",
+  "prior_review": "reports/daily_review/2026-09-24/public-market-review-2015Z.json",
+  "book": "FanDuel",
+  "vendor_quote_timestamp": null,
+  "ny_logged_in_offer_verified": false,
+  "formal_market_trace": false,
+  "observations": [
+    {"game_pk":823411,"status":"PUBLIC_PAGE_RECHECK_UNCHANGED","away_ml":114,"home_ml":-134,"total_line":7.5,"over_odds":-120,"under_odds":-102,"url":"https://sportsbook.fanduel.com/teams/mlb/milwaukee-brewers/odds"},
+    {"game_pk":824707,"status":"PUBLIC_PAGE_RECHECK_UNCHANGED","away_ml":108,"home_ml":-126,"total_line":6.5,"over_odds":-122,"under_odds":100,"url":"https://sportsbook.fanduel.com/teams/mlb/cleveland-guardians/odds"},
+    {"game_pk":824866,"status":"RECHECK_HTTP_403","new_quote":null,"note":"Earlier 20:15Z public-page observation remains historical and was not refreshed by this failed attempt.","url":"https://sportsbook.fanduel.com/teams/mlb/atlanta-braves/odds"},
+    {"game_pk":823493,"status":"PUBLIC_PAGE_QUOTE_OBSERVED","away":"TB","home":"NYY","scheduled_start_utc":"2026-09-24T23:05:00Z","away_starter":"Ian Seymour","home_starter":"Cameron Schlittler","away_ml":128,"home_ml":-152,"total_line":6.5,"over_odds":114,"under_odds":-140,"url":"https://sportsbook.fanduel.com/teams/mlb/tampa-bay-rays/odds","note":"The Rays page now exposes the game quote. The Yankees page still returned HTTP 403."}
+  ],
+  "caveats": ["These are public-page observations, not verified executable New York account offers.","The recording time is not the sportsbook update time.","No formal market admission or betting recommendation was created."]
+}

@@ -1,0 +1,81 @@
+{
+  "schema": "V51_TEMPORAL_CALIBRATION_ARTIFACT_MANIFEST_V1",
+  "legacy_execution_timestamps": "UNRECORDED_NOT_INFERRED_OR_BACKFILLED",
+  "legacy_status": "LEGACY_RETROSPECTIVE_ONLY_PRESEAL_OUTCOME_READ",
+  "numeric_reference_pair": {
+    "selection": "AUTHORITATIVE_FOR_NUMERIC_COMPARISON_ONLY_NOT_TEMPORAL_ADMISSION",
+    "temporal_admission": "WITHDRAWN_PREPARE_READ_LOCKED_AND_EVALUATED_BEFORE_PREDICTION_SEAL",
+    "prepare_receipt": {
+      "path": "prepare/prepare_receipt.json",
+      "sha256": "7529d167d2d2798b7bb8ba40bbc432ea3732d3cf7202fd5fa1c24df2bbfaa7bb"
+    },
+    "predictions": {
+      "path": "prepare/candidate_predictions.jsonl",
+      "sha256": "f5b5297a7fb0b988089e54839a40173b141c471938501df8e56deb5cb39d8039"
+    },
+    "evaluation_report": {
+      "path": "evaluate/evaluation_report.json",
+      "sha256": "8680233afa639467e70568e5d964848abc941980024a097d5a48bd9c75227954"
+    }
+  },
+  "post_outcome_metadata_equivalent_duplicate_pair": {
+    "selection": "LEGACY_RETROSPECTIVE_ONLY_PRESERVE_DO_NOT_AUTOSELECT",
+    "reason": "Created after the numeric-reference evaluation to bind added receipt caveat metadata and local code digest; no fit, prediction, or metric changed.",
+    "prepare_receipt": {
+      "path": "prepare-final/prepare_receipt.json",
+      "sha256": "a27b0d7a1962d7590c66152bebc0ccdfb9e11c0a226735154f49339259fe93ca"
+    },
+    "predictions": {
+      "path": "prepare-final/candidate_predictions.jsonl",
+      "sha256": "f5b5297a7fb0b988089e54839a40173b141c471938501df8e56deb5cb39d8039"
+    },
+    "evaluation_report": {
+      "path": "evaluate-final/evaluation_report.json",
+      "sha256": "bae7cde65ba1df81066733c241403a493536e10a52f3630fb0fec3e864381e56"
+    }
+  },
+  "corrected_technical_replay": {
+    "selection": "TECHNICALLY_SEALED_REPLAY_NOT_LIVE_OR_UNSEEN_VALIDATION",
+    "legacy_pairs_remain": "LEGACY_RETROSPECTIVE_ONLY_PRESEAL_OUTCOME_READ",
+    "prepare": {
+      "path": "prepare-corrected/prepare_receipt.json",
+      "execution_utc": "2026-09-02T20:42:54Z",
+      "sha256": "9bc723332b80f36d8786f5258a51ebd247cf7b05879ca2d68a28e02c32ff5805"
+    },
+    "predictions": {
+      "path": "prepare-corrected/candidate_predictions.jsonl",
+      "sha256": "f5b5297a7fb0b988089e54839a40173b141c471938501df8e56deb5cb39d8039"
+    },
+    "evaluate": {
+      "path": "evaluate-corrected/evaluation_report.json",
+      "execution_utc": "2026-09-02T20:43:16Z",
+      "sha256": "db00e569023875ab9ed3638fde1c352dce18477faba088d3dab241280f9fa043"
+    },
+    "sidecars_verified": true,
+    "identity_vs_legacy_numeric_reference": {
+      "prediction_sha256": true,
+      "alpha_beta": true,
+      "candidate_metrics": true,
+      "baseline_metrics": true
+    }
+  },
+  "equal_across_pairs": {
+    "candidate_prediction_sha256": "f5b5297a7fb0b988089e54839a40173b141c471938501df8e56deb5cb39d8039",
+    "alpha": 0.08502520804939874,
+    "beta": 0.5799643656381512,
+    "candidate": {
+      "N": 1340,
+      "W": 717,
+      "L": 623,
+      "brier": 0.2461723075976678,
+      "log_loss": 0.6853621813783786
+    },
+    "baseline": {
+      "N": 1340,
+      "W": 718,
+      "L": 622,
+      "brier": 0.24627075738049964,
+      "log_loss": 0.6855527297095905
+    }
+  }
+}

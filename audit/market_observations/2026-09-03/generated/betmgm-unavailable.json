@@ -1,0 +1,7 @@
+{
+  "schema":"PROVISIONAL_MULTIBOOK_MARKET_UNAVAILABLE_V1",
+  "source_book":"BETMGM",
+  "recorded_at_utc":"2026-09-03T13:53:29.630Z",
+  "reason":"COLLECTOR_REJECTED",
+  "detail":"Public NY page exposed 9 MLB rows, but URL host www.ny.betmgm.com is outside fixed sportsbook authority sports.betmgm.com; no market capture was admitted. Source observation: audit/market_observations/2026-09-03/20260903-browser-public-sources.json"
+}

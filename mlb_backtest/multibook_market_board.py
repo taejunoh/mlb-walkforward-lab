@@ -17,6 +17,7 @@ from .market_play_contracts import (
     MlQuote,
     canonical_json_bytes,
     canonical_utc,
+    canonical_utc_ns,
     content_digest,
     sidecar_bytes,
     validate_relative_path,
@@ -33,7 +34,14 @@ from .secure_fs import (
 
 
 SCHEDULE_SCHEMA = "PROVISIONAL_MULTIBOOK_MARKET_SCHEDULE_V1"
-BOARD_SCHEMA = "PROVISIONAL_MULTIBOOK_MARKET_BOARD_V1"
+BOARD_SCHEMA_V1 = "PROVISIONAL_MULTIBOOK_MARKET_BOARD_V1"
+BOARD_SCHEMA_V2 = "PROVISIONAL_MULTIBOOK_MARKET_BOARD_V2"
+BOARD_SCHEMA_V3 = "PROVISIONAL_MULTIBOOK_MARKET_BOARD_V3"
+# Keep the pre-V2 public name as the legacy schema; new intake defaults are
+# explicit through BOARD_SCHEMA_V3 below.
+BOARD_SCHEMA = BOARD_SCHEMA_V1
+BOARD_SCHEMAS = frozenset({BOARD_SCHEMA_V1, BOARD_SCHEMA_V2, BOARD_SCHEMA_V3})
+BOOKS = SUPPORTED_BOOK_IDS
 BOARD_PREFIX = PurePosixPath("data/experimental_multibook_market/boards")
 _DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 _TEAM_RE = re.compile(r"[^A-Z0-9]+")
@@ -65,7 +73,9 @@ class ScheduleAuthority:
     games: tuple[dict[str, object], ...]
     receipt_relative: Path
     receipt_snapshot: RegularFileSnapshot
-    receipt_sidecar_snapshot: RegularFileSnapshot
+    receipt_sidecar_snapshot: RegularFileSnapshot | None
+    receipt_sha256: str = ""
+    input_snapshots: tuple[RegularFileSnapshot, ...] = ()
 
     @property
     def by_game(self) -> Mapping[int, dict[str, object]]:
@@ -89,10 +99,20 @@ class MarketBoardAuthority:
     board_relative: Path
     board_snapshot: RegularFileSnapshot
     board_sidecar_snapshot: RegularFileSnapshot
+    _root: Path | None = None
+    _input_snapshots: tuple[RegularFileSnapshot, ...] = ()
 
     @property
     def by_game(self) -> Mapping[int, MarketBoardGame]:
         return MappingProxyType({game.game_pk: game for game in self.games})
+
+    def rebind(self) -> None:
+        """Require the loaded board and its admitted schedule chain unchanged."""
+        if self._root is None or not self._input_snapshots:
+            return
+        with open_trusted_root(self._root) as trusted:
+            for snapshot in self._input_snapshots:
+                rebind_regular_snapshot(trusted, snapshot, "market board authority input")
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +176,27 @@ def _match_event(event: Mapping[str, object], games: Sequence[Mapping[str, objec
     return int(matches[0]["game_pk"])
 
 
+def _match_event_v3(
+    event: Mapping[str, object], games: Sequence[Mapping[str, object]]
+) -> tuple[int, str, int]:
+    """Match one raw event without ever rounding or inferring a clock time."""
+    candidates = [game for game in games if _same_teams(event, game)]
+    exact = [game for game in candidates if _same_start(event, game)]
+    if len(exact) == 1:
+        return int(exact[0]["game_pk"]), "EXACT", 0
+    if exact:
+        raise ValueError("market event has ambiguous exact official matches")
+    # The candidate population is intentionally the whole official slate, not
+    # a ±60-second window: doubleheaders must not fall through on proximity.
+    if len(candidates) != 1:
+        raise ValueError("market event does not have one ordered-team official candidate")
+    game = candidates[0]
+    delta = canonical_utc_ns(event["scheduled_start_utc"]) - canonical_utc_ns(game["scheduled_start_utc"])
+    if abs(delta) > 60_000_000_000:
+        raise ValueError("market event start differs from official start by more than 60 seconds")
+    return int(game["game_pk"]), "UNIQUE_ORDERED_TEAMS_60S", delta
+
+
 def _validate_schedule(value: object) -> tuple[str, tuple[dict[str, object], ...]]:
     item = _exact(value, {"schema", "content_sha256", "target_date", "games"}, "schedule")
     if item["schema"] != SCHEDULE_SCHEMA:
@@ -186,6 +227,33 @@ def _validate_schedule(value: object) -> tuple[str, tuple[dict[str, object], ...
 def load_schedule_authority(root: Path, schedule_receipt: Path) -> ScheduleAuthority:
     relative = validate_relative_path(schedule_receipt)
     with open_trusted_root(root) as trusted:
+        candidate = read_regular_snapshot(
+            trusted, relative, "schedule receipt", max_bytes=2 * 1024 * 1024
+        )
+        assert candidate is not None
+        try:
+            candidate_payload = json.loads(candidate.contents.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("schedule receipt is not canonical JSON") from exc
+    if isinstance(candidate_payload, dict) and candidate_payload.get("schema_version") == 1:
+        # Keep normal market-board imports independent of the HTTP-capable
+        # live-observation module; this branch is only for an admitted receipt.
+        from .live_sources import load_live_schedule_observation
+
+        live = load_live_schedule_observation(root, relative)
+        target_date, games = _validate_schedule(
+            {
+                "schema": SCHEDULE_SCHEMA,
+                "content_sha256": "",
+                "target_date": live.target_date,
+                "games": list(live.games),
+            }
+        )
+        return ScheduleAuthority(
+            target_date, games, relative, live.input_snapshots[0], None,
+            live.receipt_sha256, live.input_snapshots,
+        )
+    with open_trusted_root(root) as trusted:
         snapshot, sidecar, payload = _read_json(trusted, relative, "schedule receipt", 2 * 1024 * 1024)
         without = dict(payload)
         digest = without.get("content_sha256")
@@ -193,7 +261,10 @@ def load_schedule_authority(root: Path, schedule_receipt: Path) -> ScheduleAutho
         if digest != content_digest(without):
             raise ValueError("schedule content_sha256 differs")
         target_date, games = _validate_schedule(payload)
-        return ScheduleAuthority(target_date, games, relative, snapshot, sidecar)
+        return ScheduleAuthority(
+            target_date, games, relative, snapshot, sidecar,
+            hashlib.sha256(snapshot.contents).hexdigest(), (snapshot, sidecar),
+        )
 
 
 def _quote_board_game(game: Mapping[str, object], outcome: LoadedCaptureOutcome, *, book_id: str) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
@@ -238,23 +309,147 @@ def _quote_board_game(game: Mapping[str, object], outcome: LoadedCaptureOutcome,
     return moneylines, totals
 
 
-def normalize_market_board(root: Path, schedule_receipt: Path, capture_outcomes: Sequence[Path]) -> BuiltMarketBoard:
+def _v3_board(
+    schedule: ScheduleAuthority, loaded: Sequence[LoadedCaptureOutcome]
+) -> dict[str, object]:
+    """Project authenticated outcomes once through the V3 event matcher."""
+    by_book_event: dict[tuple[str, str], tuple[int, Mapping[str, object]]] = {}
+    audit: list[dict[str, object]] = []
+    for outcome in loaded:
+        if outcome.status != "AVAILABLE" or outcome.raw_snapshot is None:
+            continue
+        book = str(outcome.payload["source_book"])
+        raw_payload = json.loads(outcome.raw_snapshot.contents.decode("utf-8"))
+        mapped_games: set[int] = set()
+        ids: set[str] = set()
+        for event in raw_payload["events"]:
+            assert isinstance(event, Mapping)
+            event_id = str(event["book_event_id"])
+            if event_id in ids:
+                raise ValueError("duplicate source event ID within book")
+            ids.add(event_id)
+            game_pk, rule, delta = _match_event_v3(event, schedule.games)
+            if game_pk in mapped_games:
+                raise ValueError("duplicate book events mapped to one game")
+            mapped_games.add(game_pk)
+            by_book_event[(book, event_id)] = (game_pk, event)
+            audit.append(
+                {
+                    "book_id": book,
+                    "source_event_id": event_id,
+                    "raw_capture_relative": outcome.payload["raw_capture_relative"],
+                    "raw_capture_sha256": outcome.payload["raw_capture_sha256"],
+                    "source_scheduled_start_utc": event["scheduled_start_utc"],
+                    "official_scheduled_start_utc": next(
+                        game["scheduled_start_utc"] for game in schedule.games if int(game["game_pk"]) == game_pk
+                    ),
+                    "delta_nanoseconds": delta,
+                    "game_pk": game_pk,
+                    "rule": rule,
+                }
+            )
+    ordered_loaded = sorted(loaded, key=lambda item: SUPPORTED_BOOK_IDS.index(str(item.payload["source_book"])))
+    bindings: list[dict[str, object]] = []
+    for outcome in ordered_loaded:
+        bindings.append(
+            {
+                "book_id": outcome.payload["source_book"],
+                "capture_outcome_relative": outcome.relative.as_posix(),
+                "capture_outcome_sha256": hashlib.sha256(outcome.snapshot.contents).hexdigest(),
+                "capture_outcome_sidecar_sha256": hashlib.sha256(outcome.sidecar_snapshot.contents).hexdigest(),
+            }
+        )
+    audit.sort(key=lambda item: (SUPPORTED_BOOK_IDS.index(str(item["book_id"])), str(item["source_event_id"]), int(item["game_pk"])))
+    board_games: list[dict[str, object]] = []
+    for game in schedule.games:
+        game_pk = int(game["game_pk"])
+        moneylines: list[dict[str, object]] = []
+        totals: list[dict[str, object]] = []
+        for outcome in ordered_loaded:
+            if outcome.status != "AVAILABLE":
+                continue
+            book = str(outcome.payload["source_book"])
+            for (mapped_book, event_id), (mapped_game, event) in by_book_event.items():
+                if mapped_book != book or mapped_game != game_pk:
+                    continue
+                moneyline = event["moneyline"]
+                assert isinstance(moneyline, Mapping)
+                moneylines.append(
+                    {
+                        "game_pk": game_pk, "book_id": book, "event_id": event_id,
+                        "captured_at_utc": outcome.payload["captured_at_utc"],
+                        "away_american_odds": moneyline["away_american_odds"],
+                        "home_american_odds": moneyline["home_american_odds"],
+                        "raw_capture_relative": outcome.payload["raw_capture_relative"],
+                        "raw_capture_sha256": outcome.payload["raw_capture_sha256"],
+                    }
+                )
+                for total in event["totals"]:
+                    assert isinstance(total, Mapping)
+                    totals.append(
+                        {
+                            "game_pk": game_pk, "book_id": book, "event_id": event_id,
+                            "captured_at_utc": outcome.payload["captured_at_utc"],
+                            "line_half_runs": total["line_half_runs"],
+                            "over_american_odds": total["over_american_odds"],
+                            "under_american_odds": total["under_american_odds"],
+                            "raw_capture_relative": outcome.payload["raw_capture_relative"],
+                            "raw_capture_sha256": outcome.payload["raw_capture_sha256"],
+                        }
+                    )
+        moneylines.sort(key=lambda row: (SUPPORTED_BOOK_IDS.index(str(row["book_id"])), str(row["event_id"])))
+        totals.sort(key=lambda row: (int(row["line_half_runs"]), SUPPORTED_BOOK_IDS.index(str(row["book_id"])), str(row["event_id"])))
+        board_games.append({**game, "moneylines": moneylines, "totals": totals})
+    board: dict[str, object] = {
+        "schema": BOARD_SCHEMA_V3,
+        "content_sha256": "",
+        "target_date": schedule.target_date,
+        "schedule_receipt_relative": schedule.receipt_relative.as_posix(),
+        "schedule_receipt_sha256": schedule.receipt_sha256,
+        "capture_outcomes": [item.payload for item in ordered_loaded],
+        "capture_outcome_bindings": bindings,
+        "event_match_audit": audit,
+        "games": board_games,
+    }
+    board["content_sha256"] = content_digest(board)
+    return board
+
+
+def normalize_market_board(
+    root: Path,
+    schedule_receipt: Path,
+    capture_outcomes: Sequence[Path],
+    *,
+    board_schema: str = BOARD_SCHEMA_V3,
+) -> BuiltMarketBoard:
     schedule_relative = validate_relative_path(schedule_receipt)
-    if len(capture_outcomes) != len(SUPPORTED_BOOK_IDS):
-        raise ValueError("exactly five capture outcomes are required")
+    if not isinstance(board_schema, str) or board_schema not in BOARD_SCHEMAS:
+        raise ValueError("market board schema differs")
+    if board_schema == BOARD_SCHEMA_V1 and len(capture_outcomes) != len(SUPPORTED_BOOK_IDS):
+        raise ValueError("legacy V1 boards require exactly five capture outcomes")
+    if board_schema in {BOARD_SCHEMA_V2, BOARD_SCHEMA_V3} and not 1 <= len(capture_outcomes) <= len(SUPPORTED_BOOK_IDS):
+        raise ValueError("V2/V3 boards require one to five capture outcomes")
     outcome_relatives = tuple(validate_relative_path(path) for path in capture_outcomes)
+    schedule = load_schedule_authority(root, schedule_relative)
     with open_trusted_root(root) as trusted:
-        schedule_snapshot, schedule_sidecar, schedule_payload = _read_json(trusted, schedule_relative, "schedule receipt", 2 * 1024 * 1024)
-        schedule_digest = schedule_payload.get("content_sha256")
-        schedule_without = dict(schedule_payload)
-        schedule_without["content_sha256"] = ""
-        if schedule_digest != content_digest(schedule_without):
-            raise ValueError("schedule content_sha256 differs")
-        target_date, games = _validate_schedule(schedule_payload)
+        for input_snapshot in schedule.input_snapshots:
+            rebind_regular_snapshot(trusted, input_snapshot, "schedule input")
+        target_date, games = schedule.target_date, schedule.games
         loaded = [load_capture_outcome(trusted, relative) for relative in outcome_relatives]
         books = [outcome.payload["source_book"] for outcome in loaded]
-        if set(books) != set(SUPPORTED_BOOK_IDS) or len(set(books)) != len(SUPPORTED_BOOK_IDS):
-            raise ValueError("capture outcomes must contain one of each supported book")
+        if any(book not in SUPPORTED_BOOK_IDS for book in books) or len(set(books)) != len(books):
+            raise ValueError("capture outcomes must contain distinct supported books")
+        if board_schema == BOARD_SCHEMA_V1 and set(books) != set(SUPPORTED_BOOK_IDS):
+            raise ValueError("legacy V1 boards must contain one of each supported book")
+        if board_schema == BOARD_SCHEMA_V3:
+            board = _v3_board(schedule, loaded)
+            board_bytes = canonical_json_bytes(board)
+            snapshots: list[RegularFileSnapshot] = list(schedule.input_snapshots)
+            for outcome in loaded:
+                snapshots.extend((outcome.snapshot, outcome.sidecar_snapshot))
+                if outcome.raw_snapshot is not None and outcome.raw_sidecar_snapshot is not None:
+                    snapshots.extend((outcome.raw_snapshot, outcome.raw_sidecar_snapshot))
+            return BuiltMarketBoard(board, board_bytes, sidecar_bytes(board_bytes), tuple(snapshots))
         for outcome in loaded:
             if outcome.status == "AVAILABLE" and outcome.raw_snapshot is not None:
                 raw_payload = json.loads(outcome.raw_snapshot.contents.decode("utf-8"))
@@ -278,17 +473,23 @@ def normalize_market_board(root: Path, schedule_receipt: Path, capture_outcomes:
             board_games.append({**game, "moneylines": moneylines, "totals": totals})
         del game_by_pk
         board: dict[str, object] = {
-            "schema": BOARD_SCHEMA,
+            "schema": board_schema,
             "content_sha256": "",
             "target_date": target_date,
             "schedule_receipt_relative": schedule_relative.as_posix(),
-            "schedule_receipt_sha256": hashlib.sha256(schedule_snapshot.contents).hexdigest(),
-            "capture_outcomes": [outcome.payload for outcome in sorted(loaded, key=lambda item: SUPPORTED_BOOK_IDS.index(str(item.payload["source_book"])))],
+            "schedule_receipt_sha256": schedule.receipt_sha256,
+            "capture_outcomes": [
+                outcome.payload
+                for outcome in sorted(
+                    loaded,
+                    key=lambda item: SUPPORTED_BOOK_IDS.index(str(item.payload["source_book"])),
+                )
+            ],
             "games": board_games,
         }
         board["content_sha256"] = content_digest(board)
         board_bytes = canonical_json_bytes(board)
-        snapshots: list[RegularFileSnapshot] = [schedule_snapshot, schedule_sidecar]
+        snapshots: list[RegularFileSnapshot] = list(schedule.input_snapshots)
         for outcome in loaded:
             snapshots.extend((outcome.snapshot, outcome.sidecar_snapshot))
             if outcome.raw_snapshot is not None and outcome.raw_sidecar_snapshot is not None:
@@ -309,6 +510,15 @@ def persist_market_board(root: Path, built: BuiltMarketBoard) -> tuple[Path, Pat
     if not isinstance(built, BuiltMarketBoard):
         raise TypeError("built board differs")
     board = dict(built.board)
+    if not isinstance(board.get("schema"), str) or board["schema"] not in BOARD_SCHEMAS:
+        raise ValueError("market board schema differs")
+    outcomes = board.get("capture_outcomes")
+    if not isinstance(outcomes, list):
+        raise ValueError("market board capture outcomes differ")
+    if board["schema"] == BOARD_SCHEMA_V1 and len(outcomes) != len(SUPPORTED_BOOK_IDS):
+        raise ValueError("legacy V1 boards require exactly five capture outcomes")
+    if board["schema"] in {BOARD_SCHEMA_V2, BOARD_SCHEMA_V3} and not 1 <= len(outcomes) <= len(SUPPORTED_BOOK_IDS):
+        raise ValueError("V2/V3 boards require one to five capture outcomes")
     if board.get("content_sha256") != content_digest({**board, "content_sha256": ""}):
         raise ValueError("built board digest differs")
     expected_bytes = canonical_json_bytes(board)
@@ -327,22 +537,83 @@ def load_market_board(root: Path, board_path: Path, schedule: ScheduleAuthority)
     relative = validate_relative_path(board_path)
     with open_trusted_root(root) as trusted:
         snapshot, sidecar, payload = _read_json(trusted, relative, "market board", 8 * 1024 * 1024)
-        if payload.get("schema") != BOARD_SCHEMA:
+        board_schema = payload.get("schema")
+        if not isinstance(board_schema, str) or board_schema not in BOARD_SCHEMAS:
             raise ValueError("market board schema differs")
         digest = payload.get("content_sha256")
         without = dict(payload)
         without["content_sha256"] = ""
         if digest != content_digest(without) or relative.stem != digest:
             raise ValueError("market board content digest differs")
-        if payload.get("target_date") != schedule.target_date or payload.get("schedule_receipt_relative") != schedule.receipt_relative.as_posix():
+        if payload.get("target_date") != schedule.target_date or payload.get("schedule_receipt_relative") != schedule.receipt_relative.as_posix() or payload.get("schedule_receipt_sha256") != schedule.receipt_sha256:
             raise ValueError("market board schedule binding differs")
         outcomes_value = payload.get("capture_outcomes")
-        if not isinstance(outcomes_value, list) or len(outcomes_value) != len(SUPPORTED_BOOK_IDS):
+        if not isinstance(outcomes_value, list):
             raise ValueError("market board capture outcome population differs")
+        if board_schema == BOARD_SCHEMA_V1 and len(outcomes_value) != len(SUPPORTED_BOOK_IDS):
+            raise ValueError("legacy V1 boards require exactly five capture outcomes")
+        if board_schema in {BOARD_SCHEMA_V2, BOARD_SCHEMA_V3} and not 1 <= len(outcomes_value) <= len(SUPPORTED_BOOK_IDS):
+            raise ValueError("V2/V3 boards require one to five capture outcomes")
         outcomes = [validate_capture_outcome(value) for value in outcomes_value]
         outcome_books = [str(value["source_book"]) for value in outcomes]
-        if set(outcome_books) != set(SUPPORTED_BOOK_IDS) or len(set(outcome_books)) != len(SUPPORTED_BOOK_IDS):
+        if any(book not in SUPPORTED_BOOK_IDS for book in outcome_books) or len(set(outcome_books)) != len(outcome_books):
             raise ValueError("market board capture outcomes differ")
+        if board_schema == BOARD_SCHEMA_V1 and set(outcome_books) != set(SUPPORTED_BOOK_IDS):
+            raise ValueError("legacy V1 boards must contain one of each supported book")
+        loaded_outcomes: list[LoadedCaptureOutcome] = []
+        if board_schema == BOARD_SCHEMA_V3:
+            _exact(
+                payload,
+                {
+                    "schema", "content_sha256", "target_date", "schedule_receipt_relative",
+                    "schedule_receipt_sha256", "capture_outcomes", "capture_outcome_bindings",
+                    "event_match_audit", "games",
+                },
+                "V3 market board",
+            )
+            bindings_value = payload.get("capture_outcome_bindings")
+            audit_value = payload.get("event_match_audit")
+            if not isinstance(bindings_value, list) or not isinstance(audit_value, list):
+                raise ValueError("V3 market board evidence collections differ")
+            if len(bindings_value) != len(outcomes):
+                raise ValueError("V3 market board binding population differs")
+            for embedded, binding in zip(outcomes, bindings_value, strict=True):
+                checked = _exact(
+                    binding,
+                    {"book_id", "capture_outcome_relative", "capture_outcome_sha256", "capture_outcome_sidecar_sha256"},
+                    "V3 capture outcome binding",
+                )
+                book = str(embedded["source_book"])
+                if checked["book_id"] != book:
+                    raise ValueError("V3 capture outcome binding book differs")
+                outcome = load_capture_outcome(trusted, Path(str(checked["capture_outcome_relative"])))
+                if outcome.payload != embedded or outcome.payload["source_book"] != book:
+                    raise ValueError("V3 embedded capture outcome differs from authenticated outcome")
+                if (
+                    checked["capture_outcome_sha256"] != hashlib.sha256(outcome.snapshot.contents).hexdigest()
+                    or checked["capture_outcome_sidecar_sha256"] != hashlib.sha256(outcome.sidecar_snapshot.contents).hexdigest()
+                ):
+                    raise ValueError("V3 capture outcome binding digest differs")
+                loaded_outcomes.append(outcome)
+            stored_games = payload.get("games")
+            if not isinstance(stored_games, list) or len(stored_games) != len(schedule.games):
+                raise ValueError("market board game population differs")
+            for raw_game, schedule_game in zip(stored_games, schedule.games, strict=True):
+                game = _exact(
+                    raw_game,
+                    {"game_pk", "away_team", "home_team", "scheduled_start_utc", "moneylines", "totals"},
+                    "market board game",
+                )
+                if (
+                    game["game_pk"] != schedule_game["game_pk"]
+                    or game["away_team"] != schedule_game["away_team"]
+                    or game["home_team"] != schedule_game["home_team"]
+                    or game["scheduled_start_utc"] != schedule_game["scheduled_start_utc"]
+                ):
+                    raise ValueError("market board game differs from schedule")
+            expected = _v3_board(schedule, loaded_outcomes)
+            if payload != expected:
+                raise ValueError("V3 market board is not the canonical authenticated projection")
         outcome_paths = {
             str(value["raw_capture_relative"]): str(value["raw_capture_sha256"])
             for value in outcomes
@@ -382,19 +653,31 @@ def load_market_board(root: Path, board_path: Path, schedule: ScheduleAuthority)
             ml_quotes = tuple(ml_quotes_list)
             total_quotes = tuple(total_quotes_list)
             games.append(MarketBoardGame(int(game["game_pk"]), str(game["away_team"]), str(game["home_team"]), str(game["scheduled_start_utc"]), ml_quotes, total_quotes))
-        rebind_regular_snapshot(trusted, schedule.receipt_snapshot, "schedule receipt")
-        rebind_regular_snapshot(trusted, schedule.receipt_sidecar_snapshot, "schedule receipt sidecar")
-        return MarketBoardAuthority(str(payload["target_date"]), tuple(games), relative, snapshot, sidecar)
+        source_snapshots: tuple[RegularFileSnapshot, ...] = ()
+        if board_schema == BOARD_SCHEMA_V3:
+            sources: list[RegularFileSnapshot] = []
+            for outcome in loaded_outcomes:
+                sources.extend((outcome.snapshot, outcome.sidecar_snapshot))
+                if outcome.raw_snapshot is not None and outcome.raw_sidecar_snapshot is not None:
+                    sources.extend((outcome.raw_snapshot, outcome.raw_sidecar_snapshot))
+            source_snapshots = tuple(sources)
+        chain = (snapshot, sidecar, *schedule.input_snapshots, *source_snapshots)
+        for input_snapshot in chain:
+            rebind_regular_snapshot(trusted, input_snapshot, "market board authority input")
+        return MarketBoardAuthority(
+            str(payload["target_date"]), tuple(games), relative, snapshot, sidecar,
+            Path(root), chain,
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Admit a normalized board from five already-admitted local outcomes."""
+    """Admit a normalized board from one to five already-admitted outcomes."""
     parser = argparse.ArgumentParser(description="admit an offline multibook market board")
     sub = parser.add_subparsers(dest="command", required=True)
     admit = sub.add_parser("admit-board")
     admit.add_argument("--root", type=Path, required=True)
     admit.add_argument("--schedule-receipt", type=Path, required=True)
-    admit.add_argument("--capture-outcome", type=Path, required=True, nargs=5, action="append")
+    admit.add_argument("--capture-outcome", type=Path, required=True, nargs="+", action="append")
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
@@ -404,7 +687,9 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("exactly one capture-outcome option is required")
         schedule = validate_relative_path(args.schedule_receipt)
         outcomes = tuple(validate_relative_path(path) for path in args.capture_outcome[0])
-        built = normalize_market_board(args.root, schedule, outcomes)
+        if not 1 <= len(outcomes) <= len(SUPPORTED_BOOK_IDS):
+            raise ValueError("V3 boards require one to five capture outcomes")
+        built = normalize_market_board(args.root, schedule, outcomes, board_schema=BOARD_SCHEMA_V3)
         board_relative, _ = persist_market_board(args.root, built)
     except (TypeError, ValueError, json.JSONDecodeError):
         return 2

@@ -97,7 +97,7 @@ def _number(value: str | None, field: str, row_number: int) -> float | None:
 
 
 def iter_statcast_pitches(
-    source: str | Path | bytes,
+    source: str | Path | bytes, *, game_types: tuple[str, ...] = ('R',),
 ) -> Iterable[dict[str, object]]:
     """Validate and stream normalized pitches without retaining the CSV as text."""
     raw_stream = io.BytesIO(source) if isinstance(source, bytes) else Path(source).open("rb")
@@ -128,7 +128,7 @@ def iter_statcast_pitches(
                     raise ValueError(
                         f"statcast row {row_number}: p_throws must be L or R"
                     )
-                if raw["game_type"] != "R":
+                if raw["game_type"] not in game_types:
                     raise ValueError(
                         f"statcast row {row_number}: game_type must be R"
                     )
@@ -206,7 +206,7 @@ def iter_statcast_pitches(
                         row_number,
                         maximum=2,
                     ),
-                    "game_type": "R",
+                    "game_type": raw['game_type'],
                 }
                 row["event_id"] = f'{row["game_pk"]}:{row["at_bat_number"]}'
                 yield row
@@ -253,9 +253,9 @@ def iter_unique_statcast_pitches(
         yield row
 
 
-def parse_statcast(source: str | Path | bytes) -> StatcastData:
+def parse_statcast(source: str | Path | bytes, *, game_types: tuple[str, ...] = ('R',)) -> StatcastData:
     """Parse compact pitch rows and one terminal event row per plate appearance."""
-    pitches = list(iter_unique_statcast_pitches(iter_statcast_pitches(source)))
+    pitches = list(iter_unique_statcast_pitches(iter_statcast_pitches(source, game_types=game_types)))
     pitches.sort(
         key=lambda r: (
             r["game_date"],

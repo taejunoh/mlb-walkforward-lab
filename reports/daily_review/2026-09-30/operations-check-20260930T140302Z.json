@@ -1,0 +1,1114 @@
+{
+  "schema": "MLB_DAILY_OPERATIONS_CHECK_V1",
+  "automation_id": "mlb",
+  "triggered_at_utc": "2026-09-30T14:03:02.537Z",
+  "execution_clock_at_start_utc": "2026-09-30T14:03:14Z",
+  "completed_at_utc": "2026-09-30T14:07:30Z",
+  "local_date": "2026-09-30",
+  "timezone": "America/New_York",
+  "previous_check": "reports/daily_review/2026-09-30/operations-check-20260930T120902Z.json",
+  "schedule_observed_at_utc": "2026-09-30T14:04:13Z",
+  "schedule_source": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&startDate=2026-09-29&endDate=2026-10-01&fields=totalGames,dates,date,games,gamePk,gameType,gameDate,status,abstractGameState,detailedState,codedGameState,teams,away,home,team,id,name",
+  "schedule_collection": "Read-only official StatsAPI HTTPS GET through curl after web reader could not access the endpoint; no score/outcome fields requested. Informational schedule evidence only, not a model input receipt.",
+  "official_schedule_payload": {
+    "totalGames": 12,
+    "dates": [
+      {
+        "date": "2026-09-29",
+        "totalGames": 4,
+        "games": [
+          {
+            "gamePk": 849845,
+            "gameType": "F",
+            "gameDate": "2026-09-29T18:00:00Z",
+            "status": {
+              "abstractGameState": "Final",
+              "codedGameState": "F",
+              "detailedState": "Final"
+            },
+            "teams": {
+              "away": {
+                "team": {
+                  "id": 143,
+                  "name": "Philadelphia Phillies"
+                }
+              },
+              "home": {
+                "team": {
+                  "id": 144,
+                  "name": "Atlanta Braves"
+                }
+              }
+            }
+          },
+          {
+            "gamePk": 849849,
+            "gameType": "F",
+            "gameDate": "2026-09-29T21:00:00Z",
+            "status": {
+              "abstractGameState": "Final",
+              "codedGameState": "F",
+              "detailedState": "Final"
+            },
+            "teams": {
+              "away": {
+                "team": {
+                  "id": 145,
+                  "name": "Chicago White Sox"
+                }
+              },
+              "home": {
+                "team": {
+                  "id": 117,
+                  "name": "Houston Astros"
+                }
+              }
+            }
+          },
+          {
+            "gamePk": 849851,
+            "gameType": "F",
+            "gameDate": "2026-09-30T00:00:00Z",
+            "status": {
+              "abstractGameState": "Final",
+              "codedGameState": "F",
+              "detailedState": "Final"
+            },
+            "teams": {
+              "away": {
+                "team": {
+                  "id": 111,
+                  "name": "Boston Red Sox"
+                }
+              },
+              "home": {
+                "team": {
+                  "id": 147,
+                  "name": "New York Yankees"
+                }
+              }
+            }
+          },
+          {
+            "gamePk": 849843,
+            "gameType": "F",
+            "gameDate": "2026-09-30T02:00:00Z",
+            "status": {
+              "abstractGameState": "Final",
+              "codedGameState": "F",
+              "detailedState": "Final"
+            },
+            "teams": {
+              "away": {
+                "team": {
+                  "id": 112,
+                  "name": "Chicago Cubs"
+                }
+              },
+              "home": {
+                "team": {
+                  "id": 135,
+                  "name": "San Diego Padres"
+                }
+              }
+            }
+          }
+        ]
+      },
+      {
+        "date": "2026-09-30",
+        "totalGames": 4,
+        "games": [
+          {
+            "gamePk": 849841,
+            "gameType": "F",
+            "gameDate": "2026-09-30T18:00:00Z",
+            "status": {
+              "abstractGameState": "Preview",
+              "codedGameState": "S",
+              "detailedState": "Scheduled"
+            },
+            "teams": {
+              "away": {
+                "team": {
+                  "id": 143,
+                  "name": "Philadelphia Phillies"
+                }
+              },
+              "home": {
+                "team": {
+                  "id": 144,
+                  "name": "Atlanta Braves"
+                }
+              }
+            }
+          },
+          {
+            "gamePk": 849846,
+            "gameType": "F",
+            "gameDate": "2026-09-30T21:00:00Z",
+            "status": {
+              "abstractGameState": "Preview",
+              "codedGameState": "S",
+              "detailedState": "Scheduled"
+            },
+            "teams": {
+              "away": {
+                "team": {
+                  "id": 145,
+                  "name": "Chicago White Sox"
+                }
+              },
+              "home": {
+                "team": {
+                  "id": 117,
+                  "name": "Houston Astros"
+                }
+              }
+            }
+          },
+          {
+            "gamePk": 849848,
+            "gameType": "F",
+            "gameDate": "2026-10-01T00:00:00Z",
+            "status": {
+              "abstractGameState": "Preview",
+              "codedGameState": "S",
+              "detailedState": "Scheduled"
+            },
+            "teams": {
+              "away": {
+                "team": {
+                  "id": 111,
+                  "name": "Boston Red Sox"
+                }
+              },
+              "home": {
+                "team": {
+                  "id": 147,
+                  "name": "New York Yankees"
+                }
+              }
+            }
+          },
+          {
+            "gamePk": 849842,
+            "gameType": "F",
+            "gameDate": "2026-10-01T02:00:00Z",
+            "status": {
+              "abstractGameState": "Preview",
+              "codedGameState": "S",
+              "detailedState": "Scheduled"
+            },
+            "teams": {
+              "away": {
+                "team": {
+                  "id": 112,
+                  "name": "Chicago Cubs"
+                }
+              },
+              "home": {
+                "team": {
+                  "id": 135,
+                  "name": "San Diego Padres"
+                }
+              }
+            }
+          }
+        ]
+      },
+      {
+        "date": "2026-10-01",
+        "totalGames": 4,
+        "games": [
+          {
+            "gamePk": 849844,
+            "gameType": "F",
+            "gameDate": "2026-10-01T18:00:00Z",
+            "status": {
+              "abstractGameState": "Preview",
+              "codedGameState": "S",
+              "detailedState": "Scheduled"
+            },
+            "teams": {
+              "away": {
+                "team": {
+                  "id": 143,
+                  "name": "Philadelphia Phillies"
+                }
+              },
+              "home": {
+                "team": {
+                  "id": 144,
+                  "name": "Atlanta Braves"
+                }
+              }
+            }
+          },
+          {
+            "gamePk": 849850,
+            "gameType": "F",
+            "gameDate": "2026-10-01T21:00:00Z",
+            "status": {
+              "abstractGameState": "Preview",
+              "codedGameState": "S",
+              "detailedState": "Scheduled"
+            },
+            "teams": {
+              "away": {
+                "team": {
+                  "id": 145,
+                  "name": "Chicago White Sox"
+                }
+              },
+              "home": {
+                "team": {
+                  "id": 117,
+                  "name": "Houston Astros"
+                }
+              }
+            }
+          },
+          {
+            "gamePk": 849847,
+            "gameType": "F",
+            "gameDate": "2026-10-02T00:00:00Z",
+            "status": {
+              "abstractGameState": "Preview",
+              "codedGameState": "S",
+              "detailedState": "Scheduled"
+            },
+            "teams": {
+              "away": {
+                "team": {
+                  "id": 111,
+                  "name": "Boston Red Sox"
+                }
+              },
+              "home": {
+                "team": {
+                  "id": 147,
+                  "name": "New York Yankees"
+                }
+              }
+            }
+          },
+          {
+            "gamePk": 849840,
+            "gameType": "F",
+            "gameDate": "2026-10-02T02:00:00Z",
+            "status": {
+              "abstractGameState": "Preview",
+              "codedGameState": "S",
+              "detailedState": "Scheduled"
+            },
+            "teams": {
+              "away": {
+                "team": {
+                  "id": 112,
+                  "name": "Chicago Cubs"
+                }
+              },
+              "home": {
+                "team": {
+                  "id": 135,
+                  "name": "San Diego Padres"
+                }
+              }
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "games": [
+    {
+      "date": "2026-09-30",
+      "game_pk": 849841,
+      "game_type": "F",
+      "away": "PHI",
+      "home": "ATL",
+      "away_team_id": 143,
+      "home_team_id": 144,
+      "start_utc": "2026-09-30T18:00:00Z",
+      "official_status": "Scheduled",
+      "official_abstract_status": "Preview",
+      "official_coded_status": "S",
+      "record_status": "BLOCKED_RESEARCH_NOT_ACTIVATED"
+    },
+    {
+      "date": "2026-09-30",
+      "game_pk": 849846,
+      "game_type": "F",
+      "away": "CWS",
+      "home": "HOU",
+      "away_team_id": 145,
+      "home_team_id": 117,
+      "start_utc": "2026-09-30T21:00:00Z",
+      "official_status": "Scheduled",
+      "official_abstract_status": "Preview",
+      "official_coded_status": "S",
+      "record_status": "BLOCKED_RESEARCH_NOT_ACTIVATED"
+    },
+    {
+      "date": "2026-09-30",
+      "game_pk": 849848,
+      "game_type": "F",
+      "away": "BOS",
+      "home": "NYY",
+      "away_team_id": 111,
+      "home_team_id": 147,
+      "start_utc": "2026-10-01T00:00:00Z",
+      "official_status": "Scheduled",
+      "official_abstract_status": "Preview",
+      "official_coded_status": "S",
+      "record_status": "BLOCKED_RESEARCH_NOT_ACTIVATED"
+    },
+    {
+      "date": "2026-09-30",
+      "game_pk": 849842,
+      "game_type": "F",
+      "away": "CHC",
+      "home": "SD",
+      "away_team_id": 112,
+      "home_team_id": 135,
+      "start_utc": "2026-10-01T02:00:00Z",
+      "official_status": "Scheduled",
+      "official_abstract_status": "Preview",
+      "official_coded_status": "S",
+      "record_status": "BLOCKED_RESEARCH_NOT_ACTIVATED"
+    },
+    {
+      "date": "2026-10-01",
+      "game_pk": 849844,
+      "game_type": "F",
+      "away": "PHI",
+      "home": "ATL",
+      "away_team_id": 143,
+      "home_team_id": 144,
+      "start_utc": "2026-10-01T18:00:00Z",
+      "official_status": "Scheduled",
+      "official_abstract_status": "Preview",
+      "official_coded_status": "S",
+      "record_status": "BLOCKED_RESEARCH_NOT_ACTIVATED"
+    },
+    {
+      "date": "2026-10-01",
+      "game_pk": 849850,
+      "game_type": "F",
+      "away": "CWS",
+      "home": "HOU",
+      "away_team_id": 145,
+      "home_team_id": 117,
+      "start_utc": "2026-10-01T21:00:00Z",
+      "official_status": "Scheduled",
+      "official_abstract_status": "Preview",
+      "official_coded_status": "S",
+      "record_status": "BLOCKED_RESEARCH_NOT_ACTIVATED"
+    },
+    {
+      "date": "2026-10-01",
+      "game_pk": 849847,
+      "game_type": "F",
+      "away": "BOS",
+      "home": "NYY",
+      "away_team_id": 111,
+      "home_team_id": 147,
+      "start_utc": "2026-10-02T00:00:00Z",
+      "official_status": "Scheduled",
+      "official_abstract_status": "Preview",
+      "official_coded_status": "S",
+      "record_status": "BLOCKED_RESEARCH_NOT_ACTIVATED"
+    },
+    {
+      "date": "2026-10-01",
+      "game_pk": 849840,
+      "game_type": "F",
+      "away": "CHC",
+      "home": "SD",
+      "away_team_id": 112,
+      "home_team_id": 135,
+      "start_utc": "2026-10-02T02:00:00Z",
+      "official_status": "Scheduled",
+      "official_abstract_status": "Preview",
+      "official_coded_status": "S",
+      "record_status": "BLOCKED_RESEARCH_NOT_ACTIVATED"
+    }
+  ],
+  "previous_day_games": [
+    {
+      "date": "2026-09-29",
+      "game_pk": 849845,
+      "game_type": "F",
+      "away": "PHI",
+      "home": "ATL",
+      "away_team_id": 143,
+      "home_team_id": 144,
+      "start_utc": "2026-09-29T18:00:00Z",
+      "official_status": "Final",
+      "official_abstract_status": "Final",
+      "official_coded_status": "F",
+      "record_status": "NO_PREGAME_PREDICTION"
+    },
+    {
+      "date": "2026-09-29",
+      "game_pk": 849849,
+      "game_type": "F",
+      "away": "CWS",
+      "home": "HOU",
+      "away_team_id": 145,
+      "home_team_id": 117,
+      "start_utc": "2026-09-29T21:00:00Z",
+      "official_status": "Final",
+      "official_abstract_status": "Final",
+      "official_coded_status": "F",
+      "record_status": "NO_PREGAME_PREDICTION"
+    },
+    {
+      "date": "2026-09-29",
+      "game_pk": 849851,
+      "game_type": "F",
+      "away": "BOS",
+      "home": "NYY",
+      "away_team_id": 111,
+      "home_team_id": 147,
+      "start_utc": "2026-09-30T00:00:00Z",
+      "official_status": "Final",
+      "official_abstract_status": "Final",
+      "official_coded_status": "F",
+      "record_status": "NO_PREGAME_PREDICTION"
+    },
+    {
+      "date": "2026-09-29",
+      "game_pk": 849843,
+      "game_type": "F",
+      "away": "CHC",
+      "home": "SD",
+      "away_team_id": 112,
+      "home_team_id": 135,
+      "start_utc": "2026-09-30T02:00:00Z",
+      "official_status": "Final",
+      "official_abstract_status": "Final",
+      "official_coded_status": "F",
+      "record_status": "NO_PREGAME_PREDICTION"
+    }
+  ],
+  "schedule_state_changes": [],
+  "execution": {
+    "matching_daily_top3_totals_flow_processes_observed": 0,
+    "new_model_runs": 0,
+    "new_primary_claims": 0,
+    "new_settlements": 0,
+    "new_missing_prediction_deadlines": 0,
+    "new_near_start_warnings": 0,
+    "new_coverage_reviews": 0,
+    "new_settlement_reviews": 0,
+    "new_review_artifacts": 0,
+    "new_totals_diagnostic_games": 0,
+    "source_sha256_current": {
+      "mlb_backtest/live_sources.py": "5111ba6ae9b7fc907697f3234114ac2de654719a8692a7dccb1dadea75cae98e",
+      "mlb_backtest/live_features.py": "297f864e7ca873a2066e7c84cee3c3dfdf6e030f8d8640cd537250fed7ef5e72",
+      "mlb_backtest/experimental_totals_sources.py": "f6fcf5c12538495db06e5549b1e9c341657ed1599b4db773d648b8f8fd6eeac9"
+    },
+    "source_changes_reason": "Human-approved offline research implementation completed in preceding turn; not automatic activation.",
+    "full_history_statcast_and_market_collection": "NOT_EVALUATED_RESEARCH_NOT_ACTIVATED",
+    "sep30_d_minus_one_all_final": true,
+    "repository_head": "ef5680beaf37e16686bd27f9c4bf78441f9519a8",
+    "sep25_through_oct1_flow_directories": "ABSENT",
+    "actual_postseason_report_and_claim_namespaces": "ABSENT"
+  },
+  "receipt_inventory": {
+    "dates": [
+      {
+        "target_date": "2026-09-16",
+        "pregame_receipts": 3,
+        "distinct_primary_claims": 4,
+        "postgame_receipts": 1
+      },
+      {
+        "target_date": "2026-09-23",
+        "pregame_receipts": 8,
+        "distinct_primary_claims": 16,
+        "postgame_receipts": 8
+      },
+      {
+        "target_date": "2026-09-24",
+        "pregame_receipts": 2,
+        "distinct_primary_claims": 4,
+        "postgame_receipts": 2
+      }
+    ],
+    "sep25_through_oct1": "NO_FLOW_DIRECTORIES"
+  },
+  "preserved_settlement_receipts_sha256_verified": [
+    {
+      "path": "audit/prospective_ml_daily_flow/2026-09-16/ba95bf781edc5f9b0b40773dfde04ac221136fa1ec61234a1d943e083c4bf1ba.json",
+      "sha256": "ba95bf781edc5f9b0b40773dfde04ac221136fa1ec61234a1d943e083c4bf1ba"
+    },
+    {
+      "path": "audit/prospective_ml_daily_flow/2026-09-24/62aa20b134c83dd19f12413f269d3614bdab22dca311104a52a0dd7f6f748c46.json",
+      "sha256": "62aa20b134c83dd19f12413f269d3614bdab22dca311104a52a0dd7f6f748c46"
+    },
+    {
+      "path": "audit/prospective_ml_daily_flow/2026-09-24/919ae756f84b2da8fe52de29e5ed72aa29fef36ce9e82ebb7fe0be13e4f7bac9.json",
+      "sha256": "919ae756f84b2da8fe52de29e5ed72aa29fef36ce9e82ebb7fe0be13e4f7bac9"
+    }
+  ],
+  "completed_settlement_read_only_status_checks": [
+    {
+      "pregame_receipt": "audit/prospective_ml_daily_flow/2026-09-16/db8ac60c2bc5ddd8850e0febc2c02f711a16f685ed392992d37ff703a1ddf69d.json",
+      "postgame_receipt": "audit/prospective_ml_daily_flow/2026-09-16/ba95bf781edc5f9b0b40773dfde04ac221136fa1ec61234a1d943e083c4bf1ba.json",
+      "exit_code": 0,
+      "workflow_processed": true,
+      "workflow_complete": true,
+      "complete_evidence": false,
+      "errors": [],
+      "status": {
+        "complete_evidence": false,
+        "errors": [],
+        "games": [
+          {
+            "evidence_complete": false,
+            "game_pk": 824382,
+            "missing_steps": [
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 823004,
+            "missing_steps": [
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 823655,
+            "missing_steps": [
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 822763,
+            "missing_steps": [
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 822926,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MODEL_UNSCORED,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 823332,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MODEL_UNSCORED,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 824467,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MODEL_UNSCORED,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 822680,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MODEL_UNSCORED,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 823576,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MODEL_UNSCORED,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 824626,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MODEL_UNSCORED,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 822846,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MODEL_UNSCORED,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 824140,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MODEL_UNSCORED,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 824306,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MODEL_UNSCORED,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 823979,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MODEL_UNSCORED,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 825031,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MODEL_UNSCORED,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          }
+        ],
+        "postgame_receipt": "audit/prospective_ml_daily_flow/2026-09-16/ba95bf781edc5f9b0b40773dfde04ac221136fa1ec61234a1d943e083c4bf1ba.json",
+        "pregame_receipt": "audit/prospective_ml_daily_flow/2026-09-16/db8ac60c2bc5ddd8850e0febc2c02f711a16f685ed392992d37ff703a1ddf69d.json",
+        "schema": "PROSPECTIVE_ML_DAILY_FLOW_STATUS_V1",
+        "workflow_complete": true,
+        "workflow_processed": true
+      }
+    },
+    {
+      "pregame_receipt": "audit/prospective_ml_daily_flow/2026-09-24/6d8dc9b9548f6fe1e51d0314f6892c080efc041ceca17c2f0f6ed710bbdc268a.json",
+      "postgame_receipt": "audit/prospective_ml_daily_flow/2026-09-24/62aa20b134c83dd19f12413f269d3614bdab22dca311104a52a0dd7f6f748c46.json",
+      "exit_code": 0,
+      "workflow_processed": true,
+      "workflow_complete": true,
+      "complete_evidence": false,
+      "errors": [],
+      "status": {
+        "complete_evidence": false,
+        "errors": [],
+        "games": [
+          {
+            "evidence_complete": false,
+            "game_pk": 823326,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY GAME_STARTED,INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MISSING_PREGAME_EVIDENCE,MODEL_UNSCORED,STARTER_CONFLICT,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 824059,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY GAME_STARTED,INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MISSING_PREGAME_EVIDENCE,MODEL_UNSCORED,STARTER_CONFLICT,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 824623,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY GAME_STARTED,INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MISSING_PREGAME_EVIDENCE,MODEL_UNSCORED,STARTER_CONFLICT,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 822842,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY GAME_STARTED,INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MISSING_PREGAME_EVIDENCE,MODEL_UNSCORED,STARTER_CONFLICT,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 824298,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY GAME_STARTED,INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MISSING_PREGAME_EVIDENCE,MODEL_UNSCORED,STARTER_CONFLICT,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 823411,
+            "missing_steps": [
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 824707,
+            "missing_steps": [
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 823493,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MODEL_UNSCORED,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 824866,
+            "missing_steps": [
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 823087,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MODEL_UNSCORED,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 824950,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MODEL_UNSCORED,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 823895,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MODEL_UNSCORED,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          }
+        ],
+        "postgame_receipt": "audit/prospective_ml_daily_flow/2026-09-24/62aa20b134c83dd19f12413f269d3614bdab22dca311104a52a0dd7f6f748c46.json",
+        "pregame_receipt": "audit/prospective_ml_daily_flow/2026-09-24/6d8dc9b9548f6fe1e51d0314f6892c080efc041ceca17c2f0f6ed710bbdc268a.json",
+        "schema": "PROSPECTIVE_ML_DAILY_FLOW_STATUS_V1",
+        "workflow_complete": true,
+        "workflow_processed": true
+      }
+    },
+    {
+      "pregame_receipt": "audit/prospective_ml_daily_flow/2026-09-24/9109030ceaff7cbd66a7e42e90c931923c178e78b2a7d43647b84a76fbe705f0.json",
+      "postgame_receipt": "audit/prospective_ml_daily_flow/2026-09-24/919ae756f84b2da8fe52de29e5ed72aa29fef36ce9e82ebb7fe0be13e4f7bac9.json",
+      "exit_code": 0,
+      "workflow_processed": true,
+      "workflow_complete": true,
+      "complete_evidence": false,
+      "errors": [],
+      "status": {
+        "complete_evidence": false,
+        "errors": [],
+        "games": [
+          {
+            "evidence_complete": false,
+            "game_pk": 823326,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY GAME_STARTED,INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MISSING_PREGAME_EVIDENCE,MODEL_UNSCORED,STARTER_CONFLICT,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 824059,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY GAME_STARTED,INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MISSING_PREGAME_EVIDENCE,MODEL_UNSCORED,STARTER_CONFLICT,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 824623,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY GAME_STARTED,INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MISSING_PREGAME_EVIDENCE,MODEL_UNSCORED,STARTER_CONFLICT,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 822842,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY GAME_STARTED,INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MISSING_PREGAME_EVIDENCE,MODEL_UNSCORED,STARTER_CONFLICT,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 824298,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY GAME_STARTED,INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MISSING_PREGAME_EVIDENCE,MODEL_UNSCORED,STARTER_CONFLICT,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 823411,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY not eligible",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 824707,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY not eligible",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 823493,
+            "missing_steps": [
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 824866,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY not eligible",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 823087,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MODEL_UNSCORED,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 824950,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MODEL_UNSCORED,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          },
+          {
+            "evidence_complete": false,
+            "game_pk": 823895,
+            "missing_steps": [
+              "BASELINE_NOT_PRIMARY INCOMPLETE_PARTICIPANTS,INVALID_LINEUPS,MODEL_UNSCORED,STARTER_MISMATCH",
+              "AFTER_START_IMPOSSIBLE",
+              "ODDS_MISSING",
+              "MARKET_TRACE_MISSING",
+              "RESULT_LINK_MISSING/PENDING"
+            ],
+            "workflow_processed": true
+          }
+        ],
+        "postgame_receipt": "audit/prospective_ml_daily_flow/2026-09-24/919ae756f84b2da8fe52de29e5ed72aa29fef36ce9e82ebb7fe0be13e4f7bac9.json",
+        "pregame_receipt": "audit/prospective_ml_daily_flow/2026-09-24/9109030ceaff7cbd66a7e42e90c931923c178e78b2a7d43647b84a76fbe705f0.json",
+        "schema": "PROSPECTIVE_ML_DAILY_FLOW_STATUS_V1",
+        "workflow_complete": true,
+        "workflow_processed": true
+      }
+    }
+  ],
+  "settlement_action": "Existing Sep16 four and Sep24 four FINAL primary settlements verified with exact prior receipt links and read-only status; no new unprocessed primary claims. No terminal result collection or known Sep23 824785 failure retry.",
+  "known_sep23_game_824785_failure": "PRESERVED_NOT_RETRIED",
+  "postseason_implementation": "IMPLEMENTED_TESTED_NOT_ACTIVATED",
+  "manual_implementation_context": {
+    "status": "IMPLEMENTED_TESTED_NOT_ACTIVATED",
+    "completed_at_utc": "2026-09-30T13:59:47Z",
+    "verification": "docs/superpowers/plans/2026-09-30-postseason-ml-research-verification.md",
+    "offline_verification": {
+      "tests_passed": 508,
+      "subtests_passed": 427,
+      "independent_integration_review": "PASS",
+      "live_upstream_verified": false,
+      "full_season_performance_verified": false
+    },
+    "source_code_modified": true,
+    "human_approval_date_local": "2026-09-30",
+    "scope": "Existing postseason ML research design: implementation and offline tests without intermediate approval",
+    "plan": "docs/superpowers/plans/2026-09-30-postseason-ml-research.md",
+    "ledger": ".superpowers/sdd/2026-09-30-postseason-ml-research/progress.md",
+    "automation_adoption_authorized": false,
+    "guard": "Offline implementation and independent review passed. This is not live validation or authorization for automation adoption. Preserve regular default behavior; do not launch the opt-in research path until a separately authorized activation handoff. Incomplete claim reservations fail closed and require separately scoped recovery; never backdate a claim."
+  },
+  "prediction_coverage_summary": {
+    "target_date": "2026-09-30",
+    "status": "BLOCKED_RESEARCH_NOT_ACTIVATED",
+    "official_game_count": 4,
+    "scheduled_cutoffs_elapsed": 0,
+    "saved_pregame_predictions": 0,
+    "added_validation_samples": 0,
+    "accuracy": null,
+    "brier_score": null,
+    "log_loss": null,
+    "reason": "Regular default/total paths do not admit F; opt-in research implementation is offline-verified but explicitly not authorized for live/automation adoption."
+  },
+  "preservation": {
+    "source_code_modified_this_heartbeat": false,
+    "original_predictions_changed": false,
+    "primary_claims_changed": false,
+    "terminal_heads_changed": false,
+    "automation_changed": false
+  },
+  "notification": {
+    "decision": "DONT_NOTIFY",
+    "reason": "Official schedules, claims, and settlements unchanged. Research implementation completion/nonactivation was already reported in preceding human turn; no duplicate notification or new missed deadline."
+  },
+  "next_check": {
+    "trigger": "Next app-managed heartbeat, nominally 2026-09-30T14:33:02Z.",
+    "preparation_target_utc": "2026-09-30T15:00:00Z",
+    "first_game_start_utc": "2026-09-30T18:00:00Z",
+    "action": "Recheck schedule, artifacts/processes and explicit activation handoff. Do not activate research from this unchanged heartbeat. Keep known Sep23 failure isolated."
+  }
+}

@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "items": [
+    {
+      "id": "ongoing-automation",
+      "title": "상시 평가·정산 자동화 설정",
+      "queries": [{
+        "id": "automation-config",
+        "source": {
+          "label": "MLB 자동화 설정 및 운영 기록",
+          "files": ["mlb/automation.toml", "reports/daily_review/2026-09-29/operations-status.json"],
+          "links": [{"label": "OpenAI scheduled tasks", "url": "https://developers.openai.com/codex/app/automations"}],
+          "caveats": ["자동화는 ACTIVE로 저장됐으나 첫 예약 실행 성공은 아직 검증하지 않았다.", "로컬 파일을 사용하는 예약 실행은 컴퓨터가 켜져 있고 앱이 실행 중이어야 한다."],
+          "evidenceFlow": [{"kind": "validation", "title": "설정 확인", "body": "자동화 생성 도구가 automationId=mlb, status=ACTIVE를 반환했다. 저장된 설정에서 30분 주기와 현재 채팅 연결을 재확인했다."}]
+        },
+        "summary": "경기 전 기록, 라인업 재확인, 다음날 공식 결과 정산 및 오답노트를 같은 채팅에서 반복한다."
+      }]
+    },
+    {
+      "id": "sep24-settlements",
+      "title": "9월 24일 저장 예측 정산",
+      "queries": [{
+        "id": "sep24-flow-status",
+        "source": {
+          "label": "9월 24일 정산 및 상태 조회",
+          "files": ["reports/daily_review/2026-09-24/prospective_ml_settlement.json"],
+          "filters": ["대상: 경기 시작 전에 저장된 primary claim", "결과: 공식 Final 검증 통과"],
+          "caveats": ["정산은 모델 재학습이나 베팅 수익 검증이 아니다.", "정식 시장 증거 완전성은 충족되지 않았다.", "총점 7경기 대조는 별도 진단이며 정식 O/U 정산이 아니다."],
+          "evidenceFlow": [{"kind": "validation", "title": "정산 계보 확인", "body": "서로 다른 두 사전 receipt를 참조한 사후 처리 결과를 재조회했다. 처리 완료이며 errors는 빈 배열이었다. 각 receipt의 primary claim 세 건과 한 건에 대한 정산이 보존됐다."}]
+        },
+        "rows": [{"target_date": "2026-09-24", "saved_primary_claims": 4, "final_settlements": 4, "totals_diagnostic_games": 7}],
+        "columns": ["target_date", "saved_primary_claims", "final_settlements", "totals_diagnostic_games"],
+        "reportingPeriod": "2026-09-24 경기; 2026-09-29 정산"
+      }]
+    },
+    {
+      "id": "postseason-blocker",
+      "title": "오늘 포스트시즌 모델 평가 제한",
+      "queries": [{
+        "id": "schedule-and-admission",
+        "source": {
+          "label": "공식 MLB 일정과 현재 입력 허용 규칙",
+          "links": [{"label": "MLB 9월 29일 일정", "url": "https://www.mlb.com/schedule/2026-09-29"}],
+          "files": ["mlb_backtest/live_sources.py", "mlb_backtest/live_features.py", "mlb_backtest/experimental_totals_sources.py"],
+          "caveats": ["자동화 활성화가 포스트시즌 모델 지원을 의미하지 않는다.", "기존 정규시즌 제한을 우회해 예측을 만들지 않았다."],
+          "evidenceFlow": [{"kind": "validation", "title": "현재 경기 유형과 코드 계약", "body": "공식 일정의 당일 네 경기는 gameType F였다. ML 현재 경기 수집은 gameType R만 요청하고 비정규시즌 payload를 거부한다. 총점 입력에도 별도의 R 검사 조건이 있다."}]
+        },
+        "summary": "현재 승패·총점 입력 허용 규칙은 정규시즌 전용이므로 포스트시즌 지원 검증이 별도로 필요하다.",
+        "capturedAt": "2026-09-29T20:33:08Z"
+      }]
+    }
+  ]
+}

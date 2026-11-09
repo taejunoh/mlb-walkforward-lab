@@ -1,0 +1,9 @@
+{
+  "observed_at_utc": "2026-09-03T13:53:29.630Z",
+  "schedule_source": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-03",
+  "fanduel": {"url":"https://sportsbook.fanduel.com/navigation/mlb","status":"AVAILABLE","event_count":9,"raw_capture":"data/experimental_multibook_market/raw/2c2305b9e7f61151922faf0b0a78a27723713089c9b8fce6836b4efad91cc915.json","dom_note":"Public MLB DOM exposed all 9 event links with ML and O/U buttons; one read."},
+  "draftkings": {"url":"https://sportsbook.draftkings.com/leagues/baseball/mlb","status":"AVAILABLE","event_count":9,"raw_capture":"data/experimental_multibook_market/raw/f8a74288b2450c338d751fa65fdabdd2c163f4c47129c9f0c2a3ad4552124184.json","dom_note":"Public MLB DOM exposed all 9 event links with ML and O/U buttons; login header remained unused; one read."},
+  "betmgm": {"url":"https://www.ny.betmgm.com/en/sports/baseball-23/betting/usa-9/mlb-75","status":"UNAVAILABLE","reason":"COLLECTOR_REJECTED","dom_note":"Public NY page exposed 9 event rows and prices, but observed host www.ny.betmgm.com is outside fixed admitted host sports.betmgm.com; no event capture admitted.","observed_rows":"SF@PIT ML +135/-165 O9 +100/U9 -130; TOR@CLE -110/-110 O8 -105/U8 -115; CWS@HOU +135/-165 O8.5 -102/U8.5 -118; BOS@BAL -125/+105 O8.5 -105/U8.5 -115; MIL@CHC -120/+100 O8.5 -102/U8.5 -118; MIA@KC -102/-118 O9 -110/U9 -110; TB@TEX -130/+105 O8 +100/U8 -120; ATH@SEA +180/-220 O7 -115/U7 -105; STL@LAD +230/-285 O8 -105/U8 -115."},
+  "caesars": {"url":"https://sportsbook.caesars.com/us/ny/bet/baseball","status":"UNAVAILABLE","reason":"COLLECTOR_REJECTED","dom_note":"Public page loaded but exposed no genuine MLB event IDs or ML/O-U event rows; event identity was not invented."},
+  "fanatics": {"attempted_url":"https://sportsbook.fanatics.com/sports/baseball/mlb","status":"UNAVAILABLE","reason":"TRANSPORT_FAILURE","error":"net::ERR_BLOCKED_BY_CLIENT; no DOM."}
+}

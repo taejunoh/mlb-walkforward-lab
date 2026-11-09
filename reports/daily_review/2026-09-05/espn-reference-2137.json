@@ -1,0 +1,206 @@
+{
+  "schema": "ESPN_DISPLAYED_DRAFTKINGS_REFERENCE_V1",
+  "fetched_at": {
+    "current_time": "2026-09-05 21:37:31 UTC"
+  },
+  "source_url": "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard?dates=20260905&limit=100",
+  "source_role": "ESPN-displayed DraftKings reference; provider quote timestamp unavailable; not a directly admitted sportsbook capture",
+  "events": [
+    {
+      "id": "401816815",
+      "game": "CHC @ MIA",
+      "date": "2026-09-05T20:10Z",
+      "status": "STATUS_IN_PROGRESS",
+      "quote": null
+    },
+    {
+      "id": "401816818",
+      "game": "SF @ NYM",
+      "date": "2026-09-05T20:10Z",
+      "status": "STATUS_IN_PROGRESS",
+      "quote": null
+    },
+    {
+      "id": "401816813",
+      "game": "ATL @ PHI",
+      "date": "2026-09-05T22:05Z",
+      "status": "STATUS_SCHEDULED",
+      "quote": {
+        "book": "DraftKings",
+        "away": "+137",
+        "home": "-166",
+        "total": "o8",
+        "over": "-115",
+        "under": "-104"
+      }
+    },
+    {
+      "id": "401816816",
+      "game": "DET @ CLE",
+      "date": "2026-09-05T22:10Z",
+      "status": "STATUS_SCHEDULED",
+      "quote": {
+        "book": "DraftKings",
+        "away": "+134",
+        "home": "-163",
+        "total": "o7",
+        "over": "-102",
+        "under": "-119"
+      }
+    },
+    {
+      "id": "401816812",
+      "game": "LAA @ PIT",
+      "date": "2026-09-05T22:40Z",
+      "status": "STATUS_SCHEDULED",
+      "quote": {
+        "book": "DraftKings",
+        "away": "+153",
+        "home": "-187",
+        "total": "o7.5",
+        "over": "-114",
+        "under": "-105"
+      }
+    },
+    {
+      "id": "401816817",
+      "game": "MIL @ CIN",
+      "date": "2026-09-05T22:40Z",
+      "status": "STATUS_SCHEDULED",
+      "quote": {
+        "book": "DraftKings",
+        "away": "-156",
+        "home": "+129",
+        "total": "o9",
+        "over": "-114",
+        "under": "-106"
+      }
+    },
+    {
+      "id": "401816814",
+      "game": "BOS @ BAL",
+      "date": "2026-09-05T23:05Z",
+      "status": "STATUS_SCHEDULED",
+      "quote": {
+        "book": "DraftKings",
+        "away": "-126",
+        "home": "+105",
+        "total": "o7.5",
+        "over": "-118",
+        "under": "-102"
+      }
+    },
+    {
+      "id": "401816821",
+      "game": "TB @ TEX",
+      "date": "2026-09-05T23:05Z",
+      "status": "STATUS_SCHEDULED",
+      "quote": {
+        "book": "DraftKings",
+        "away": "-107",
+        "home": "-112",
+        "total": "o7",
+        "over": "+104",
+        "under": "-126"
+      }
+    },
+    {
+      "id": "401816820",
+      "game": "MIN @ CHW",
+      "date": "2026-09-05T23:10Z",
+      "status": "STATUS_SCHEDULED",
+      "quote": {
+        "book": "DraftKings",
+        "away": "+104",
+        "home": "-126",
+        "total": "o8",
+        "over": "-117",
+        "under": "-103"
+      }
+    },
+    {
+      "id": "401816822",
+      "game": "TOR @ KC",
+      "date": "2026-09-05T23:10Z",
+      "status": "STATUS_SCHEDULED",
+      "quote": {
+        "book": "DraftKings",
+        "away": "-111",
+        "home": "-108",
+        "total": "o9.5",
+        "over": "-104",
+        "under": "-115"
+      }
+    },
+    {
+      "id": "401816819",
+      "game": "ARI @ HOU",
+      "date": "2026-09-05T23:15Z",
+      "status": "STATUS_SCHEDULED",
+      "quote": {
+        "book": "DraftKings",
+        "away": "-112",
+        "home": "-108",
+        "total": "o9",
+        "over": "+100",
+        "under": "-120"
+      }
+    },
+    {
+      "id": "401816825",
+      "game": "NYY @ SD",
+      "date": "2026-09-05T23:15Z",
+      "status": "STATUS_SCHEDULED",
+      "quote": {
+        "book": "DraftKings",
+        "away": "+105",
+        "home": "-126",
+        "total": "o7.5",
+        "over": "-114",
+        "under": "-106"
+      }
+    },
+    {
+      "id": "401816823",
+      "game": "STL @ COL",
+      "date": "2026-09-06T00:10Z",
+      "status": "STATUS_SCHEDULED",
+      "quote": {
+        "book": "DraftKings",
+        "away": "-126",
+        "home": "+104",
+        "total": "o11",
+        "over": "+100",
+        "under": "-120"
+      }
+    },
+    {
+      "id": "401816826",
+      "game": "WSH @ LAD",
+      "date": "2026-09-06T01:10Z",
+      "status": "STATUS_SCHEDULED",
+      "quote": {
+        "book": "DraftKings",
+        "away": "+177",
+        "home": "-218",
+        "total": "o7",
+        "over": "-112",
+        "under": "-108"
+      }
+    },
+    {
+      "id": "401816824",
+      "game": "ATH @ SEA",
+      "date": "2026-09-06T01:40Z",
+      "status": "STATUS_SCHEDULED",
+      "quote": {
+        "book": "DraftKings",
+        "away": "+198",
+        "home": "-245",
+        "total": "o7.5",
+        "over": "-108",
+        "under": "-111"
+      }
+    }
+  ]
+}

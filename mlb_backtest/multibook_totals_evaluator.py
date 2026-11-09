@@ -23,8 +23,7 @@ from .multibook_market_board import MarketBoardAuthority, MarketBoardGame
 
 
 MAX_QUOTE_AGE_NS = 300 * 1_000_000_000
-MIN_BOOK_COVERAGE = 3
-REQUIRED_RESIDUAL_COUNT = 764
+MIN_BOOK_COVERAGE = 1
 MIN_NONPUSH_SUPPORT = Fraction("0.80")
 MIN_POINT_GAP = Fraction("1.00")
 MIN_SUPPORT_MARGIN = Fraction("0.05")
@@ -73,7 +72,9 @@ def _ordered_reasons(reasons: set[str]) -> tuple[str, ...]:
 
 def _sample_counts(game: TotalsGameAuthority) -> tuple[int, ...]:
     """Convert sealed residual observations to integer run outcomes."""
-    if len(game.residual_samples) != REQUIRED_RESIDUAL_COUNT:
+    if type(game.residual_count) is not int or game.residual_count <= 0:
+        return ()
+    if len(game.residual_samples) != game.residual_count:
         return ()
     counts: list[int] = []
     for residual in game.residual_samples:
@@ -102,7 +103,12 @@ def evaluate_total_candidate(
     price = quote.over_american_odds if direction == "OVER" else quote.under_american_odds
     reasons: set[str] = set()
     counts = _sample_counts(game)
-    if len(game.residual_samples) != REQUIRED_RESIDUAL_COUNT or len(counts) != REQUIRED_RESIDUAL_COUNT:
+    if (
+        type(game.residual_count) is not int
+        or game.residual_count <= 0
+        or len(game.residual_samples) != game.residual_count
+        or len(counts) != game.residual_count
+    ):
         reasons.add("RESIDUAL_COUNT_MISMATCH")
     line_ticks = quote.line_half_runs
     line_runs = Fraction(line_ticks, 2)
@@ -269,7 +275,14 @@ def evaluate_totals(
             reasons.add("STARTER_CONFLICT")
         if participant.late_scratch:
             reasons.add("LATE_SCRATCH")
-        if game.status != "PROJECTED" or len(game.residual_samples) != REQUIRED_RESIDUAL_COUNT:
+        sample_counts = _sample_counts(game)
+        if (
+            game.status != "PROJECTED"
+            or type(game.residual_count) is not int
+            or game.residual_count <= 0
+            or len(game.residual_samples) != game.residual_count
+            or len(sample_counts) != game.residual_count
+        ):
             reasons.add("RESIDUAL_COUNT_MISMATCH")
         fresh, had_stale = _fresh_quotes(board_game, evaluated_at_ns)
         coverage = len({quote.book_id for quote in fresh})

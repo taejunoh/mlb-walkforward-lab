@@ -1,0 +1,19 @@
+{
+  "observed_at_utc": "2026-09-15T22:41:04Z",
+  "source_url": "https://sportsbook.fanduel.com/navigation/mlb",
+  "source": "FanDuel Sportsbook public MLB page",
+  "status": "AVAILABLE",
+  "page_display_timestamp": "9/15/2026, 6:41:04 PM",
+  "access_note": "Fresh public FanDuel MLB page loaded in Chrome and read without login or wager interaction; current DET-TOR row and paired markets were visible.",
+  "event_count": 1,
+  "event": {
+    "event_id": "36070889",
+    "game_pk": 822762,
+    "displayed_event": "Detroit Tigers D Anderson at Toronto Blue Jays B Fisher",
+    "displayed_start": "7:08PM ET",
+    "scheduled_start_utc": "2026-09-15T23:08:00Z",
+    "moneyline": {"Detroit Tigers": "+124", "Toronto Blue Jays": "-146"},
+    "total": {"line": "8.5", "line_half_runs": 17, "over": "-102", "under": "-120"}
+  },
+  "totals_unit_check": "Displayed 8.5 total stored as line_half_runs=17; 17/2=8.5."
+}

@@ -99,7 +99,7 @@ def validate_market_plays_report(value: object) -> dict[str, object]:
     }
     if not isinstance(value, Mapping) or set(value) != required:
         raise ValueError("market-play report fields differ")
-    safe = json.loads(canonical_json_bytes(value))
+    safe = json.loads(canonical_json_bytes(dict(value)))
     if safe["schema"] != REPORT_SCHEMA or safe["status_labels"] != STATUS_LABELS:
         raise ValueError("market-play report schema/status differs")
     canonical_utc(safe["evaluated_at_utc"])
@@ -136,7 +136,7 @@ def validate_market_plays_trace(value: object) -> dict[str, object]:
     required = {"schema", "content_sha256", "report_relative", "report_sha256", "report_sidecar_sha256", "markdown_sha256", "evaluated_at_utc", "policy_sha256"}
     if not isinstance(value, Mapping) or set(value) != required:
         raise ValueError("market-play trace fields differ")
-    safe = json.loads(canonical_json_bytes(value))
+    safe = json.loads(canonical_json_bytes(dict(value)))
     if safe["schema"] != TRACE_SCHEMA:
         raise ValueError("market-play trace schema differs")
     if (
@@ -269,7 +269,7 @@ def build_market_plays(
     trace_bytes = canonical_json_bytes(trace)
     return BuiltMarketPlays(
         MappingProxyType(report), report_bytes, sidecar, markdown_bytes,
-        MappingProxyType(trace), trace_bytes, (ml, totals), root,
+        MappingProxyType(trace), trace_bytes, (ml, totals, board_authority), root,
     )
 
 
@@ -290,7 +290,7 @@ def persist_market_plays(root: Path, built: BuiltMarketPlays) -> tuple[Path, Pat
     report = validate_market_plays_report(built.report)
     if canonical_json_bytes(report) != built.report_bytes or sidecar_bytes(built.report_bytes) != built.sidecar_bytes:
         raise ValueError("built market-play report bytes differ")
-    if canonical_json_bytes(built.trace) != built.trace_bytes:
+    if canonical_json_bytes(dict(built.trace)) != built.trace_bytes:
         raise ValueError("built market-play trace bytes differ")
     if Path(os.path.abspath(built.root)) != Path(os.path.abspath(root)):
         raise ValueError("built market-play root differs")
