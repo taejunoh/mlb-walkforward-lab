@@ -1,0 +1,103 @@
+{
+  "schemaVersion": 1,
+  "items": [
+    {
+      "id": "temporal-reference-comparison",
+      "title": "시간 분리 후보의 변화는 작음",
+      "queries": [
+        {
+          "id": "paired-locked-2025",
+          "source": {
+            "label": "시간 분리 후보의 기존 2025년 표본 비교",
+            "files": [
+              {
+                "label": "temporal_calibration/evaluate-corrected/evaluation_report.json"
+              },
+              {
+                "label": "temporal_calibration/prepare-corrected/candidate_predictions.jsonl"
+              },
+              {
+                "label": "v5.1 locked/evaluated predictions"
+              }
+            ],
+            "metricDefinitions": [
+              {
+                "id": "brier",
+                "name": "Brier 점수",
+                "definition": "같은 1,340경기에서 홈팀 예측 확률과 실제 홈팀 승패의 제곱 오차를 평균합니다. 낮을수록 좋습니다."
+              }
+            ],
+            "filters": [
+              "기존 잠금 표본 1,340경기",
+              "새 후보를 고르는 데 결과를 사용하지 않음"
+            ],
+            "caveats": [
+              "2025년은 이미 검토한 기간이며, 실제 경기 전 시점의 독립 검증이 아닙니다.",
+              "최종 라인업과 선발을 재구성한 데이터이며 정규화와 확률 보정을 함께 변경했습니다.",
+              "초기 실행은 예측 저장 전 결과 파일을 해시 검사했으므로 시간 순서 검증을 통과한 증적으로 인정하지 않습니다. 수치 비교로만 보존합니다.",
+              "수정된 경로를 한 번 재현해 같은 예측과 지표를 확인했습니다. 기술적 재현이며 새로운 독립 검증은 아닙니다.",
+              "8월은 12일까지의 부분 기간입니다. 수익성이나 시장 대비 우위를 검증하지 않았습니다."
+            ]
+          },
+          "reportingPeriod": "2025-05-01~2025-08-12",
+          "columns": [
+            {
+              "field": "model",
+              "label": "모델"
+            },
+            {
+              "field": "n",
+              "label": "경기 수"
+            },
+            {
+              "field": "wins",
+              "label": "적중 수"
+            },
+            {
+              "field": "accuracy_pct",
+              "label": "적중률 (%)"
+            },
+            {
+              "field": "mean_probability_pct",
+              "label": "평균 예측 승률 (%)"
+            },
+            {
+              "field": "brier",
+              "label": "Brier 점수"
+            },
+            {
+              "field": "log_loss",
+              "label": "로그 손실"
+            }
+          ],
+          "rows": [
+            {
+              "model": "기존 모델",
+              "n": 1340,
+              "wins": 718,
+              "accuracy_pct": 53.582089552238806,
+              "mean_probability_pct": 56.56607006474621,
+              "brier": 0.24627075738049964,
+              "log_loss": 0.6855527297095905
+            },
+            {
+              "model": "시간 분리 후보",
+              "n": 1340,
+              "wins": 717,
+              "accuracy_pct": 53.507462686567166,
+              "mean_probability_pct": 56.10592212330444,
+              "brier": 0.2461723075976678,
+              "log_loss": 0.6853621813783786
+            }
+          ],
+          "preview": {
+            "kind": "aggregate",
+            "note": "기존 잠금 표본의 전체 집계. 후보가 점수화한 나머지 632경기는 평가 표본 밖입니다.",
+            "totalRows": 1340
+          },
+          "summary": "후보는 2022년 2,422개 적격 경기로 정규화하고 2023년 2,415경기로 보정했습니다. 독립 재계산은 두 모델의 보고 지표와 1.5e-15 이내에서 일치했습니다. 초기 두 실행 쌍과 수정 후 기술적 재현의 예측 파일 SHA는 같으며 반복 실행을 독립 검증으로 세지 않습니다."
+        }
+      ]
+    }
+  ]
+}

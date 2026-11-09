@@ -866,9 +866,9 @@ def _validate_candidate(row: Mapping[str, object]) -> dict[str, object]:
         )
     if "doubleheader_marker" in result and (
         not isinstance(result["doubleheader_marker"], str)
-        or result["doubleheader_marker"] not in ("GAME1", "GAME2")
+        or result["doubleheader_marker"] not in ("GAME1", "GAME2", "NO")
     ):
-        raise ValueError("doubleheader_marker must be GAME1 or GAME2")
+        raise ValueError("doubleheader_marker must be GAME1, GAME2, or NO")
     return result
 
 

@@ -1,0 +1,13 @@
+{
+  "query": {
+    "game_pk": 824144,
+    "observation_id": "43e5cbd9be79405dbd7a10623f07051e",
+    "target_date": "2026-09-03",
+    "url": "https://statsapi.mlb.com/api/v1/game/824144/boxscore"
+  },
+  "retrieved_at_utc": "2026-09-03T15:33:45.584340+00:00",
+  "row_count": 1,
+  "schema_version": 1,
+  "sha256": "c4cff32bff8d96e3ead9c57b0f0c2036c723ca8e48d93f3a975e6a5afac206ea",
+  "source": "mlb_live_boxscore"
+}

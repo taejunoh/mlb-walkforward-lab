@@ -8,6 +8,7 @@ and observation IDs used to authenticate observations.
 from __future__ import annotations
 
 import csv
+from dataclasses import replace
 from datetime import datetime, timezone
 import hashlib
 import io
@@ -24,6 +25,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from mlb_backtest import daily_top3, live_history, live_sources
 from mlb_backtest.live_top3_contracts import LiveHttpObservation, canonical_json_bytes
+from mlb_backtest.live_top3_trace import validate_trace_payload
 
 
 TARGET = "2026-07-21"
@@ -32,8 +34,8 @@ CARD = Path(__file__).parents[1] / "audit" / "v5_1_bt" / "model_card.json"
 HISTORY_COMPLETED = "2026-07-21T10:00:01Z"
 LIVE_COMPLETED = "2026-07-21T16:00:01Z"
 SEALED_SLATE_SHA256 = "2fce5639267743df26cc1bd036dfd275dbd613364c4ffc4fbfd083cced957684"
-GOLDEN_CONTENT_SHA256 = "6f03e2ee3be1f214ecf7f262bd6a7f599633efa64caef8c43858cd06c37662f7"
-GOLDEN_MARKDOWN_SHA256 = "2db9b30617a719bb7fcc856775970e2db94c2b6948e8c48d2add5204e4de0db4"
+GOLDEN_CONTENT_SHA256 = "e7567d3c68e9ca24563281c9c7e8d7b03442f6e31905a3885fa6a6a2899459ac"
+GOLDEN_MARKDOWN_SHA256 = "bc70de95a61255a611d20cca93c024959ed8eb6697ca8eab8bf6cc3d89f99393"
 
 
 class _FixedHistoryDateTime(datetime):
@@ -99,8 +101,7 @@ def _venue(*, valid: bool = True) -> bytes:
     coordinates = {"latitude": 40.0, "longitude": -74.0} if valid else {"latitude": 99.0, "longitude": -74.0}
     return json.dumps({"venues": [{"id": 1, "name": "Fixture Park", "location": {
         "city": "Fixture City", "defaultCoordinates": coordinates,
-        "timeZone": {"id": "America/New_York"},
-    }}]}).encode()
+    }, "timeZone": {"id": "America/New_York"}}]}).encode()
 
 
 def _league_era() -> bytes:
@@ -179,7 +180,7 @@ class SealedLiveFetcher:
             body = _history_schedule()
             completed = HISTORY_COMPLETED
         elif source == "stats_api" and "/venues/" in url:
-            if urlsplit(url).path.rsplit("/", 1)[-1] != "1" or query.get("hydrate") != ["location"]:
+            if urlsplit(url).path.rsplit("/", 1)[-1] != "1" or query.get("hydrate") != ["location,timezone"]:
                 raise AssertionError("venue request identity differs")
             body = _venue(valid=self.variant != "invalid_venue")
             completed = HISTORY_COMPLETED
@@ -240,6 +241,76 @@ class SealedLiveFetcher:
             content_type="application/json", etag='"sealed"', last_modified=None,
             body=body,
         )
+
+
+class MixedInitialExclusionFetcher(SealedLiveFetcher):
+    """Make only the first current-slate game already past its start."""
+
+    def __call__(self, source: str, url: str, *, max_bytes: int) -> LiveHttpObservation:
+        observed = super().__call__(source, url, max_bytes=max_bytes)
+        if (
+            source == "stats_api"
+            and "/schedule" in url
+            and "startDate=2026-07-21" in url
+            and self.current_schedule_calls == 1
+        ):
+            payload = json.loads(observed.body)
+            payload["dates"][0]["games"][0]["gameDate"] = (
+                "2026-07-21T15:00:00Z"
+            )
+            observed = replace(observed, body=json.dumps(payload).encode())
+        return observed
+
+
+class SuccessiveObservationFetcher:
+    """Move one sealed fixture root through missing, complete, and changed observations."""
+
+    def __init__(self):
+        self.inner = SealedLiveFetcher()
+
+    @property
+    def current_schedule_calls(self):
+        return self.inner.current_schedule_calls
+
+    def __call__(self, source: str, url: str, *, max_bytes: int) -> LiveHttpObservation:
+        observed = self.inner(source, url, max_bytes=max_bytes)
+        if source == "stats_api" and "/game/" in url and "/boxscore" in url:
+            game_pk = int(urlsplit(url).path.split("/")[4])
+            index = game_pk - 880001
+            if self.current_schedule_calls <= 8:
+                observed = replace(
+                    observed,
+                    body=json.dumps(
+                        {
+                            "teams": {
+                                "away": {
+                                    "team": {"id": 100 + index},
+                                    "pitchers": [],
+                                    "players": {},
+                                },
+                                "home": {
+                                    "team": {"id": 200 + index},
+                                    "pitchers": [],
+                                    "players": {},
+                                },
+                            }
+                        }
+                    ).encode(),
+                )
+        elif (
+            source == "stats_api"
+            and "/schedule" in url
+            and self.current_schedule_calls > 16
+            and self.current_schedule_calls % 8 != 1
+        ):
+            altered = json.loads(observed.body)
+            for game in altered["dates"][0]["games"]:
+                game["teams"]["away"]["probablePitcher"]["id"] = 9999
+                game["teams"]["away"]["probablePitcher"][
+                    "fullName"
+                ] = "Replacement Pitcher"
+            observed = replace(observed, body=json.dumps(altered).encode())
+        return observed
 
 
 class OfflineCurrentFetcher:
@@ -309,7 +380,8 @@ class DailyTop3EndToEndTests(unittest.TestCase):
     def run_fixture(
         self, root: Path, *, variant: str | None = None, redirect: bool = False,
         tamper_card: bool = False, component_weight_tamper: bool = False,
-        fetcher: SealedLiveFetcher | None = None, durable_at_start: bool = False,
+        fetcher: SealedLiveFetcher | SuccessiveObservationFetcher | None = None,
+        durable_at_start: bool = False, observation_id_factory=None,
     ):
         card = root / "audit" / "v5_1_bt" / "model_card.json"
         card.parent.mkdir(parents=True, exist_ok=True)
@@ -320,7 +392,7 @@ class DailyTop3EndToEndTests(unittest.TestCase):
         if component_weight_tamper:
             card.write_bytes(card.read_bytes().replace(b'"starter": 0.35', b'"starter": 0.34'))
         fetcher = fetcher or SealedLiveFetcher(variant=variant, redirect=redirect)
-        fixed_id = _fixed_ids()
+        fixed_id = observation_id_factory or _fixed_ids()
 
         def durable():
             if durable_at_start:
@@ -407,6 +479,26 @@ class DailyTop3EndToEndTests(unittest.TestCase):
                 [row["starter_edge_abs"] for row in payload["preliminary_top3"]],
                 [1.506376631040581, 1.3027996827358095, 1.1126482172581404],
             )
+            expected_schedule_flags = {
+                "away": [
+                    "home_city_unsupported",
+                    "prior_innings_unsupported",
+                    "rest_unsupported",
+                    "time_zones_neutral_missing_venue_coordinates",
+                    "travel_neutral_missing_venue_coordinates",
+                ],
+                "home": [
+                    "home_city_unsupported",
+                    "prior_innings_unsupported",
+                    "rest_unsupported",
+                    "time_zones_neutral_missing_venue_coordinates",
+                    "travel_neutral_missing_venue_coordinates",
+                ],
+            }
+            self.assertEqual(
+                [row["schedule_quality_flags"] for row in payload["preliminary_top3"]],
+                [expected_schedule_flags, expected_schedule_flags, expected_schedule_flags],
+            )
             self.assertEqual(payload["content_sha256"], GOLDEN_CONTENT_SHA256)
             self.assertEqual(
                 {
@@ -415,7 +507,7 @@ class DailyTop3EndToEndTests(unittest.TestCase):
                 },
                 {
                     880005: ("UNSCORED", ("STARTER_CONFLICT",)),
-                    880006: ("UNSCORED", ("INVALID_HOME_LINEUP",)),
+                    880006: ("UNSCORED", ("MISSING_HOME_LINEUP",)),
                 },
             )
             self.assertEqual(
@@ -434,13 +526,71 @@ class DailyTop3EndToEndTests(unittest.TestCase):
             )
             self.assertTrue(first_json.is_file())
             self.assertTrue(first_markdown.is_file())
+            first_readiness = first_json.with_suffix(".readiness.md")
+            second_readiness = second_json.with_suffix(".readiness.md")
+            first_trace = first_json.with_suffix(".trace.json")
+            second_trace = second_json.with_suffix(".trace.json")
+            self.assertTrue(first_readiness.is_file())
+            self.assertTrue(first_trace.is_file())
             self.assertTrue(second_json.is_file())
             self.assertTrue(second_markdown.is_file())
+            self.assertTrue(second_readiness.is_file())
+            self.assertTrue(second_trace.is_file())
             self.assertEqual(json.loads(first_json.read_bytes()), payload)
             self.assertEqual(first_json.read_bytes(), canonical_json_bytes(payload))
             self.assertEqual(second_json.read_bytes(), canonical_json_bytes(payload))
+            trace = validate_trace_payload(
+                json.loads(first_trace.read_bytes()),
+                expected_primary_report_content_sha256=payload["content_sha256"],
+                expected_model_card_sha256=payload["model_card_sha256"],
+            )
+            self.assertEqual(trace["primary_report_relative"], first_json.relative_to(first_json.parents[3]).as_posix())
+            self.assertEqual(
+                {row["game_pk"] for row in trace["games"]},
+                {880001, 880002, 880003, 880004},
+            )
+            self.assertEqual(
+                {row["disposition"] for row in trace["games"]},
+                {"PRELIMINARY", "SCORED_NOT_TOP3"},
+            )
+            self.assertEqual(first_trace.read_bytes(), second_trace.read_bytes())
             self.assertEqual(first_markdown.read_bytes(), daily_top3.render_live_top3_markdown(payload))
             self.assertEqual(hashlib.sha256(first_markdown.read_bytes()).hexdigest(), GOLDEN_MARKDOWN_SHA256)
+            readiness = first_readiness.read_text(encoding="utf-8")
+            self.assertIn("PARTICIPANT COMPLETENESS IS NOT SCORE READINESS", readiness)
+            self.assertIn("UNSCORED \\(not ranked\\)", readiness)
+            self.assertIn("EXCLUDED \\(not ranked\\)", readiness)
+            self.assertIn("MISSING\\_HOME\\_LINEUP", readiness)
+            self.assertIn("PREGAME\\_STATUS\\_NOT\\_ACCEPTED", readiness)
+            self.assertIn("- 판정:", readiness)
+            self.assertIn("- 근거:", readiness)
+            self.assertIn("- 리스크/보류 이유:", readiness)
+            self.assertEqual(readiness.count("- 판정:"), 7)
+            self.assertEqual(readiness.count("- 근거:"), 7)
+            self.assertEqual(readiness.count("- 리스크/보류 이유:"), 7)
+            self.assertIn(
+                "내부 모델은 배당·O/U 입력을 지원하지 않으며, 이 판정은 연구용 "
+                "사전 상태이지 베팅 추천이나 수익 보장이 아닙니다.",
+                readiness,
+            )
+            self.assertEqual(readiness.count("내부 모델은 배당·O/U 입력을 지원하지 않으며"), 7)
+            unscored_block = readiness[readiness.index("### 880006 · "):]
+            self.assertIn("- 판정: `UNSCORED \\(not ranked\\)`", unscored_block)
+            self.assertIn("확률을 산출하지 않음", unscored_block)
+            self.assertNotIn("승리 확률", unscored_block)
+            self.assertIn("Validated away lineup count: `9`", readiness)
+            self.assertIn("Validated home lineup count: `0`", readiness)
+            self.assertIn("Validated away lineup count: `unknown`", readiness)
+            self.assertIn(f"Primary report filename: `{first_json.name}`", readiness)
+            self.assertIn(f"Primary report content_sha256: `{payload['content_sha256']}`", readiness)
+            self.assertIn(f"Model card SHA-256: `{payload['model_card_sha256']}`", readiness)
+            for binding in payload["source_bindings"]:
+                if binding["binding_role"] in {"LIVE_PARTICIPANTS", "FINAL_SCHEDULE"}:
+                    self.assertIn(binding["observation_id"], readiness)
+                    self.assertIn(binding["durable_at_utc"], readiness)
+                    self.assertIn(binding["binding_sha256"], readiness)
+                    self.assertIn(binding["payload_sha256"], readiness)
+                    self.assertIn(binding["receipt_sha256"], readiness)
             self.assertEqual(first_json.name, f"20260721T160000Z-{GOLDEN_CONTENT_SHA256[:16]}.json")
             self.assertEqual(first_markdown.name, f"20260721T160000Z-{GOLDEN_CONTENT_SHA256[:16]}.md")
             self.assertEqual([result[4] for result in results], [8, 8])
@@ -478,6 +628,148 @@ class DailyTop3EndToEndTests(unittest.TestCase):
                 SEALED_SLATE_SHA256,
             )
 
+    def test_fixture_e2e_preserves_successive_observation_diagnostics(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "root"
+            fetcher = SuccessiveObservationFetcher()
+            observation_ids = _fixed_ids()
+
+            first, first_json, _first_markdown, _ = self.run_fixture(
+                root,
+                fetcher=fetcher,
+                observation_id_factory=observation_ids,
+            )
+            first_json_bytes = first_json.read_bytes()
+            first_readiness = first_json.with_suffix(".readiness.md")
+            first_readiness_bytes = first_readiness.read_bytes()
+            middle, middle_json, _middle_markdown, _ = self.run_fixture(
+                root,
+                fetcher=fetcher,
+                observation_id_factory=observation_ids,
+            )
+            middle_readiness = middle_json.with_suffix(".readiness.md")
+            last, last_json, _last_markdown, _ = self.run_fixture(
+                root,
+                fetcher=fetcher,
+                observation_id_factory=observation_ids,
+            )
+            last_readiness = last_json.with_suffix(".readiness.md")
+
+            self.assertEqual(first["preliminary_top3"], [])
+            self.assertEqual(last["preliminary_top3"], [])
+            self.assertTrue(
+                all("pick_probability" not in row for row in first["unscored_games"])
+            )
+            self.assertTrue(
+                all("pick_probability" not in row for row in last["unscored_games"])
+            )
+            self.assertEqual(len(middle["preliminary_top3"]), 3)
+            self.assertTrue(
+                all(0 < row["pick_probability"] < 1 for row in middle["preliminary_top3"])
+            )
+            self.assertTrue(
+                all(
+                    "PROBABLE_PITCHER_CHANGED" in row["reason_codes"]
+                    for row in last["unscored_games"]
+                )
+            )
+
+            def live_observation_ids(payload):
+                return tuple(
+                    binding["observation_id"]
+                    for binding in payload["source_bindings"]
+                    if binding["binding_role"]
+                    in {"LIVE_SCHEDULE", "LIVE_PARTICIPANTS", "FINAL_SCHEDULE"}
+                )
+
+            first_ids = live_observation_ids(first)
+            middle_ids = live_observation_ids(middle)
+            last_ids = live_observation_ids(last)
+            self.assertNotEqual(first_ids, middle_ids)
+            self.assertNotEqual(middle_ids, last_ids)
+            self.assertNotEqual(first_ids, last_ids)
+            self.assertEqual(first_json.read_bytes(), first_json_bytes)
+            self.assertEqual(first_readiness.read_bytes(), first_readiness_bytes)
+            self.assertTrue(middle_readiness.is_file())
+            self.assertTrue(last_readiness.is_file())
+            self.assertNotEqual(first_readiness_bytes, middle_readiness.read_bytes())
+            self.assertNotEqual(middle_readiness.read_bytes(), last_readiness.read_bytes())
+            self.assertNotEqual(first_readiness_bytes, last_readiness.read_bytes())
+            first_readiness_text = first_readiness.read_text(encoding="utf-8")
+            middle_readiness_text = middle_readiness.read_text(encoding="utf-8")
+            last_readiness_text = last_readiness.read_text(encoding="utf-8")
+
+            def game_block(readiness_text, game_pk):
+                marker = f"### {game_pk} · "
+                start = readiness_text.index(marker)
+                end = readiness_text.find("\n### ", start + len(marker))
+                return readiness_text[start:] if end == -1 else readiness_text[start:end]
+
+            for index, game_pk in enumerate(range(880001, 880008)):
+                expected_away = 1000 + index
+                expected_home = 3000 + index
+                observed_away = (
+                    "unknown" if index == 6 else 9004 if index == 4 else expected_away
+                )
+                observed_home = "unknown" if index == 6 else expected_home
+                first_away_count = "unknown" if index == 6 else 0
+                first_home_count = "unknown" if index == 6 else 0
+                complete_away_count = "unknown" if index == 6 else 9
+                complete_home_count = (
+                    "unknown" if index == 6 else 0 if index == 5 else 9
+                )
+                first_block = game_block(first_readiness_text, game_pk)
+                middle_block = game_block(middle_readiness_text, game_pk)
+                last_block = game_block(last_readiness_text, game_pk)
+
+                with self.subTest(game_pk=game_pk, observation="missing"):
+                    self.assertIn(f"- Expected away starter ID: `{expected_away}`", first_block)
+                    self.assertIn(f"- Expected home starter ID: `{expected_home}`", first_block)
+                    self.assertIn("- Observed away pitcher-list ID: `unknown`", first_block)
+                    self.assertIn("- Observed home pitcher-list ID: `unknown`", first_block)
+                    self.assertIn(f"- Validated away lineup count: `{first_away_count}`", first_block)
+                    self.assertIn(f"- Validated home lineup count: `{first_home_count}`", first_block)
+                with self.subTest(game_pk=game_pk, observation="complete"):
+                    self.assertIn(f"- Expected away starter ID: `{expected_away}`", middle_block)
+                    self.assertIn(f"- Expected home starter ID: `{expected_home}`", middle_block)
+                    self.assertIn(f"- Observed away pitcher-list ID: `{observed_away}`", middle_block)
+                    self.assertIn(f"- Observed home pitcher-list ID: `{observed_home}`", middle_block)
+                    self.assertIn(f"- Validated away lineup count: `{complete_away_count}`", middle_block)
+                    self.assertIn(f"- Validated home lineup count: `{complete_home_count}`", middle_block)
+                with self.subTest(game_pk=game_pk, observation="changed-final-schedule"):
+                    self.assertIn(f"- Expected away starter ID: `{expected_away}`", last_block)
+                    self.assertIn(f"- Expected home starter ID: `{expected_home}`", last_block)
+                    self.assertIn(f"- Observed away pitcher-list ID: `{observed_away}`", last_block)
+                    self.assertIn(f"- Observed home pitcher-list ID: `{observed_home}`", last_block)
+                    self.assertIn(f"- Validated away lineup count: `{complete_away_count}`", last_block)
+                    self.assertIn(f"- Validated home lineup count: `{complete_home_count}`", last_block)
+                    self.assertIn("PROBABLE\\_PITCHER\\_CHANGED", last_block)
+            self.assertNotEqual(first_json, middle_json)
+            self.assertNotEqual(middle_json, last_json)
+
+    def test_mixed_initial_exclusion_persists_excluded_and_scored_games(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "root"
+            payload, json_path, _markdown_path, _fetcher = self.run_fixture(
+                root, fetcher=MixedInitialExclusionFetcher()
+            )
+
+            excluded = {
+                row["game_pk"]: row for row in payload["excluded_games"]
+            }
+            self.assertIn(880001, excluded)
+            self.assertEqual(
+                excluded[880001]["reason_codes"],
+                ["OBSERVATION_AT_OR_AFTER_START"],
+            )
+            self.assertIn(
+                880002, {row["game_pk"] for row in payload["preliminary_top3"]}
+            )
+            self.assertTrue(json_path.is_file())
+            self.assertEqual(json.loads(json_path.read_bytes()), payload)
+            self.assertNotIn("pick_probability", excluded[880001])
+            self.assertNotIn("rank", excluded[880001])
+
     def test_result_field_normalization_rejects_mlb_and_semantic_variants(self):
         rejected = (
             "home_score", "actual_winner", "market_odds", "isWinner",
@@ -493,7 +785,6 @@ class DailyTop3EndToEndTests(unittest.TestCase):
     def test_global_integrity_failures_write_no_ranking_report(self):
         cases = (
             ("card digest", {"tamper_card": True}, ValueError, "digest", False),
-            ("durable receipt at scheduled start", {"durable_at_start": True}, ValueError, "durable at or after", True),
             ("target-day Statcast poison", {"variant": "target_poison"}, ValueError, "same-day leakage", True),
             ("invalid history venue", {"variant": "invalid_venue"}, ValueError, "coordinates", True),
             ("incomplete current schedule", {"variant": "incomplete"}, ValueError, "scheduled games", True),
@@ -634,12 +925,12 @@ class DailyTop3EndToEndTests(unittest.TestCase):
     def test_candidate_local_failures_preserve_other_scoreable_games(self):
         cases = (
             ("target venue absent", "target_venue_missing", "unscored_games", "MISSING_TARGET_VENUE_EVIDENCE"),
-            ("empty pitcher lists", "empty_pitchers", "unscored_games", "STARTER_CONFLICT"),
-            ("post-start appearance order", "poststart_pitchers", "unscored_games", "INVALID_AWAY_LINEUP"),
+            ("empty pitcher lists", "empty_pitchers", "unscored_games", "MISSING_AWAY_PITCHER_LIST"),
+            ("post-start appearance order", "poststart_pitchers", "unscored_games", "MISSING_AWAY_LINEUP"),
             ("final start conflict", "final_start_conflict", "excluded_games", "SCHEDULED_START_CHANGED"),
             ("final identity conflict", "final_identity_conflict", "excluded_games", "GAME_IDENTITY_CHANGED"),
             ("final status conflict", "final_status_conflict", "excluded_games", "PREGAME_STATUS_NOT_ACCEPTED"),
-            ("missing schedule starter", "missing_starter", "unscored_games", "STARTER_CONFLICT"),
+            ("missing schedule starter", "missing_starter", "unscored_games", "MISSING_SCHEDULE_PROBABLE"),
             ("unknown schedule status", "unknown_status", "excluded_games", "PREGAME_STATUS_NOT_ACCEPTED"),
         )
         for label, variant, population, reason in cases:

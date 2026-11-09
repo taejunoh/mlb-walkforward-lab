@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {"sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
+  "type": "object", "additionalProperties": false,
+  "required": ["schema", "model_id", "lane_id", "fold_id", "calibration_key", "target_year", "training_start", "training_end", "source_authority_sha256", "source_inventory_sha256", "game_evidence_inventory_relative_path", "game_evidence_inventory_sha256", "feature_contract_sha256", "feature_code_revision", "feature_rows_path", "feature_rows_sha256", "feature_population_sha256"],
+  "properties": {
+    "schema": {"const": "MODEL_IMPROVEMENT_CALIBRATION_FEATURE_RECEIPT_V1"}, "model_id": {"const": "v5.1"}, "lane_id": {"const": "baseline"},
+    "fold_id": {"type": "string"}, "calibration_key": {"type": "string"}, "target_year": {"type": "integer"}, "training_start": {"type": "string"}, "training_end": {"type": "string"},
+    "source_authority_sha256": {"$ref": "#/$defs/sha"}, "source_inventory_sha256": {"$ref": "#/$defs/sha"}, "game_evidence_inventory_relative_path": {"type": "string", "pattern": "^(?!/).+"}, "game_evidence_inventory_sha256": {"$ref": "#/$defs/sha"}, "feature_contract_sha256": {"$ref": "#/$defs/sha"}, "feature_code_revision": {"type": "string"}, "feature_rows_path": {"type": "string", "pattern": "^/"}, "feature_rows_sha256": {"$ref": "#/$defs/sha"}, "feature_population_sha256": {"$ref": "#/$defs/sha"}
+  }
+}

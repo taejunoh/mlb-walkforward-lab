@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["lane_id", "state", "run_spec_sha256", "parent_card_sha256", "evidence_sha256", "reason_codes"],
+  "properties": {
+    "lane_id": {"type": "string", "enum": ["A", "B", "C"]},
+    "state": {"type": "string", "enum": ["QUALIFIED", "ABSENT", "REJECTED"]},
+    "run_spec_sha256": {"$ref": "#/$defs/sha256"},
+    "parent_card_sha256": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/sha256"}]},
+    "evidence_sha256": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/sha256"}},
+    "reason_codes": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

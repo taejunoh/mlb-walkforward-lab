@@ -1,0 +1,521 @@
+{
+  "schema": "MLB_OPERATIONS_CHECK_V1",
+  "triggered_at_utc": "2026-09-30T17:50:03.152Z",
+  "checked_at_utc": "2026-09-30T17:51:58Z",
+  "local_date": "2026-09-30",
+  "timezone": "America/New_York",
+  "status": "SOURCE_BLOCKERS_UNCHANGED_ROUTINE_PRESTART_STATE_TRANSITIONS",
+  "schedule": {
+    "source_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&startDate=2026-09-29&endDate=2026-10-01&fields=totalGames,dates,date,games,gamePk,gameType,gameDate,status,abstractGameState,detailedState,codedGameState,teams,away,home,team,id,name",
+    "request_started_at_utc": "2026-09-30T17:50:48Z",
+    "response_received_at_utc": "2026-09-30T17:50:48Z",
+    "score_free": true,
+    "payload": {
+      "totalGames": 12,
+      "dates": [
+        {
+          "date": "2026-09-29",
+          "totalGames": 4,
+          "games": [
+            {
+              "gamePk": 849845,
+              "gameType": "F",
+              "gameDate": "2026-09-29T18:00:00Z",
+              "status": {
+                "abstractGameState": "Final",
+                "codedGameState": "F",
+                "detailedState": "Final"
+              },
+              "teams": {
+                "away": {
+                  "team": {
+                    "id": 143,
+                    "name": "Philadelphia Phillies"
+                  }
+                },
+                "home": {
+                  "team": {
+                    "id": 144,
+                    "name": "Atlanta Braves"
+                  }
+                }
+              }
+            },
+            {
+              "gamePk": 849849,
+              "gameType": "F",
+              "gameDate": "2026-09-29T21:00:00Z",
+              "status": {
+                "abstractGameState": "Final",
+                "codedGameState": "F",
+                "detailedState": "Final"
+              },
+              "teams": {
+                "away": {
+                  "team": {
+                    "id": 145,
+                    "name": "Chicago White Sox"
+                  }
+                },
+                "home": {
+                  "team": {
+                    "id": 117,
+                    "name": "Houston Astros"
+                  }
+                }
+              }
+            },
+            {
+              "gamePk": 849851,
+              "gameType": "F",
+              "gameDate": "2026-09-30T00:00:00Z",
+              "status": {
+                "abstractGameState": "Final",
+                "codedGameState": "F",
+                "detailedState": "Final"
+              },
+              "teams": {
+                "away": {
+                  "team": {
+                    "id": 111,
+                    "name": "Boston Red Sox"
+                  }
+                },
+                "home": {
+                  "team": {
+                    "id": 147,
+                    "name": "New York Yankees"
+                  }
+                }
+              }
+            },
+            {
+              "gamePk": 849843,
+              "gameType": "F",
+              "gameDate": "2026-09-30T02:00:00Z",
+              "status": {
+                "abstractGameState": "Final",
+                "codedGameState": "F",
+                "detailedState": "Final"
+              },
+              "teams": {
+                "away": {
+                  "team": {
+                    "id": 112,
+                    "name": "Chicago Cubs"
+                  }
+                },
+                "home": {
+                  "team": {
+                    "id": 135,
+                    "name": "San Diego Padres"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        {
+          "date": "2026-09-30",
+          "totalGames": 4,
+          "games": [
+            {
+              "gamePk": 849841,
+              "gameType": "F",
+              "gameDate": "2026-09-30T18:00:00Z",
+              "status": {
+                "abstractGameState": "Live",
+                "codedGameState": "P",
+                "detailedState": "Warmup"
+              },
+              "teams": {
+                "away": {
+                  "team": {
+                    "id": 143,
+                    "name": "Philadelphia Phillies"
+                  }
+                },
+                "home": {
+                  "team": {
+                    "id": 144,
+                    "name": "Atlanta Braves"
+                  }
+                }
+              }
+            },
+            {
+              "gamePk": 849846,
+              "gameType": "F",
+              "gameDate": "2026-09-30T21:00:00Z",
+              "status": {
+                "abstractGameState": "Preview",
+                "codedGameState": "P",
+                "detailedState": "Pre-Game"
+              },
+              "teams": {
+                "away": {
+                  "team": {
+                    "id": 145,
+                    "name": "Chicago White Sox"
+                  }
+                },
+                "home": {
+                  "team": {
+                    "id": 117,
+                    "name": "Houston Astros"
+                  }
+                }
+              }
+            },
+            {
+              "gamePk": 849848,
+              "gameType": "F",
+              "gameDate": "2026-10-01T00:00:00Z",
+              "status": {
+                "abstractGameState": "Preview",
+                "codedGameState": "S",
+                "detailedState": "Scheduled"
+              },
+              "teams": {
+                "away": {
+                  "team": {
+                    "id": 111,
+                    "name": "Boston Red Sox"
+                  }
+                },
+                "home": {
+                  "team": {
+                    "id": 147,
+                    "name": "New York Yankees"
+                  }
+                }
+              }
+            },
+            {
+              "gamePk": 849842,
+              "gameType": "F",
+              "gameDate": "2026-10-01T02:00:00Z",
+              "status": {
+                "abstractGameState": "Preview",
+                "codedGameState": "S",
+                "detailedState": "Scheduled"
+              },
+              "teams": {
+                "away": {
+                  "team": {
+                    "id": 112,
+                    "name": "Chicago Cubs"
+                  }
+                },
+                "home": {
+                  "team": {
+                    "id": 135,
+                    "name": "San Diego Padres"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        {
+          "date": "2026-10-01",
+          "totalGames": 4,
+          "games": [
+            {
+              "gamePk": 849844,
+              "gameType": "F",
+              "gameDate": "2026-10-01T18:00:00Z",
+              "status": {
+                "abstractGameState": "Preview",
+                "codedGameState": "S",
+                "detailedState": "Scheduled"
+              },
+              "teams": {
+                "away": {
+                  "team": {
+                    "id": 143,
+                    "name": "Philadelphia Phillies"
+                  }
+                },
+                "home": {
+                  "team": {
+                    "id": 144,
+                    "name": "Atlanta Braves"
+                  }
+                }
+              }
+            },
+            {
+              "gamePk": 849850,
+              "gameType": "F",
+              "gameDate": "2026-10-01T21:00:00Z",
+              "status": {
+                "abstractGameState": "Preview",
+                "codedGameState": "S",
+                "detailedState": "Scheduled"
+              },
+              "teams": {
+                "away": {
+                  "team": {
+                    "id": 145,
+                    "name": "Chicago White Sox"
+                  }
+                },
+                "home": {
+                  "team": {
+                    "id": 117,
+                    "name": "Houston Astros"
+                  }
+                }
+              }
+            },
+            {
+              "gamePk": 849847,
+              "gameType": "F",
+              "gameDate": "2026-10-02T00:00:00Z",
+              "status": {
+                "abstractGameState": "Preview",
+                "codedGameState": "S",
+                "detailedState": "Scheduled"
+              },
+              "teams": {
+                "away": {
+                  "team": {
+                    "id": 111,
+                    "name": "Boston Red Sox"
+                  }
+                },
+                "home": {
+                  "team": {
+                    "id": 147,
+                    "name": "New York Yankees"
+                  }
+                }
+              }
+            },
+            {
+              "gamePk": 849840,
+              "gameType": "F",
+              "gameDate": "2026-10-02T02:00:00Z",
+              "status": {
+                "abstractGameState": "Preview",
+                "codedGameState": "S",
+                "detailedState": "Scheduled"
+              },
+              "teams": {
+                "away": {
+                  "team": {
+                    "id": 112,
+                    "name": "Chicago Cubs"
+                  }
+                },
+                "home": {
+                  "team": {
+                    "id": 135,
+                    "name": "San Diego Padres"
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "participant_availability_observation": {
+    "url": "https://statsapi.mlb.com/api/v1/game/849841/boxscore?fields=teams,away,home,team,id,players,person,battingOrder,pitchers",
+    "observed_at_utc": "2026-09-30T17:21:13Z",
+    "game_pk": 849841,
+    "scope": "Read-only participant availability; not a model input or prospective prediction.",
+    "sides": {
+      "away": {
+        "team_id": 143,
+        "starting_nine_count": 9,
+        "starting_nine": [
+          {
+            "batting_order": "100",
+            "player_id": 607208
+          },
+          {
+            "batting_order": "200",
+            "player_id": 656941
+          },
+          {
+            "batting_order": "300",
+            "player_id": 547180
+          },
+          {
+            "batting_order": "400",
+            "player_id": 664761
+          },
+          {
+            "batting_order": "500",
+            "player_id": 681082
+          },
+          {
+            "batting_order": "600",
+            "player_id": 669016
+          },
+          {
+            "batting_order": "700",
+            "player_id": 624641
+          },
+          {
+            "batting_order": "800",
+            "player_id": 702222
+          },
+          {
+            "batting_order": "900",
+            "player_id": 592663
+          }
+        ],
+        "pitcher_ids": [
+          650911
+        ]
+      },
+      "home": {
+        "team_id": 144,
+        "starting_nine_count": 9,
+        "starting_nine": [
+          {
+            "batting_order": "100",
+            "player_id": 660670
+          },
+          {
+            "batting_order": "200",
+            "player_id": 686948
+          },
+          {
+            "batting_order": "300",
+            "player_id": 645277
+          },
+          {
+            "batting_order": "400",
+            "player_id": 621566
+          },
+          {
+            "batting_order": "500",
+            "player_id": 643289
+          },
+          {
+            "batting_order": "600",
+            "player_id": 663586
+          },
+          {
+            "batting_order": "700",
+            "player_id": 671739
+          },
+          {
+            "batting_order": "800",
+            "player_id": 669221
+          },
+          {
+            "batting_order": "900",
+            "player_id": 673490
+          }
+        ],
+        "pitcher_ids": [
+          641816
+        ]
+      }
+    }
+  },
+  "participant_observation_limitations": [
+    "Participant observation is retained from17:21Z and was not refreshed in this check.",
+    "PHI@ATL is now within15minutes of scheduled start; no other game is in the configured120-to15-minute recheck interval.",
+    "Official Warmup/abstract Live is recorded verbatim; it is not treated as confirmed first pitch or permission to bypass pregame gates."
+  ],
+  "observations": {
+    "previous_day_final_games": 4,
+    "today_games": 4,
+    "today_pregame_or_scheduled": 3,
+    "tomorrow_scheduled_games": 4,
+    "today_first_start_utc": "2026-09-30T18:00:00Z",
+    "within_first_game_lineup_recheck_window": false,
+    "new_game_start_cutoffs_missed": 0,
+    "matching_model_process_count": 0,
+    "research_report_namespace": "ABSENT",
+    "research_flow_namespace": "ABSENT",
+    "poststart_report_namespace": "ABSENT",
+    "regular_flow_receipt_counts": {
+      "2026-09-16": 4,
+      "2026-09-23": 16,
+      "2026-09-24": 4
+    },
+    "receipt_inventory_changed": false,
+    "today_warmup": 1
+  },
+  "actions": {
+    "model_runs": 0,
+    "poststart_runs": 0,
+    "new_model_reports": 0,
+    "new_primary_claims": 0,
+    "new_settlements": 0,
+    "source_code_modified": false,
+    "known_sep23_failure_retried": false,
+    "unchanged_source_failures_retried": false
+  },
+  "blockers_preserved": [
+    {
+      "code": "RESEARCH_SCHEDULE_DUPLICATE_COVERAGE_GAME_PK",
+      "evidence": "reports/daily_review/2026-09-30/postseason-live-activation-attempt-20260930T1521Z.json"
+    },
+    {
+      "code": "POSTSTART_HISTORY_SOURCE_BINDING_CARDINALITY_MISMATCH",
+      "evidence": "reports/daily_review/2026-09-30/reconstruction-preparation/input-contract-blocker.json"
+    },
+    {
+      "code": "POSTSTART_POSTSEASON_UNSUPPORTED",
+      "note": "Existing poststart path remains R-only."
+    }
+  ],
+  "notification": {
+    "decision": "DONT_NOTIFY",
+    "reason": "Routine PHI@ATL Warmup and CWS@HOU Pre-Game transitions do not resolve the known source failure. No new forecast/receipt/settlement or actual missed scheduled start yet; near-start warning already sent."
+  },
+  "next_check": "Next existing 30-minute heartbeat or explicit human direction. Preserve terminal settlements and do not rerun unchanged failures.",
+  "comparison": {
+    "previous_record": "reports/daily_review/2026-09-30/operations-check-20260930T172003Z.json",
+    "schedule_unchanged": false,
+    "schedule_state_changes": [
+      {
+        "game_pk": 849841,
+        "previous": {
+          "abstractGameState": "Preview",
+          "codedGameState": "P",
+          "detailedState": "Pre-Game"
+        },
+        "current": {
+          "abstractGameState": "Live",
+          "codedGameState": "P",
+          "detailedState": "Warmup"
+        }
+      },
+      {
+        "game_pk": 849846,
+        "previous": {
+          "abstractGameState": "Preview",
+          "codedGameState": "S",
+          "detailedState": "Scheduled"
+        },
+        "current": {
+          "abstractGameState": "Preview",
+          "codedGameState": "P",
+          "detailedState": "Pre-Game"
+        }
+      }
+    ],
+    "participant_ids_unchanged": null,
+    "participant_rechecked": false,
+    "artifact_inventory_unchanged": true
+  },
+  "deadline_observation": {
+    "first_start_utc": "2026-09-30T18:00:00Z",
+    "minutes_until_start": 8,
+    "scheduled_start_elapsed": false,
+    "actual_first_pitch_verified": false,
+    "missed_start_cutoff": false,
+    "new_within_one_hour_warning": false,
+    "prior_warning_record": "reports/daily_review/2026-09-30/operations-check-20260930T172003Z.json"
+  }
+}

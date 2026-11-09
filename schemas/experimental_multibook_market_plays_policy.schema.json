@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Provisional multibook market plays policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "maximum_quote_age_seconds",
+    "minimum_book_coverage",
+    "minimum_data_completeness",
+    "minimum_ml_price_margin",
+    "minimum_nonpush_support",
+    "minimum_point_gap_runs",
+    "minimum_total_support_margin"
+  ],
+  "properties": {
+    "schema": {"const": "PROVISIONAL_MULTIBOOK_MARKET_PLAYS_POLICY_V2"},
+    "maximum_quote_age_seconds": {"const": 300},
+    "minimum_book_coverage": {"const": 1},
+    "minimum_data_completeness": {"const": "0.50"},
+    "minimum_ml_price_margin": {"const": "0.05"},
+    "minimum_nonpush_support": {"const": "0.80"},
+    "minimum_point_gap_runs": {"const": "1.00"},
+    "minimum_total_support_margin": {"const": "0.05"}
+  }
+}

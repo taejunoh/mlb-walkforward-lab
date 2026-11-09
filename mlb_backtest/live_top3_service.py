@@ -448,15 +448,25 @@ def _candidate_failure_reasons(
         game.get("away_probable_pitcher_id"),
         game.get("home_probable_pitcher_id"),
     )
-    if "STARTER_CONFLICT" in reasons or any(
+    missing_starter_evidence = any(
         type(starter) is not int
         or starter <= 0
         or type(probable) is not int
         or probable <= 0
-        or starter != probable
+        for starter, probable in zip(starters, probable_starters, strict=True)
+    )
+    if missing_starter_evidence:
+        return nonprobable_reasons or {"INCOMPLETE_PREGAME_PARTICIPANTS"}
+    if "STARTER_CONFLICT" in reasons or any(
+        starter != probable
         for starter, probable in zip(starters, probable_starters, strict=True)
     ):
         return {"STARTER_CONFLICT"}
+    missing_lineup_reasons = nonprobable_reasons & {
+        "MISSING_AWAY_LINEUP", "MISSING_HOME_LINEUP"
+    }
+    if missing_lineup_reasons:
+        return nonprobable_reasons
     for side in ("away", "home"):
         lineup = getattr(participant, f"{side}_lineup")
         if (
@@ -537,10 +547,13 @@ def build_live_top3_run(
     career_bf_bindings: tuple[SourceBinding, ...],
     command_inputs: Mapping[str, object],
     execution_times: ExecutionTimes,
+    trace_sink: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     """Return one validated, content-hashed experimental run payload."""
     if not callable(final_schedule_observer):
         raise ValueError("final_schedule_observer must be callable")
+    if trace_sink is not None and not isinstance(trace_sink, list):
+        raise ValueError("trace_sink must be a list or None")
     career_by_pitcher = _validate_inputs(
         slate,
         history,
@@ -560,7 +573,7 @@ def build_live_top3_run(
         tuple[
             Mapping[str, object],
             object,
-            object,
+            FinalGameObservation | FinalGameScheduleDisposition | None,
             list[SourceBinding],
             str,
             set[str],
@@ -575,6 +588,7 @@ def build_live_top3_run(
             dict[str, object],
         ]
     ] = []
+    captured_trace_rows: list[dict[str, object]] = []
 
     for game in sorted(slate.games, key=lambda row: int(row["game_pk"])):
         game_pk = int(game["game_pk"])
@@ -582,11 +596,32 @@ def build_live_top3_run(
         relevant = _relevant_slate_bindings(slate, game_pk)
         relevant.extend(history.source_bindings)
         relevant.extend(_participant_career_bindings(participant, career_by_pitcher))
-        exclusion_reasons: set[str] = set()
+        exclusion_reasons: set[str] = set(
+            slate.initial_exclusion_reasons.get(game_pk, ())
+        )
+        initially_excluded = bool(exclusion_reasons)
         if game.get("official_date") != slate.target_date:
             exclusion_reasons.add("OFFICIAL_DATE_CHANGED")
         if game.get("status") not in ACCEPTED_PREGAME_STATUSES:
             exclusion_reasons.add("PREGAME_STATUS_NOT_ACCEPTED")
+
+        if initially_excluded:
+            relevant = _unique_bindings(relevant)
+            boundary_utc, boundary_time = _boundary(relevant)
+            start_time = _parse_utc(str(game["scheduled_start_utc"]))
+            if boundary_time >= start_time:
+                exclusion_reasons.add("OBSERVATION_AT_OR_AFTER_START")
+            observed_games.append(
+                (
+                    game,
+                    participant,
+                    None,
+                    relevant,
+                    boundary_utc,
+                    exclusion_reasons,
+                )
+            )
+            continue
 
         final = final_schedule_observer(game_pk, slate.target_date)
         if isinstance(final, FinalGameScheduleDisposition):
@@ -814,6 +849,44 @@ def build_live_top3_run(
             unresolved_context,
         )
         tier(pick["pick_probability"], confidence, uncertainty_label)
+        if trace_sink is not None:
+            trace_row: dict[str, object] = {
+                "game_pk": game_pk,
+                "target_date": slate.target_date,
+                "away_team": game["away_team"],
+                "home_team": game["home_team"],
+                "scheduled_start_utc": game["scheduled_start_utc"],
+                "raw_features": json.loads(canonical_json_bytes(raw)),
+                "feature_sha256": hashlib.sha256(
+                    canonical_json_bytes(raw)
+                ).hexdigest(),
+                "model_card_sha256": card.file_sha256,
+                "away_scores": _plain_json(scored["away_scores"]),
+                "home_scores": _plain_json(scored["home_scores"]),
+                "qualities": _plain_json(scored["qualities"]),
+                "contributions": {
+                    name: WEIGHTS[name]
+                    * (
+                        float(scored["home_scores"][name])
+                        - float(scored["away_scores"][name])
+                    )
+                    for name in WEIGHTS
+                },
+                "total_edge": float(scored["edge"]),
+                "edge": float(scored["edge"]),
+                "p_home": float(p_home),
+                "predicted_side": pick["predicted_side"],
+                "pick_probability": float(pick["pick_probability"]),
+                "primary_rank": None,
+                "disposition": "UNSCORED_EXACT_NEUTRAL"
+                if pick["predicted_side"] == "none"
+                else "SCORED_NOT_TOP3",
+            }
+            for quality_field in ("away_qualities", "home_qualities"):
+                if quality_field in scored:
+                    trace_row[quality_field] = _plain_json(scored[quality_field])
+            captured_trace_rows.append(trace_row)
+            trace_sink.append(trace_row)
         if pick["predicted_side"] == "none":
             unscored.append(
                 _unranked_row(
@@ -843,6 +916,14 @@ def build_live_top3_run(
                 "scheduled_start_utc": game["scheduled_start_utc"],
                 "observation_boundary_utc": boundary_utc,
                 "reason_codes": sorted(set(participant.reason_codes)),
+                "schedule_quality_flags": {
+                    side: sorted(
+                        set(
+                            raw.get(side, {}).get("schedule", {}).get("flags", [])
+                        )
+                    )
+                    for side in ("away", "home")
+                },
                 "model_card_sha256": card.file_sha256,
                 "feature_sha256": hashlib.sha256(
                     canonical_json_bytes(raw)
@@ -865,6 +946,14 @@ def build_live_top3_run(
     preliminary = preliminary[:3]
     for rank, row in enumerate(preliminary, 1):
         row["rank"] = rank
+        if trace_sink is not None:
+            trace_row = next(
+                candidate
+                for candidate in captured_trace_rows
+                if candidate["game_pk"] == row["game_pk"]
+            )
+            trace_row["primary_rank"] = rank
+            trace_row["disposition"] = "PRELIMINARY"
     unscored.sort(key=lambda row: (row["scheduled_start_utc"], row["game_pk"]))
     excluded.sort(key=lambda row: (row["scheduled_start_utc"], row["game_pk"]))
 

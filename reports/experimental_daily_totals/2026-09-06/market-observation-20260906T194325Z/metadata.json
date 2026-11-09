@@ -1,0 +1,73 @@
+{
+  "schema": "EXPERIMENTAL_MARKET_OBSERVATION_V1",
+  "observation_status": "OBSERVATION_ONLY_NOT_ADMITTED",
+  "source_url": "https://dknetwork.draftkings.com/moneyline-total-spread/",
+  "final_url": "https://dknetwork.draftkings.com/moneyline-total-spread/",
+  "request_started_at_utc": "2026-09-06T19:43:25.068940000Z",
+  "response_completed_at_utc": "2026-09-06T19:43:25.599064000Z",
+  "http_status": 200,
+  "transport": "curl_standard_http_no_auth",
+  "raw_relative": "reports/experimental_daily_totals/2026-09-06/market-observation-20260906T194325Z/raw.html",
+  "raw_sha256": "944cde74c96bab82962772774225a18f33e0ffcfdc6961a7fa997e47218a4c19",
+  "raw_byte_length": 145832,
+  "provider_quote_updated_at_utc": null,
+  "provider_quote_freshness": "UNKNOWN",
+  "rows": [
+    {
+      "event_id": "34624714",
+      "displayed_matchup": "NY Yankees @ SD Padres",
+      "displayed_start": "9/6, 04:10PM",
+      "moneyline": {
+        "SD Padres": "−118",
+        "NY Yankees": "−102"
+      },
+      "total": {
+        "displayed_line": "7",
+        "over": "−105",
+        "under": "−115"
+      }
+    },
+    {
+      "event_id": "34624715",
+      "displayed_matchup": "Athletics @ SEA Mariners",
+      "displayed_start": "9/6, 04:10PM",
+      "moneyline": {
+        "SEA Mariners": "−215",
+        "Athletics": "+176"
+      },
+      "total": {
+        "displayed_line": "7",
+        "over": "−117",
+        "under": "−103"
+      }
+    },
+    {
+      "event_id": "34624716",
+      "displayed_matchup": "MIN Twins @ CHI White Sox",
+      "displayed_start": "9/6, 06:20PM",
+      "moneyline": {
+        "CHI White Sox": "−143",
+        "MIN Twins": "+119"
+      },
+      "total": {
+        "displayed_line": "8.5",
+        "over": "−112",
+        "under": "−108"
+      }
+    },
+    {
+      "event_id": "34624717",
+      "displayed_matchup": "WAS Nationals @ LA Dodgers",
+      "displayed_start": "9/6, 10:10PM",
+      "moneyline": {
+        "LA Dodgers": "−199",
+        "WAS Nationals": "+163"
+      },
+      "total": {
+        "displayed_line": "8",
+        "over": "−119",
+        "under": "−101"
+      }
+    }
+  ]
+}

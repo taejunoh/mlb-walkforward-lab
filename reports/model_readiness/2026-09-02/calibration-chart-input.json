@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 1,
+  "id": "mlb-calibration-check",
+  "title": "예측 확률 구간별 실제 적중률",
+  "description": "2025-05-01~08-12 · 잠금 표본 1,340경기 · 후향적 진단",
+  "chart": {
+    "type": "bar",
+    "x": "bin",
+    "y": "percent",
+    "series": "series",
+    "yLabel": "비율 (%)",
+    "showXAxisLabel": false
+  },
+  "rows": [
+    {
+      "bin": "50~60% (1,032경기)",
+      "series": "평균 예상 승률",
+      "percent": 54.49488086810073
+    },
+    {
+      "bin": "50~60% (1,032경기)",
+      "series": "실제 적중률",
+      "percent": 50.1937984496124
+    },
+    {
+      "bin": "60~70% (298경기)",
+      "series": "평균 예상 승률",
+      "percent": 63.25933934382552
+    },
+    {
+      "bin": "60~70% (298경기)",
+      "series": "실제 적중률",
+      "percent": 65.1006711409396
+    },
+    {
+      "bin": "70~80% (10경기)",
+      "series": "평균 예상 승률",
+      "percent": 70.85337064199999
+    },
+    {
+      "bin": "70~80% (10경기)",
+      "series": "실제 적중률",
+      "percent": 60
+    }
+  ],
+  "source": {
+    "label": "v5.1 잠금 예측·평가 결과",
+    "files": [
+      {
+        "label": "v51-transfer-diagnostic.json"
+      },
+      {
+        "label": "evaluated_predictions.jsonl"
+      },
+      {
+        "label": "predictions.jsonl"
+      }
+    ],
+    "metricDefinitions": [
+      {
+        "id": "calibration",
+        "name": "예상 승률과 적중률",
+        "definition": "2025년 잠금 표본 1,340경기를 예측한 팀의 승률 구간으로 묶어, 평균 예측 확률과 실제 승리 비율을 비교합니다."
+      }
+    ],
+    "filters": [
+      "2025-05-01~2025-08-12의 잠금된 100개 날짜",
+      "최종 결과가 있는 1,340경기",
+      "예측한 팀 기준 확률과 승패"
+    ],
+    "caveats": [
+      "과거 최종 라인업·실제 선발을 재구성한 후향적 진단이며 실시간 검증이 아닙니다.",
+      "70~80% 구간은 10경기뿐입니다. 표본을 보고 베팅 임계값을 고르지 않았습니다.",
+      "수익성·시장 대비 우위는 검증하지 않았습니다."
+    ]
+  },
+  "theme": "codex-classic"
+}

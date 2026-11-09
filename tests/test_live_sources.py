@@ -24,6 +24,7 @@ from mlb_backtest.live_sources import (
     LiveSlateObservation,
     compare_probable_pitchers,
     fetch_live_http,
+    load_live_schedule_observation,
     live_schedule_url,
     observe_final_game_schedule,
     observe_live_slate,
@@ -120,10 +121,10 @@ def _http(
     )
 
 
-def _posted_lineup_pregame_schedule():
+def _posted_lineup_pregame_schedule(*, status="Scheduled"):
     payload = json.loads(POSTED_LINEUP_SCHEDULE.read_text())
     game = payload["dates"][0]["games"][0]
-    game["status"] = {"detailedState": "Scheduled"}
+    game["status"] = {"detailedState": status}
     game["teams"]["away"]["team"] = {"id": 110, "name": "Away Club"}
     game["teams"]["home"]["team"] = {"id": 120, "name": "Home Club"}
     game["teams"]["away"]["probablePitcher"] = {
@@ -135,6 +136,38 @@ def _posted_lineup_pregame_schedule():
         "fullName": "Home Pitcher",
     }
     payload["dates"][0]["games"] = [game]
+    return json.dumps(payload).encode()
+
+
+def _explicit_non_doubleheader_schedule():
+    payload = json.loads(_posted_lineup_pregame_schedule())
+    game = payload["dates"][0]["games"][0]
+    game["doubleHeader"] = "N"
+    game["gameNumber"] = 1
+    return json.dumps(payload).encode()
+
+
+def _mixed_warmup_schedule():
+    payload = json.loads(_posted_lineup_pregame_schedule(status="Warmup"))
+    first = payload["dates"][0]["games"][0]
+    second = json.loads(json.dumps(first))
+    first["gamePk"] = 778100
+    first["gameDate"] = "2025-05-01T18:00:00Z"
+    second["gamePk"] = 778101
+    second["gameDate"] = "2025-05-01T20:00:00Z"
+    payload["dates"][0]["games"] = [first, second]
+    return json.dumps(payload).encode()
+
+
+def _offdate_postponed_schedule(*, status="Postponed"):
+    payload = json.loads(_posted_lineup_pregame_schedule(status=status))
+    payload["dates"][0]["date"] = "2026-09-22"
+    game = payload["dates"][0]["games"][0]
+    game["officialDate"] = "2026-09-23"
+    game["gameDate"] = "2026-09-23T00:10:00Z"
+    for side in ("away", "home"):
+        game["teams"][side].pop("score", None)
+        game["teams"][side].pop("isWinner", None)
     return json.dumps(payload).encode()
 
 
@@ -241,6 +274,70 @@ def _run_persist_process_pair(root, observation_id, roles):
 
 
 class LiveSourceTests(unittest.TestCase):
+    def test_mixed_warmup_slate_localizes_at_start_schedule(self):
+        schedule = _mixed_warmup_schedule()
+        boxscore_requests: list[str] = []
+
+        def fetcher(_source, url, *, max_bytes):
+            if "/boxscore" in url:
+                boxscore_requests.append(url)
+                if url.endswith("/778100/boxscore"):
+                    raise AssertionError("excluded game must not fetch boxscore")
+                return _http(
+                    url,
+                    BOX_COMPLETE.read_bytes(),
+                    started="2025-05-01T18:30:00Z",
+                    completed="2025-05-01T18:30:01Z",
+                )
+            return _http(
+                url,
+                schedule,
+                started="2025-05-01T18:30:00Z",
+                completed="2025-05-01T18:30:01Z",
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            slate = observe_live_slate(
+                Path(temporary),
+                "2025-05-01",
+                fetcher=fetcher,
+                durable_clock=lambda: datetime(
+                    2025, 5, 1, 19, 0, tzinfo=timezone.utc
+                ),
+                observation_id_factory=iter(
+                    ("mixed-schedule", "mixed-game-2")
+                ).__next__,
+            )
+
+        self.assertEqual(
+            slate.initial_exclusion_reasons[778100],
+            ("OBSERVATION_AT_OR_AFTER_START",),
+        )
+        self.assertIn(778101, slate.participants)
+        self.assertNotIn(778100, slate.participants)
+        self.assertEqual(boxscore_requests, [
+            "https://statsapi.mlb.com/api/v1/game/778101/boxscore"
+        ])
+
+    def test_live_schedule_preserves_explicit_non_doubleheader_marker(self):
+        games = parse_live_schedule(
+            _explicit_non_doubleheader_schedule(), requested_date="2025-05-01"
+        )
+
+        self.assertEqual(games[0]["doubleheader_marker"], "NO")
+
+    def test_live_schedule_missing_doubleheader_fields_remains_unknown(self):
+        payload = json.loads(_posted_lineup_pregame_schedule())
+        game = payload["dates"][0]["games"][0]
+        game.pop("doubleHeader", None)
+        game.pop("gameNumber", None)
+
+        games = parse_live_schedule(
+            json.dumps(payload).encode(), requested_date="2025-05-01"
+        )
+
+        self.assertIsNone(games[0]["doubleheader_marker"])
+
     def test_http_observation_binds_status_final_url_and_selected_headers(self):
         started = datetime(2026, 7, 21, 15, tzinfo=timezone.utc)
         completed = datetime(2026, 7, 21, 15, 0, 1, tzinfo=timezone.utc)
@@ -452,12 +549,248 @@ class LiveSourceTests(unittest.TestCase):
         }
         self.assertFalse(forbidden & set(games[0]))
         self.assertEqual(
-            ACCEPTED_PREGAME_STATUSES, frozenset({"Scheduled", "Pre-Game"})
+            ACCEPTED_PREGAME_STATUSES, frozenset({"Scheduled", "Pre-Game", "Warmup"})
         )
 
         wrong_date = SCHEDULE_COMPLETE.read_text().replace("2026-07-21", "2026-07-22")
         with self.assertRaises(ValueError):
             parse_live_schedule(wrong_date.encode(), requested_date="2026-07-21")
+
+    def test_offdate_result_free_postponed_row_is_retained_for_top3_exclusion(self):
+        games = parse_live_schedule(
+            _offdate_postponed_schedule(), requested_date="2026-09-22"
+        )
+
+        self.assertEqual(len(games), 1)
+        self.assertEqual(games[0]["official_date"], "2026-09-23")
+        self.assertEqual(games[0]["status"], "Postponed")
+        self.assertEqual(games[0]["game_pk"], 778100)
+
+    def test_offdate_played_or_result_bearing_row_is_rejected(self):
+        cases = (
+            ("Scheduled", False),
+            ("Final", True),
+            ("Postponed", True),
+        )
+        for status, include_result in cases:
+            with self.subTest(status=status, include_result=include_result):
+                payload = json.loads(
+                    _offdate_postponed_schedule(status=status)
+                )
+                game = payload["dates"][0]["games"][0]
+                if include_result:
+                    game["teams"]["away"].update(score=1, isWinner=True)
+                    game["teams"]["home"].update(score=0, isWinner=False)
+                with self.assertRaisesRegex(ValueError, "outside its query"):
+                    parse_live_schedule(
+                        json.dumps(payload).encode(),
+                        requested_date="2026-09-22",
+                    )
+
+    def test_offdate_postponed_observation_never_fetches_participants(self):
+        requested = live_schedule_url("2026-09-22", "2026-09-22")
+        requests = []
+
+        def fetcher(_source, url, *, max_bytes):
+            requests.append(url)
+            return _http(
+                url,
+                _offdate_postponed_schedule(),
+                started="2026-09-22T12:00:00Z",
+                completed="2026-09-22T12:00:01Z",
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            slate = observe_live_slate(
+                Path(temporary),
+                "2026-09-22",
+                fetcher=fetcher,
+                observation_id_factory=lambda: "offdate-postponed-observation",
+                durable_clock=lambda: datetime(
+                    2026, 9, 22, 12, 0, 2, tzinfo=timezone.utc
+                ),
+            )
+
+        self.assertEqual([game["game_pk"] for game in slate.games], [778100])
+        self.assertEqual(slate.games[0]["official_date"], "2026-09-23")
+        self.assertEqual(slate.games[0]["status"], "Postponed")
+        self.assertEqual(slate.participants, {})
+        self.assertEqual(requests, [requested])
+
+    def test_live_schedule_market_bridge_omits_offdate_and_keeps_ontarget_rows(self):
+        target_date = "2026-09-22"
+        payload = json.loads(_offdate_postponed_schedule())
+        offdate_game = payload["dates"][0]["games"][0]
+        ondate_game = json.loads(json.dumps(offdate_game))
+        ondate_game.update(
+            gamePk=778101,
+            officialDate=target_date,
+            gameDate="2026-09-22T23:10:00Z",
+        )
+        ondate_game["status"] = {"detailedState": "Scheduled"}
+        payload["dates"][0]["games"].append(ondate_game)
+        raw = json.dumps(payload).encode()
+        request = live_schedule_url(target_date, target_date)
+        observation_id = "offdate-market-bridge"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = live_sources.normalize_live_root_path(Path(temporary))
+            persisted = live_sources._persist_observation(
+                root,
+                raw_source="mlb_live_schedule",
+                source="stats_api",
+                binding_role="LIVE_SCHEDULE",
+                game_pks=(),
+                observation_id=observation_id,
+                query={
+                    "observation_id": observation_id,
+                    "target_date": target_date,
+                    "url": request,
+                },
+                http=_http(
+                    request,
+                    raw,
+                    started="2026-09-22T12:00:00Z",
+                    completed="2026-09-22T12:00:01Z",
+                ),
+                durable_clock=lambda: datetime(
+                    2026, 9, 22, 12, 0, 2, tzinfo=timezone.utc
+                ),
+            )
+
+            loaded = load_live_schedule_observation(
+                root, Path(persisted.source_binding.receipt_relative)
+            )
+
+        self.assertEqual(
+            [game["game_pk"] for game in loaded.games], [778101]
+        )
+
+    def test_warmup_is_admitted_only_with_a_strictly_prestart_schedule_and_participant_receipt(self):
+        schedule = _posted_lineup_pregame_schedule(status="Warmup")
+        boxscore = BOX_COMPLETE.read_bytes()
+        start = datetime(2025, 5, 1, 16, 35, tzinfo=timezone.utc)
+
+        def fetcher(_source, url, *, max_bytes):
+            return _http(
+                url,
+                boxscore if "/boxscore" in url else schedule,
+                started="2025-05-01T16:33:00Z",
+                completed="2025-05-01T16:33:01Z",
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            slate = observe_live_slate(
+                Path(temporary),
+                "2025-05-01",
+                fetcher=fetcher,
+                observation_id_factory=iter(("warmup-schedule", "warmup-box")).__next__,
+                durable_clock=_clock(start.replace(minute=34, second=59), start.replace(minute=34, second=59)),
+            )
+            self.assertIn(778100, slate.participants)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            slate = observe_live_slate(
+                Path(temporary),
+                "2025-05-01",
+                fetcher=fetcher,
+                observation_id_factory=lambda: "warmup-equal-schedule",
+                durable_clock=lambda: start,
+            )
+            self.assertEqual(
+                slate.initial_exclusion_reasons,
+                {778100: ("OBSERVATION_AT_OR_AFTER_START",)},
+            )
+            self.assertNotIn(778100, slate.participants)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            slate = observe_live_slate(
+                Path(temporary),
+                "2025-05-01",
+                fetcher=fetcher,
+                observation_id_factory=iter(
+                    ("warmup-before-schedule", "warmup-after-box")
+                ).__next__,
+                durable_clock=_clock(
+                    start.replace(minute=34, second=59), start.replace(second=1)
+                ),
+            )
+            self.assertEqual(
+                slate.initial_exclusion_reasons,
+                {778100: ("OBSERVATION_AT_OR_AFTER_START",)},
+            )
+            self.assertNotIn(778100, slate.participants)
+
+    def test_non_pregame_statuses_do_not_trigger_participant_capture(self):
+        for status in ("In Progress", "Final"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
+                schedule = _posted_lineup_pregame_schedule(status=status)
+                requests = []
+
+                def fetcher(_source, url, *, max_bytes):
+                    requests.append(url)
+                    return _http(
+                        url,
+                        schedule,
+                        started="2025-05-01T12:00:00Z",
+                        completed="2025-05-01T12:00:01Z",
+                    )
+
+                slate = observe_live_slate(
+                    Path(temporary),
+                    "2025-05-01",
+                    fetcher=fetcher,
+                    observation_id_factory=lambda: f"status-{status.replace(' ', '-')}",
+                    durable_clock=lambda: datetime(
+                        2025, 5, 1, 12, 0, 2, tzinfo=timezone.utc
+                    ),
+                )
+                self.assertEqual(len(requests), 1)
+                self.assertNotIn("/boxscore", requests[0])
+                self.assertNotIn(778100, slate.participants)
+
+    def test_final_warmup_before_start_returns_final_observation(self):
+        schedule = _posted_lineup_pregame_schedule(status="Warmup")
+        saved = parse_live_schedule(schedule, requested_date="2025-05-01")[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            result = observe_final_game_schedule(
+                Path(temporary),
+                "2025-05-01",
+                saved,
+                fetcher=lambda _source, url, *, max_bytes: _http(
+                    url,
+                    schedule,
+                    started="2025-05-01T16:34:00Z",
+                    completed="2025-05-01T16:34:01Z",
+                ),
+                observation_id_factory=lambda: "final-warmup-before",
+                durable_clock=lambda: datetime(
+                    2025, 5, 1, 16, 34, 59, tzinfo=timezone.utc
+                ),
+            )
+        self.assertIsInstance(result, FinalGameObservation)
+        self.assertEqual(result.projected_game["status"], "Warmup")
+
+    def test_final_warmup_at_or_after_start_is_an_observation_not_pregame_disposition(self):
+        schedule = _posted_lineup_pregame_schedule(status="Warmup")
+        saved = parse_live_schedule(schedule, requested_date="2025-05-01")[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            result = observe_final_game_schedule(
+                Path(temporary),
+                "2025-05-01",
+                saved,
+                fetcher=lambda _source, url, *, max_bytes: _http(
+                    url,
+                    schedule,
+                    started="2025-05-01T16:34:00Z",
+                    completed="2025-05-01T16:34:01Z",
+                ),
+                observation_id_factory=lambda: "final-warmup-at-start",
+                durable_clock=lambda: datetime(
+                    2025, 5, 1, 16, 35, tzinfo=timezone.utc
+                ),
+            )
+        self.assertIsInstance(result, FinalGameScheduleDisposition)
+        self.assertEqual(result.reason_codes, ("OBSERVATION_NOT_PREGAME",))
 
     def test_live_schedule_url_requests_only_probables_and_venue_hydration(self):
         url = live_schedule_url("2026-07-21", "2026-07-21")
@@ -591,6 +924,54 @@ class LiveSourceTests(unittest.TestCase):
         )
         self.assertFalse(conflict.complete)
         self.assertIn("STARTER_CONFLICT", conflict.reason_codes)
+
+    def test_missing_pitcher_list_is_missing_evidence_not_starter_conflict(self):
+        game = parse_live_schedule(
+            SCHEDULE_COMPLETE.read_bytes(), requested_date="2026-07-21"
+        )[0]
+        participants = parse_pregame_boxscore(
+            BOX_EMPTY_PITCHERS.read_bytes(), game_pk=777001
+        )
+
+        observed = compare_probable_pitchers(game, participants)
+
+        self.assertFalse(observed.complete)
+        self.assertIn("MISSING_AWAY_PITCHER_LIST", observed.reason_codes)
+        self.assertIn("MISSING_HOME_PITCHER_LIST", observed.reason_codes)
+        self.assertNotIn("STARTER_CONFLICT", observed.reason_codes)
+
+    def test_missing_schedule_probable_is_retained_without_consistency(self):
+        game = parse_live_schedule(
+            SCHEDULE_COMPLETE.read_bytes(), requested_date="2026-07-21"
+        )[0]
+        participants = parse_pregame_boxscore(BOX_COMPLETE.read_bytes(), game_pk=777001)
+        participants = compare_probable_pitchers(game, participants)
+
+        observed = compare_probable_pitchers(
+            {**game, "away_probable_pitcher_id": None}, participants
+        )
+
+        self.assertFalse(observed.complete)
+        self.assertIn("MISSING_SCHEDULE_PROBABLE", observed.reason_codes)
+        self.assertNotIn("PROBABLE_CONSISTENT", observed.reason_codes)
+
+    def test_missing_one_side_and_known_opposite_mismatch_retain_both_reasons(self):
+        game = parse_live_schedule(
+            SCHEDULE_COMPLETE.read_bytes(), requested_date="2026-07-21"
+        )[0]
+        boxscore = json.loads(BOX_COMPLETE.read_bytes())
+        boxscore["teams"]["away"]["pitchers"] = []
+        participants = parse_pregame_boxscore(
+            json.dumps(boxscore).encode(), game_pk=777001
+        )
+
+        observed = compare_probable_pitchers(
+            {**game, "home_probable_pitcher_id": 999}, participants
+        )
+
+        self.assertFalse(observed.complete)
+        self.assertIn("MISSING_AWAY_PITCHER_LIST", observed.reason_codes)
+        self.assertIn("STARTER_CONFLICT", observed.reason_codes)
 
     def test_live_slate_writes_append_only_raw_manifests_receipts_and_bindings(self):
         schedule = SCHEDULE_COMPLETE.read_bytes()
@@ -1859,7 +2240,7 @@ class LiveSourceTests(unittest.TestCase):
                     backup.rename(seal)
             self.assertEqual(_fd_count(), before)
 
-    def test_poststart_durable_boundary_fails_before_boxscore_fetch(self):
+    def test_poststart_durable_boundary_excludes_before_boxscore_fetch(self):
         fetch_count = 0
 
         def fetcher(_source, url, *, max_bytes):
@@ -1870,17 +2251,21 @@ class LiveSourceTests(unittest.TestCase):
             return _http(url, SCHEDULE_COMPLETE.read_bytes())
 
         with tempfile.TemporaryDirectory() as temporary:
-            with self.assertRaisesRegex(ValueError, "scheduled start"):
-                observe_live_slate(
-                    Path(temporary),
-                    "2026-07-21",
-                    fetcher=fetcher,
-                    observation_id_factory=lambda: "poststart-boundary",
-                    durable_clock=lambda: datetime(
-                        2026, 7, 21, 23, 5, tzinfo=timezone.utc
-                    ),
-                )
+            slate = observe_live_slate(
+                Path(temporary),
+                "2026-07-21",
+                fetcher=fetcher,
+                observation_id_factory=lambda: "poststart-boundary",
+                durable_clock=lambda: datetime(
+                    2026, 7, 21, 23, 5, tzinfo=timezone.utc
+                ),
+            )
             self.assertEqual(fetch_count, 1)
+            self.assertEqual(
+                slate.initial_exclusion_reasons,
+                {777001: ("OBSERVATION_AT_OR_AFTER_START",)},
+            )
+            self.assertNotIn(777001, slate.participants)
             self.assertTrue(
                 (
                     Path(temporary)

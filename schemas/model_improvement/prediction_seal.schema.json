@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "ledger_id", "fold_id", "model_id", "candidate_id", "run_spec_sha256", "source_gate_sha256", "feature_seal_sha256", "prediction_contract_sha256", "scoring_model_card_sha256", "population_sha256", "frozen_model_card_sha256", "rows_sha256"],
+  "properties": {
+    "schema": {"const": "MODEL_IMPROVEMENT_PREDICTION_SEAL_V1"},
+    "ledger_id": {"type": "string", "pattern": "^baseline/v5\\.1/(O19|O20|O21|O22|O23|H22|H23)$"},
+    "fold_id": {"enum": ["O19", "O20", "O21", "O22", "O23", "H22", "H23"]},
+    "model_id": {"const": "v5.1"},
+    "candidate_id": {"type": "null"},
+    "run_spec_sha256": {"$ref": "#/$defs/sha256"},
+    "source_gate_sha256": {"$ref": "#/$defs/sha256"},
+    "feature_seal_sha256": {"$ref": "#/$defs/sha256"},
+    "prediction_contract_sha256": {"$ref": "#/$defs/sha256"},
+    "scoring_model_card_sha256": {"$ref": "#/$defs/sha256"},
+    "population_sha256": {"$ref": "#/$defs/sha256"},
+    "frozen_model_card_sha256": {"type": "null"},
+    "rows_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "prediction_row": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model_id", "game_pk", "official_date", "target_year", "p_home", "picked_side", "pick_probability", "confidence", "starter_edge_abs", "scheduled_start_utc", "rank", "feature_row_sha256", "prediction_contract_sha256", "scoring_model_card_sha256"],
+      "properties": {
+        "model_id": {"const": "v5.1"}, "game_pk": {"type": "integer", "minimum": 1},
+        "official_date": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+        "target_year": {"type": "integer", "minimum": 1876},
+        "p_home": {"type": "number", "minimum": 0, "maximum": 1},
+        "picked_side": {"enum": ["away", "home", "none"]},
+        "pick_probability": {"type": "number", "minimum": 0, "maximum": 1},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 10},
+        "starter_edge_abs": {"type": "number", "minimum": 0},
+        "scheduled_start_utc": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T"},
+        "rank": {"type": "integer", "minimum": 0},
+        "feature_row_sha256": {"$ref": "#/$defs/sha256"},
+        "prediction_contract_sha256": {"$ref": "#/$defs/sha256"},
+        "scoring_model_card_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "prediction_seal": {"$ref": "#"}
+  }
+}

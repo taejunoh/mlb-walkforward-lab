@@ -1,0 +1,12 @@
+{
+  "query": {
+    "as_of_date": "2026-09-14",
+    "pitcher_id": 680755,
+    "url": "https://statsapi.mlb.com/api/v1/people/680755/stats?stats=byDateRange&group=pitching&gameType=R&sportIds=1&startDate=1876-01-01&endDate=2026-09-14"
+  },
+  "retrieved_at_utc": "2026-09-15T22:00:25.959797+00:00",
+  "row_count": 1,
+  "schema_version": 1,
+  "sha256": "1e85ce7ff1cc6e964efb53d0603561c90015b0f55e34314f53e97c390cc05ab3",
+  "source": "mlb_live_career_bf"
+}

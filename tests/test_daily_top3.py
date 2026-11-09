@@ -32,6 +32,136 @@ def _rehash(payload):
 
 
 class DailyTop3Tests(unittest.TestCase):
+    def test_readiness_renderer_preserves_recorded_unranked_states_and_missing_rows(self):
+        from mlb_backtest import daily_top3
+        from tests.test_live_top3_service import (
+            _build,
+            _final_observer,
+            _game,
+            _participants,
+            _slate,
+        )
+
+        unscored = _game(1)
+        excluded = _game(2, status="Unknown")
+        no_row = _game(3)
+        unscored_participant = _participants(
+            1, complete=False, reasons=("MISSING_HOME_LINEUP",), home_lineup=()
+        )
+        payload_slate = _slate(
+            (unscored, excluded),
+            participants={
+                1: unscored_participant,
+                2: _participants(2),
+            },
+        )
+        payload = _build(payload_slate, _final_observer((unscored, excluded)))
+        readiness_slate = _slate(
+            (unscored, excluded, no_row),
+            participants={
+                1: unscored_participant,
+                2: _participants(2),
+                3: _participants(3),
+            },
+        )
+
+        rendered = daily_top3.render_live_pregame_readiness_markdown(
+            readiness_slate, payload
+        )
+
+        self.assertEqual(rendered.count("UNSCORED \\(not ranked\\)"), 3)
+        self.assertEqual(rendered.count("EXCLUDED \\(not ranked\\)"), 3)
+        self.assertIn("MISSING\\_HOME\\_LINEUP", rendered)
+        self.assertEqual(rendered.count("not listed in ranked output"), 3)
+
+    def test_readiness_renderer_binds_observations_without_inventing_values(self):
+        from mlb_backtest import daily_top3
+        from tests.test_live_top3_service import _build, _final_observer, _game, _participants, _slate
+
+        first = _game(1)
+        first["away_team"] = "Away | <Club>"
+        first["away_probable_pitcher_name"] = "Expected [Away]"
+        second = _game(2)
+        slate = _slate(
+            (first, second),
+            participants={2: _participants(2)},
+        )
+        payload = _build(slate, _final_observer((first, second)))
+
+        rendered = daily_top3.render_live_pregame_readiness_markdown(slate, payload)
+
+        self.assertIsInstance(rendered, str)
+        self.assertIn("RESEARCH ONLY", rendered)
+        self.assertIn("PARTICIPANT COMPLETENESS IS NOT SCORE READINESS", rendered)
+        self.assertIn("NOT A BETTING RECOMMENDATION", rendered)
+        self.assertIn("Away \\| &lt;Club&gt;", rendered)
+        self.assertIn("Expected \\[Away\\]", rendered)
+        self.assertIn("Expected away starter ID: `501`", rendered)
+        self.assertIn("Observed away pitcher-list ID: `unknown`", rendered)
+        self.assertIn("Validated away lineup count: `unknown`", rendered)
+        self.assertIn("Validated away lineup count: `9`", rendered)
+        self.assertIn("UNSCORED \\(not ranked\\)", rendered)
+        self.assertIn("Primary report content_sha256:", rendered)
+        self.assertIn("Model card SHA-256:", rendered)
+        participant_binding = next(
+            binding for binding in payload["source_bindings"]
+            if binding["binding_role"] == "LIVE_PARTICIPANTS" and binding["game_pks"] == [2]
+        )
+        for value in (
+            participant_binding["observation_id"],
+            participant_binding["durable_at_utc"],
+            participant_binding["binding_sha256"],
+            participant_binding["payload_sha256"],
+            participant_binding["receipt_sha256"],
+        ):
+            self.assertIn(value, rendered)
+
+    def test_readiness_persistence_is_exclusive_and_preserves_primary_report(self):
+        from mlb_backtest import daily_top3
+        from tests.test_live_top3_service import _build, _final_observer, _game, _slate
+
+        game = _game(1)
+        slate = _slate((game,))
+        payload = _build(slate, _final_observer((game,)))
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            json_path, markdown_path = daily_top3.persist_live_top3_report(root, payload)
+            original = {path: path.read_bytes() for path in (json_path, markdown_path)}
+            readiness = root / daily_top3._readiness_relative_path(payload)
+            with open_trusted_root(root) as trusted:
+                written = daily_top3._persist_bound_live_pregame_readiness_report(
+                    root, trusted, slate, payload
+                )
+            self.assertEqual(written, readiness)
+            original_readiness = readiness.read_bytes()
+            with self.assertRaises(FileExistsError):
+                with open_trusted_root(root) as trusted:
+                    daily_top3._persist_bound_live_pregame_readiness_report(
+                        root, trusted, slate, payload
+                    )
+            self.assertEqual(readiness.read_bytes(), original_readiness)
+            self.assertEqual({path: path.read_bytes() for path in original}, original)
+
+    def test_readiness_persistence_failure_leaves_primary_report_intact(self):
+        from mlb_backtest import daily_top3
+        from tests.test_live_top3_service import _build, _final_observer, _game, _slate
+
+        game = _game(1)
+        slate = _slate((game,))
+        payload = _build(slate, _final_observer((game,)))
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            json_path, markdown_path = daily_top3.persist_live_top3_report(root, payload)
+            original = {path: path.read_bytes() for path in (json_path, markdown_path)}
+            with mock.patch.object(daily_top3, "write_exclusive", side_effect=OSError("injected readiness failure")):
+                with self.assertRaises(OSError):
+                    with open_trusted_root(root) as trusted:
+                        daily_top3._persist_bound_live_pregame_readiness_report(
+                            root, trusted, slate, payload
+                        )
+            self.assertEqual({path: path.read_bytes() for path in original}, original)
+            self.assertFalse((root / daily_top3._readiness_relative_path(payload)).exists())
+
     def test_parse_args_defaults_date_in_eastern_time(self):
         from mlb_backtest import daily_top3
 
@@ -71,6 +201,27 @@ class DailyTop3Tests(unittest.TestCase):
         unscored = rendered.split("## Unscored games", 1)[1]
         self.assertNotIn("Probability", unscored)
         self.assertNotIn("Rank", unscored)
+
+    def test_renderer_distinguishes_legacy_missing_schedule_flags_from_empty_flags(self):
+        from mlb_backtest import daily_top3
+
+        legacy = _payload()
+        legacy["preliminary_top3"][0].pop("schedule_quality_flags")
+        _rehash(legacy)
+        rendered_legacy = daily_top3.render_live_top3_markdown(legacy).decode("utf-8")
+        current = _payload()
+        current["preliminary_top3"][0]["schedule_quality_flags"] = {
+            "away": [], "home": ["time_zones_neutral_missing_venue_coordinates"]
+        }
+        _rehash(current)
+        rendered_current = daily_top3.render_live_top3_markdown(current).decode("utf-8")
+
+        self.assertIn("Schedule quality flags", rendered_legacy)
+        self.assertIn("not recorded", rendered_legacy)
+        self.assertIn(
+            "away: none; home: time\\_zones\\_neutral\\_missing\\_venue\\_coordinates",
+            rendered_current,
+        )
 
     def test_persist_writes_validated_json_then_markdown_in_experimental_namespace(self):
         from mlb_backtest import daily_top3
@@ -223,6 +374,11 @@ class DailyTop3Tests(unittest.TestCase):
                     "_persist_bound_live_top3_report",
                     return_value=expected_paths,
                 ) as persist,
+                mock.patch.object(
+                    daily_top3,
+                    "_persist_bound_live_pregame_readiness_report",
+                    return_value=root / "readiness.md",
+                ) as persist_readiness,
             ):
                 result = daily_top3.run_daily_top3(
                     root,
@@ -241,6 +397,9 @@ class DailyTop3Tests(unittest.TestCase):
         self.assertIsNotNone(final.call_args.kwargs["expected_root_binding"])
         self.assertEqual(persist.call_args.args[0], root)
         self.assertEqual(persist.call_args.args[2], {"payload": "validated"})
+        self.assertEqual(persist_readiness.call_args.args[0], root)
+        self.assertEqual(persist_readiness.call_args.args[2], slate)
+        self.assertEqual(persist_readiness.call_args.args[3], {"payload": "validated"})
 
     def test_main_does_not_persist_when_integrity_validation_fails(self):
         from mlb_backtest import daily_top3
@@ -525,6 +684,90 @@ class DailyTop3Tests(unittest.TestCase):
                 with redirect_stdout(stdout), redirect_stderr(io.StringIO()):
                     self.assertEqual(daily_top3.main(["--json-only"]), 0)
                 self.assertEqual(json.loads(stdout.getvalue()), payload)
+
+
+class DecisionExplanationTests(unittest.TestCase):
+    @staticmethod
+    def _block(rendered: str, game_pk: int) -> str:
+        marker = f"### {game_pk} ·"
+        start = rendered.index(marker)
+        end = rendered.find("\n### ", start + len(marker))
+        return rendered[start:] if end == -1 else rendered[start:end]
+
+    def test_ranked_row_explains_evidence_and_risk(self):
+        from mlb_backtest import daily_top3
+        from tests.test_live_top3_service import _build, _final_observer, _game, _slate
+
+        game = _game(1)
+        slate = _slate((game,))
+        payload = _build(slate, _final_observer((game,)))
+
+        block = self._block(
+            daily_top3.render_live_pregame_readiness_markdown(slate, payload), 1
+        )
+
+        self.assertIn("판정: `PRELIMINARY \\(rank 1\\)`", block)
+        self.assertIn("근거: Home 승리 확률 54.1%", block)
+        self.assertIn("검증된 라인업 9명/9명", block)
+        self.assertIn("선발 예상 일치", block)
+        self.assertIn("리스크/보류 이유: 데이터 완전성 90.0%", block)
+        self.assertIn("내부 모델은 배당·O/U 입력을 지원하지 않으며", block)
+
+    def test_unscored_row_explains_missing_inputs_without_probability(self):
+        from dataclasses import replace
+
+        from mlb_backtest import daily_top3
+        from tests.test_live_top3_service import (
+            _build,
+            _final_observer,
+            _game,
+            _participants,
+            _slate,
+        )
+
+        game = _game(1)
+        participant = replace(
+            _participants(
+                1,
+                complete=False,
+                reasons=("MISSING_AWAY_LINEUP", "MISSING_AWAY_PITCHER_LIST"),
+            ),
+            away_pitcher_list_id=None,
+            away_lineup=(),
+        )
+        slate = _slate((game,), participants={1: participant})
+        payload = _build(slate, _final_observer((game,)))
+        block = self._block(
+            daily_top3.render_live_pregame_readiness_markdown(slate, payload), 1
+        )
+
+        self.assertIn("판정: `UNSCORED \\(not ranked\\)`", block)
+        self.assertIn("확률을 산출하지 않음", block)
+        self.assertIn("원정 라인업 누락", block)
+        self.assertIn("원정 선발 관측 누락", block)
+        self.assertNotIn("승리 확률", block)
+        self.assertNotIn("예상 승자", block)
+
+    def test_unknown_reason_and_flag_use_stable_fallback_and_render_is_deterministic(self):
+        from mlb_backtest import daily_top3
+        from tests.test_live_top3_service import _game
+
+        game = _game(1)
+        row = {
+            "state": "UNSCORED",
+            "reason_codes": ("UNKNOWN_REASON",),
+            "schedule_quality_flags": {
+                "away": ("UNKNOWN_FLAG",),
+                "home": (),
+            },
+        }
+
+        first = daily_top3._decision_explanation_lines(game, row, None)
+        second = daily_top3._decision_explanation_lines(game, row, None)
+        self.assertEqual(first, second)
+        rendered = "\n".join(first)
+        self.assertIn("원본 코드: UNKNOWN\\_REASON", rendered)
+        self.assertIn("원본 코드: UNKNOWN\\_FLAG", rendered)
 
 
 if __name__ == "__main__":

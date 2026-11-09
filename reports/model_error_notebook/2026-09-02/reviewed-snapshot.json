@@ -1,0 +1,221 @@
+{
+  "surface": "report",
+  "title": "9월 2일 오답노트 — 틀린 9경기를 다음 검증으로 연결하기",
+  "generatedAt": "2026-09-03T10:00:20.137138Z",
+  "status": "reviewed",
+  "filters": [],
+  "queries": {
+    "game_results": {
+      "rows": [
+        {
+          "gamePk": 824470,
+          "game": "San Diego Padres @ Cincinnati Reds",
+          "cohort": "기존 사전경기 기록",
+          "probability": 0.6127826336630863,
+          "favored": "San Diego Padres",
+          "score": "3–7",
+          "outcome": "LOSS",
+          "state": "PRELIMINARY",
+          "forecastAt": "2026-09-02T15:58:39.204827Z"
+        },
+        {
+          "gamePk": 822686,
+          "game": "Atlanta Braves @ Washington Nationals",
+          "cohort": "기존 사전경기 기록",
+          "probability": 0.5347373282817707,
+          "favored": "Washington Nationals",
+          "score": "9–0",
+          "outcome": "LOSS",
+          "state": "PRELIMINARY",
+          "forecastAt": "2026-09-02T15:58:39.204827Z"
+        },
+        {
+          "gamePk": 822851,
+          "game": "Athletics @ Texas Rangers",
+          "cohort": "기존 사전경기 기록",
+          "probability": 0.5729535190450439,
+          "favored": "Texas Rangers",
+          "score": "9–2",
+          "outcome": "LOSS",
+          "state": "PRELIMINARY",
+          "forecastAt": "2026-09-02T18:07:35.55496Z"
+        },
+        {
+          "gamePk": 824312,
+          "game": "Baltimore Orioles @ Colorado Rockies",
+          "cohort": "기존 사전경기 기록",
+          "probability": 0.689322310398387,
+          "favored": "Baltimore Orioles",
+          "score": "5–6",
+          "outcome": "LOSS",
+          "state": "PRELIMINARY",
+          "forecastAt": "2026-09-02T18:07:35.55496Z"
+        },
+        {
+          "gamePk": 825037,
+          "game": "Philadelphia Phillies @ Arizona Diamondbacks",
+          "cohort": "기존 사전경기 기록",
+          "probability": 0.5059384056602717,
+          "favored": "Philadelphia Phillies",
+          "score": "0–1",
+          "outcome": "LOSS",
+          "state": "SCORED_NOT_TOP3",
+          "forecastAt": "2026-09-02T18:07:35.55496Z"
+        },
+        {
+          "gamePk": 824717,
+          "game": "Seattle Mariners @ Boston Red Sox",
+          "cohort": "기존 사전경기 기록",
+          "probability": 0.5255246654135401,
+          "favored": "Seattle Mariners",
+          "score": "8–3",
+          "outcome": "WIN",
+          "state": "PRELIMINARY",
+          "forecastAt": "2026-09-02T18:07:35.55496Z"
+        },
+        {
+          "gamePk": 822931,
+          "game": "New York Mets @ Tampa Bay Rays",
+          "cohort": "사전 등록",
+          "probability": 0.5230675351505469,
+          "favored": "Tampa Bay Rays",
+          "score": "10–4",
+          "outcome": "LOSS",
+          "state": "PRIMARY",
+          "forecastAt": null
+        },
+        {
+          "gamePk": 823339,
+          "game": "San Francisco Giants @ Pittsburgh Pirates",
+          "cohort": "사전 등록",
+          "probability": 0.5514672978926715,
+          "favored": "Pittsburgh Pirates",
+          "score": "5–4",
+          "outcome": "LOSS",
+          "state": "PRIMARY",
+          "forecastAt": null
+        },
+        {
+          "gamePk": 824390,
+          "game": "Toronto Blue Jays @ Cleveland Guardians",
+          "cohort": "사전 등록",
+          "probability": 0.5394328531733499,
+          "favored": "Toronto Blue Jays",
+          "score": "11–0",
+          "outcome": "WIN",
+          "state": "PRIMARY",
+          "forecastAt": null
+        },
+        {
+          "gamePk": 823660,
+          "game": "Detroit Tigers @ Minnesota Twins",
+          "cohort": "사전 등록",
+          "probability": 0.5106550577647386,
+          "favored": "Minnesota Twins",
+          "score": "11–6",
+          "outcome": "LOSS",
+          "state": "PRIMARY",
+          "forecastAt": null
+        },
+        {
+          "gamePk": 824068,
+          "game": "Miami Marlins @ Kansas City Royals",
+          "cohort": "사전 등록",
+          "probability": 0.504452257860316,
+          "favored": "Kansas City Royals",
+          "score": "9–6",
+          "outcome": "LOSS",
+          "state": "PRIMARY",
+          "forecastAt": null
+        },
+        {
+          "gamePk": 824634,
+          "game": "Milwaukee Brewers @ Chicago Cubs",
+          "cohort": "사전 등록",
+          "probability": 0.6793841102668805,
+          "favored": "Milwaukee Brewers",
+          "score": "9–5",
+          "outcome": "WIN",
+          "state": "PRIMARY",
+          "forecastAt": null
+        },
+        {
+          "gamePk": 824147,
+          "game": "Chicago White Sox @ Houston Astros",
+          "cohort": "사전 등록",
+          "probability": 0.5835602363591988,
+          "favored": "Houston Astros",
+          "score": "0–2",
+          "outcome": "WIN",
+          "state": "PRIMARY",
+          "forecastAt": null
+        },
+        {
+          "gamePk": 823983,
+          "game": "New York Yankees @ Los Angeles Angels",
+          "cohort": "미산출",
+          "probability": null,
+          "favored": null,
+          "score": "6–3",
+          "outcome": null,
+          "state": null,
+          "forecastAt": null
+        },
+        {
+          "gamePk": 823906,
+          "game": "St. Louis Cardinals @ Los Angeles Dodgers",
+          "cohort": "미산출",
+          "probability": null,
+          "favored": null,
+          "score": "8–6",
+          "outcome": null,
+          "state": null,
+          "forecastAt": null
+        }
+      ],
+      "source": {
+        "label": "9월 2일 고정 예측 및 MLB 공식 최종 결과",
+        "files": [
+          "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix/reports/experimental_all_day_ml_ledger/2026-09-02/11869f74a98db326afa5d653f71c40b66f78bfb0341cdfbde75f6da336d5be2d.json"
+        ],
+        "freshness": "마지막 결과 확인 2026-09-03 06:00 ET. 이미 Final인 6경기는 전날 확인한 증적 재사용.",
+        "filters": [
+          "2026-09-02 전 경기 15개; 예측 있는 13개만 성능 평가"
+        ],
+        "metricDefinitions": [
+          {
+            "label": "모델 우세팀",
+            "definition": "저장된 selected forecast의 우세 방향. 베팅 추천이나 실제 베팅 기록이 아니다.",
+            "componentIds": [
+              "results",
+              "mistakes",
+              "summary"
+            ]
+          },
+          {
+            "label": "추정 승률",
+            "definition": "경기 전에 고정된 모델 출력. 실측 보정 승률로 해석하지 않는다.",
+            "componentIds": [
+              "results",
+              "mistakes",
+              "summary"
+            ]
+          },
+          {
+            "label": "적중/실패",
+            "definition": "우세팀과 공식 Final 승자가 같으면 WIN, 다르면 LOSS. 미산출 2경기 제외.",
+            "componentIds": [
+              "results",
+              "mistakes",
+              "summary"
+            ]
+          }
+        ],
+        "notes": [
+          "예측/배당 원본 변경 없음.",
+          "회고에서 복원한 사전경기 기록 6개와 기존 사전 등록 7개를 분리."
+        ]
+      }
+    }
+  }
+}

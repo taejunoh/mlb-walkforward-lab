@@ -1,0 +1,12 @@
+{
+  "query": {
+    "as_of_date": "2026-08-31",
+    "url": "https://statsapi.mlb.com/api/v1/venues/4169?hydrate=location%2Ctimezone",
+    "venue_id": 4169
+  },
+  "retrieved_at_utc": "2026-09-01T13:38:51.106054+00:00",
+  "row_count": 1,
+  "schema_version": 1,
+  "sha256": "7deb4dc6d3e8fcc2fe06afbf231cf03bfbee962ed4d081da7c696e2d5ef5aeb4",
+  "source": "mlb_live_history_venue"
+}

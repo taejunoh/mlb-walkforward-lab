@@ -26,7 +26,7 @@ from mlb_backtest.live_sources import normalize_live_root_path
 from mlb_backtest.live_top3_contracts import LiveHttpObservation
 from mlb_backtest.manifest import RawStore
 from mlb_backtest.secure_fs import open_trusted_root
-from mlb_backtest.statcast import STATCAST_ROW_CAP, statcast_url
+from mlb_backtest.statcast import STATCAST_ROW_CAP, StatcastData, statcast_url
 
 
 def _career_payload() -> bytes:
@@ -202,8 +202,7 @@ def _statcast_with_unique_game_rows(game_day: str, row_count: int) -> bytes:
 def _venue() -> bytes:
     return json.dumps({"venues": [{"id": 1, "name": "Fixture Park", "location": {
         "city": "Fixture City", "defaultCoordinates": {"latitude": 40.0, "longitude": -74.0},
-        "timeZone": {"id": "America/New_York"},
-    }}]}).encode()
+    }, "timeZone": {"id": "America/New_York"}}]}).encode()
 
 
 def _history_fetcher(*, poison_target_day=False):
@@ -1630,6 +1629,59 @@ class LiveHistoryTests(unittest.TestCase):
         self.assertEqual(len(result.rows), 15)
         self.assertEqual(counting.iterations, 1)
 
+    def test_schedule_history_builder_keeps_row_and_verification_id_orders_distinct(self):
+        schedule = [
+            {
+                "game_pk": 823081,
+                "official_date": "2026-03-26",
+                "away_team": "Away 2",
+                "home_team": "Home 2",
+                "venue_id": 1,
+                "venue_name": "Fixture Park",
+                "doubleheader_marker": "N",
+            },
+            {
+                "game_pk": 823244,
+                "official_date": "2026-03-25",
+                "away_team": "Away 1",
+                "home_team": "Home 1",
+                "venue_id": 1,
+                "venue_name": "Fixture Park",
+                "doubleheader_marker": "N",
+            },
+        ]
+        statcast = StatcastData(
+            (
+                {"game_pk": 823081, "game_date": "2026-03-26", "inning": 1},
+                {"game_pk": 823244, "game_date": "2026-03-25", "inning": 1},
+            ),
+            (),
+        )
+        result = live_history._build_result_free_live_schedule_history(
+            schedule,
+            statcast,
+            {
+                "Away 1": "A1",
+                "Home 1": "H1",
+                "Away 2": "A2",
+                "Home 2": "H2",
+            },
+            {
+                1: {
+                    "venue_name": "Fixture Park",
+                    "venue_city": "City",
+                    "venue_latitude": 40.0,
+                    "venue_longitude": -74.0,
+                    "time_zone": "America/New_York",
+                }
+            },
+            date.fromisoformat("2026-03-25"),
+            date.fromisoformat("2026-03-26"),
+            "a" * 64,
+        )
+        self.assertEqual(tuple(row["game_pk"] for row in result.rows), (823244, 823081))
+        self.assertEqual(result.expected_game_pks, (823081, 823244))
+
     def test_completion_timestamp_tampering_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2004,9 +2056,46 @@ class LiveHistoryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "coordinates"):
             live_history._parse_venue(json.dumps(invalid).encode(), 1)
         invalid = json.loads(_venue())
-        invalid["venues"][0]["location"]["timeZone"]["id"] = "Mars/Olympus"
+        invalid["venues"][0]["timeZone"]["id"] = "Mars/Olympus"
         with self.assertRaisesRegex(ValueError, "IANA"):
             live_history._parse_venue(json.dumps(invalid).encode(), 1)
+        invalid = json.loads(_venue())
+        invalid["venues"][0].pop("timeZone")
+        with self.assertRaisesRegex(ValueError, "malformed"):
+            live_history._parse_venue(json.dumps(invalid).encode(), 1)
+
+    def test_venue_reference_reads_timezone_from_actual_mlb_response(self):
+        payload = (Path(__file__).parent / "fixtures" / "venue_1_location_timezone.json").read_bytes()
+        parsed = live_history._parse_venue(payload, 1)
+        self.assertEqual(parsed["time_zone"], "America/Los_Angeles")
+
+    def test_venue_reference_preserves_paired_missing_coordinates_from_mlb_response(self):
+        payload = (Path(__file__).parent / "fixtures" / "venue_5340_missing_coordinates.json").read_bytes()
+
+        parsed = live_history._parse_venue(payload, 5340)
+
+        self.assertIsNone(parsed["venue_latitude"])
+        self.assertIsNone(parsed["venue_longitude"])
+        self.assertEqual(parsed["time_zone"], "America/Mexico_City")
+
+    def test_venue_request_uses_location_and_timezone_hydration(self):
+        calls = []
+        delegate = _history_fetcher()
+
+        def recording_fetcher(source, url, *, max_bytes):
+            if "/venues/" in url:
+                calls.append(url)
+            return delegate(source, url, max_bytes=max_bytes)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            build_live_history(
+                Path(temporary), "2026-07-21", _card(),
+                fetcher=recording_fetcher, sleeper=lambda _delay: None,
+            )
+        self.assertEqual(
+            calls,
+            ["https://statsapi.mlb.com/api/v1/venues/1?hydrate=location%2Ctimezone"],
+        )
 
     def test_target_day_statcast_poison_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:

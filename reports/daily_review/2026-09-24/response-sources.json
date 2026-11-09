@@ -1,0 +1,210 @@
+{
+  "schemaVersion": 1,
+  "items": [
+    {
+      "id": "sep23-results",
+      "title": "9월 23일 사전 예측과 공식 결과",
+      "queries": [
+        {
+          "id": "sep23-primary-results",
+          "source": {
+            "label": "MLB 공식 결과와 최초 사전 예측",
+            "files": [{"label": "prospective_ml_settlement.json"}],
+            "links": [{"label": "MLB 9월 23일 결과", "href": "https://www.mlb.com/scores/2026-09-23"}],
+            "metricDefinitions": [
+              {"label": "승패 적중률", "definition": "승패 적중률은 경기 시작 전에 저장한 최초 모델 예측 팀과 공식 승리 팀이 일치한 경기의 비율입니다."},
+              {"label": "Brier 점수", "definition": "Brier 점수는 홈팀 예측 승률과 실제 홈팀 승리 여부의 제곱 오차 평균이며 낮을수록 좋습니다."}
+            ],
+            "filters": ["뉴욕 경기일: 2026-09-23", "모델별 최초 사전 예측만 사용", "공식 Final 결과만 비교"],
+            "caveats": ["전체 16경기 진단 비교와 정식 정산 15경기는 다른 표본입니다.", "TOR–BAL 1차전은 공식 응답에 연기일과 종료일이 함께 있어 기존 수집기가 거부했습니다. 이 경기는 정식 정산에 포함되지 않았습니다.", "실제 베팅 추천은 0건이므로 승패 적중률은 베팅 수익률이 아닙니다.", "하루 16경기만으로 모델 확률의 장기 신뢰도를 판단할 수 없습니다."]
+          },
+          "reportingPeriod": "2026-09-23, America/New_York; 결과 수집 2026-09-24 20:15:59–20:16:30 UTC",
+          "columns": ["표본", "경기", "적중", "적중률", "Brier", "Log loss"],
+          "rows": [
+            {"표본": "전체 진단 비교", "경기": 16, "적중": 9, "적중률": 0.5625, "Brier": 0.25975311712660937, "Log loss": 0.7129493469685457},
+            {"표본": "정식 정산", "경기": 15, "적중": 8, "적중률": 0.5333333333333333, "Brier": 0.2644727375996795, "Log loss": 0.7224534386261054}
+          ],
+          "methods": [{"language": "calculation", "code": "accuracy = correct / n\nBrier = mean((p_home - home_win)^2)\nLog loss = mean(-log(p_home) if home_win else -log(1-p_home))\nConstant 50% Brier baseline = 0.25"}]
+        }
+      ]
+    },
+    {
+      "id": "sep23-totals",
+      "title": "9월 23일 총점 예측 오차",
+      "queries": [{
+        "id": "sep23-total-errors",
+        "source": {
+          "label": "최초 유효 사전 총점 보고서와 공식 최종 점수",
+          "files": [{"label":"prospective_ml_settlement.json"},{"label":"20260923T091445528603Z-db519940b966ed12.json"}],
+          "metricDefinitions": [{"label":"총점 평균 절대오차","definition":"총점 평균 절대오차는 각 경기의 예상 합계 득점과 실제 합계 득점 차이의 절댓값을 평균한 값입니다."}],
+          "filters": ["뉴욕 경기일: 2026-09-23", "과거 데이터 마감: 2026-09-22", "경기별 최초 유효 사전 PROJECTED 총점만 비교"],
+          "caveats": ["경기 전 저장된 별도 daily_totals 보고서의 진단 비교입니다. 정식 O/U 베팅 정산은 아닙니다.","ML 관측 원장에 totals_status NOT_EVALUATED가 있어도 별도 총점 예측이 없다는 의미는 아닙니다.","후속 8개 보고서로 성능이 더 좋은 예측을 선택하지 않았습니다."]
+        },
+        "reportingPeriod":"2026-09-23; 최초 총점 보고서 09:14:45 UTC, 모든 경기 시작 전",
+        "columns":["표본 수","MAE 점","RMSE 점","최대 오차 경기","그 경기 예상","그 경기 실제"],
+        "rows":[{"표본 수":16,"MAE 점":2.8854757775266338,"RMSE 점":3.4295772676959206,"최대 오차 경기":"CLE@BOS","그 경기 예상":8.760722067163627,"그 경기 실제":1}],
+        "methods":[{"language":"calculation","code":"error = expected_total_runs - actual_total_runs\nMAE = mean(abs(error))\nRMSE = sqrt(mean(error^2))"}]
+      }]
+    },
+    {
+      "id": "sep24-model",
+      "title": "9월 24일 내부 모델 평가와 판정",
+      "queries": [
+        {
+          "id": "sep24-all-remaining",
+          "source": {
+            "label": "내부 ML 및 TEAM_VENUE_30 보고서",
+            "files": [
+              {
+                "label": "20260924T203303766913Z-095c7301fcd8a3f4.trace.json"
+              },
+              {
+                "label": "20260924T203851237694Z-646bc8c67da1a99c.json"
+              },
+              {
+                "label": "model-market-review.json"
+              }
+            ],
+            "metricDefinitions": [
+              {
+                "label": "모델 승률",
+                "definition": "모델 승률은 선발·타선·불펜 등 입력으로 산출한 연구용 수치이며 실제 적중 빈도로 독립 검증된 확률은 아닙니다."
+              },
+              {
+                "label": "입력 완전성",
+                "definition": "입력 완전성은 모델이 산출한 데이터 충족 점수이며 승률이나 라인업 발표 비율과 다릅니다."
+              },
+              {
+                "label": "명목 배당 차이",
+                "definition": "명목 배당 차이는 해당 팀의 모델 승률에서 공개 가격의 손익분기 승률을 뺀 값이며 검증된 베팅 우위가 아닙니다."
+              }
+            ],
+            "filters": [
+              "뉴욕 경기일: 2026-09-24",
+              "과거 기록 마감: 2026-09-23",
+              "시작 전 남은 7경기 전체 평가",
+              "SCORED_NOT_TOP3 경기도 포함"
+            ],
+            "caveats": [
+              "승패 확률은 라인업이 갖춰진 4경기에서만 산출했고 서부 3경기는 미산출입니다.",
+              "수비·환경 입력이 없으며 산출된 4경기의 입력 완전성은 44.0–61.3%입니다.",
+              "총점 모델은 라인업·선발·날씨를 반영하지 않습니다. 총점과 시장 기준의 차이만으로 O/U 확률을 계산하지 않았습니다.",
+              "공개 가격의 계정 실행 가능 여부와 북 갱신 시각이 미확인입니다.",
+              "이미 시작한 5경기는 새 경기 전 예측에서 제외했습니다."
+            ]
+          },
+          "reportingPeriod": "2026-09-24 EDT; TB 라인업 갱신 후 모델 재계산, 총점 보고서 20:38 UTC",
+          "columns": [
+            "경기",
+            "홈팀 모델 승률",
+            "입력 완전성",
+            "예상 총점",
+            "시장 총점",
+            "판정"
+          ],
+          "rows": [
+            {
+              "경기": "MIL@PHI",
+              "홈팀 모델 승률": 0.5164834520036866,
+              "입력 완전성": 0.600709477602531,
+              "예상 총점": 9.095938203915246,
+              "시장 총점": 7.5,
+              "판정": "PASS_RESEARCH_ONLY"
+            },
+            {
+              "경기": "CLE@BOS",
+              "홈팀 모델 승률": 0.5433968363134901,
+              "입력 완전성": 0.43997567383588726,
+              "예상 총점": 8.54357649425377,
+              "시장 총점": 6.5,
+              "판정": "PASS_RESEARCH_ONLY"
+            },
+            {
+              "경기": "TB@NYY",
+              "홈팀 모델 승률": 0.5780441566546113,
+              "입력 완전성": 0.5907565272756166,
+              "예상 총점": 8.372912511792821,
+              "시장 총점": 6.5,
+              "판정": "PASS_RESEARCH_ONLY"
+            },
+            {
+              "경기": "CIN@ATL",
+              "홈팀 모델 승률": 0.7154588932282524,
+              "입력 완전성": 0.6125592899375513,
+              "예상 총점": 8.962957726100672,
+              "시장 총점": 7.5,
+              "판정": "PASS_RESEARCH_ONLY"
+            },
+            {
+              "경기": "HOU@ATH",
+              "홈팀 모델 승률": null,
+              "입력 완전성": null,
+              "예상 총점": 9.359227808077602,
+              "시장 총점": 10.5,
+              "판정": "WAIT_LINEUPS_NO_BET"
+            },
+            {
+              "경기": "LAA@SEA",
+              "홈팀 모델 승률": null,
+              "입력 완전성": null,
+              "예상 총점": 8.783787462041676,
+              "시장 총점": 6.5,
+              "판정": "WAIT_LINEUPS_NO_BET"
+            },
+            {
+              "경기": "SD@LAD",
+              "홈팀 모델 승률": null,
+              "입력 완전성": null,
+              "예상 총점": 8.76963982427696,
+              "시장 총점": 7.5,
+              "판정": "WAIT_LINEUPS_NO_BET"
+            }
+          ],
+          "methods": [
+            {
+              "language": "calculation",
+              "code": "All 4 scored ML games are used, not only the report's top 3.\nML comparisons: MIL +114: model 48.35% vs break-even 46.73%; BOS -126: 54.34% vs 55.75%; NYY -152: 57.80% vs 60.32%; ATL -220: 71.55% vs 68.75%.\nBoth ML sides are checked in model-market-review.json. O/U expected values are not probabilities."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sep24-market",
+      "title": "9월 24일 남은 경기의 공개 배당",
+      "queries": [
+        {
+          "id": "sep24-public-book",
+          "source": {
+            "label": "FanDuel 공개 팀별 배당 페이지",
+            "files": [{"label": "public-market-review-2015Z.json"}, {"label": "public-market-review-addendum-2033Z.json"}],
+            "links": [
+              {"label": "MIL–PHI", "href": "https://sportsbook.fanduel.com/teams/mlb/milwaukee-brewers/odds"},
+              {"label": "CLE–BOS", "href": "https://sportsbook.fanduel.com/teams/mlb/cleveland-guardians/odds"},
+              {"label": "TB–NYY", "href": "https://sportsbook.fanduel.com/teams/mlb/tampa-bay-rays/odds"},
+              {"label": "CIN–ATL", "href": "https://sportsbook.fanduel.com/teams/mlb/atlanta-braves/odds"},
+              {"label": "HOU–ATH", "href": "https://sportsbook.fanduel.com/teams/mlb/houston-astros/odds"},
+              {"label": "LAA–SEA", "href": "https://sportsbook.fanduel.com/teams/mlb/seattle-mariners/odds"},
+              {"label": "SD–LAD", "href": "https://sportsbook.fanduel.com/teams/mlb/san-diego-padres/odds"}
+            ],
+            "metricDefinitions": [{"label": "손익분기 승률", "definition": "손익분기 승률은 해당 배당에서 장기 기대수익이 0이 되는 승률입니다."}],
+            "filters": ["뉴욕 경기일: 2026-09-24", "확인 시점에 아직 시작하지 않은 7경기", "한 북 기준: FanDuel 공개 가격"],
+            "caveats": ["공개 페이지 관찰값이며 로그인된 뉴욕 계정의 실행 가능한 가격은 검증하지 않았습니다.", "북 자체의 배당 갱신 시각을 제공받지 못했습니다. 기록 시각은 가격 갱신 시각과 다릅니다.", "TB–NYY 가격은 16:33 EDT 재확인에서 처음 확보했습니다. MIL–PHI와 CLE–BOS는 같은 재확인에서 값이 같았습니다.", "CIN–ATL 재확인은 HTTP 403으로 실패해 16:15 EDT 관찰값을 보존했습니다. 이를 새 가격이라고 표시하지 않았습니다.", "이 관찰은 정식 시장 입력 수집 절차를 통과한 market trace가 아닙니다."]
+          },
+          "reportingPeriod": "2026-09-24, America/New_York; 공개 페이지 확인 약 16:13–16:15 EDT, 추가 확인 약 16:33 EDT",
+          "columns": ["경기", "원정 ML", "홈 ML", "총점", "오버 배당", "언더 배당"],
+          "rows": [
+            {"경기":"MIL@PHI","원정 ML":114,"홈 ML":-134,"총점":7.5,"오버 배당":-120,"언더 배당":-102},
+            {"경기":"CLE@BOS","원정 ML":108,"홈 ML":-126,"총점":6.5,"오버 배당":-122,"언더 배당":100},
+            {"경기":"TB@NYY","원정 ML":128,"홈 ML":-152,"총점":6.5,"오버 배당":114,"언더 배당":-140},
+            {"경기":"CIN@ATL","원정 ML":184,"홈 ML":-220,"총점":7.5,"오버 배당":-122,"언더 배당":100},
+            {"경기":"HOU@ATH","원정 ML":-162,"홈 ML":136,"총점":10.5,"오버 배당":-114,"언더 배당":-106},
+            {"경기":"LAA@SEA","원정 ML":190,"홈 ML":-230,"총점":6.5,"오버 배당":-140,"언더 배당":114},
+            {"경기":"SD@LAD","원정 ML":146,"홈 ML":-174,"총점":7.5,"오버 배당":-130,"언더 배당":106}
+          ],
+          "methods": [{"language":"calculation","code":"Positive American odds +B: break_even = 100 / (100+B)\nNegative American odds -A: break_even = A / (100+A)\nNominal gap = model probability - break_even; this is not a validated betting edge."}]
+        }
+      ]
+    }
+  ]
+}

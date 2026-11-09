@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "model_id",
+    "lane_id",
+    "fold_id",
+    "candidate_id",
+    "run_spec_sha256",
+    "source_gate_sha256",
+    "baseline_replay_sha256",
+    "parent_card_sha256",
+    "feature_seal_sha256",
+    "prediction_contract_sha256",
+    "calibration_card_sha256",
+    "candidate_payload_sha256",
+    "parameters"
+  ],
+  "properties": {
+    "schema": {"const": "MODEL_IMPROVEMENT_SCORING_MODEL_CARD_V1"},
+    "model_id": {"enum": ["A", "A+B", "A+B+C"]},
+    "lane_id": {"enum": ["A", "B", "C", "H24"]},
+    "fold_id": {"enum": ["O19", "O20", "O21", "O22", "O23", "H22", "H23", "H24"]},
+    "candidate_id": {
+      "type": ["string", "null"],
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "run_spec_sha256": {"$ref": "#/$defs/sha256"},
+    "source_gate_sha256": {"$ref": "#/$defs/sha256"},
+    "baseline_replay_sha256": {"$ref": "#/$defs/sha256"},
+    "parent_card_sha256": {"$ref": "#/$defs/optional_sha256"},
+    "feature_seal_sha256": {"$ref": "#/$defs/sha256"},
+    "prediction_contract_sha256": {"$ref": "#/$defs/sha256"},
+    "calibration_card_sha256": {"$ref": "#/$defs/optional_sha256"},
+    "candidate_payload_sha256": {"$ref": "#/$defs/optional_sha256"},
+    "parameters": {
+      "type": "object",
+      "required": ["component_weights_pp"],
+      "properties": {
+        "component_weights_pp": {"$ref": "#/$defs/component_weights_pp"}
+      },
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "optional_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "component_weights_pp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["starter", "offense", "bullpen", "environment", "defense", "schedule"],
+      "properties": {
+        "starter": {"type": "integer", "minimum": 0},
+        "offense": {"type": "integer", "minimum": 0},
+        "bullpen": {"type": "integer", "minimum": 0},
+        "environment": {"type": "integer", "minimum": 0},
+        "defense": {"type": "integer", "minimum": 0},
+        "schedule": {"type": "integer", "minimum": 0}
+      }
+    }
+  }
+}

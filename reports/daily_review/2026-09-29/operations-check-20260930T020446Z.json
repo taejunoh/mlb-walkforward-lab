@@ -1,0 +1,173 @@
+{
+  "schema": "MLB_DAILY_OPERATIONS_CHECK_V1",
+  "automation_id": "mlb",
+  "triggered_at_utc": "2026-09-30T02:04:46.309Z",
+  "execution_clock_at_start_utc": "2026-09-30T02:05:12Z",
+  "local_date": "2026-09-29",
+  "timezone": "America/New_York",
+  "previous_check": "reports/daily_review/2026-09-29/operations-check-20260930T013446Z.json",
+  "schedule_observed_at_utc": "2026-09-30T02:05:33Z",
+  "schedule_source": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&startDate=2026-09-29&endDate=2026-09-30&fields=dates,date,games,gamePk,gameType,gameDate,status,abstractGameState,detailedState,codedGameState,teams,away,home,team,id,name",
+  "schedule_collection": "Read-only official StatsAPI HTTPS GET; no score/outcome fields requested.",
+  "games": [
+    {
+      "date": "2026-09-29",
+      "game_pk": 849845,
+      "game_type": "F",
+      "away": "PHI",
+      "home": "ATL",
+      "start_utc": "2026-09-29T18:00:00Z",
+      "official_status": "Final",
+      "record_status": "NO_PREGAME_PREDICTION",
+      "official_abstract_status": "Final",
+      "official_coded_status": "F"
+    },
+    {
+      "date": "2026-09-29",
+      "game_pk": 849849,
+      "game_type": "F",
+      "away": "CWS",
+      "home": "HOU",
+      "start_utc": "2026-09-29T21:00:00Z",
+      "official_status": "Final",
+      "record_status": "NO_PREGAME_PREDICTION",
+      "official_abstract_status": "Final",
+      "official_coded_status": "F"
+    },
+    {
+      "date": "2026-09-29",
+      "game_pk": 849851,
+      "game_type": "F",
+      "away": "BOS",
+      "home": "NYY",
+      "start_utc": "2026-09-30T00:00:00Z",
+      "official_status": "In Progress",
+      "record_status": "NO_PREGAME_PREDICTION",
+      "cutoff_note": "Scheduled cutoff elapsed and official status is now In Progress. Absence of a saved prediction was already recorded; no new pregame forecast created.",
+      "official_abstract_status": "Live",
+      "official_coded_status": "I"
+    },
+    {
+      "date": "2026-09-29",
+      "game_pk": 849843,
+      "game_type": "F",
+      "away": "CHC",
+      "home": "SD",
+      "start_utc": "2026-09-30T02:00:00Z",
+      "official_status": "Warmup",
+      "record_status": "NO_PREGAME_PREDICTION",
+      "official_abstract_status": "Live",
+      "official_coded_status": "P",
+      "cutoff_note": "Scheduled 02:00Z start elapsed; official status is Warmup, not confirmation of first pitch. No late forecast created."
+    },
+    {
+      "date": "2026-09-30",
+      "game_pk": 849841,
+      "game_type": "F",
+      "away": "PHI",
+      "home": "ATL",
+      "start_utc": "2026-09-30T18:00:00Z",
+      "official_status": "Scheduled",
+      "record_status": "BLOCKED_UNSUPPORTED_GAME_TYPE",
+      "official_abstract_status": "Preview",
+      "official_coded_status": "S"
+    },
+    {
+      "date": "2026-09-30",
+      "game_pk": 849846,
+      "game_type": "F",
+      "away": "CWS",
+      "home": "HOU",
+      "start_utc": "2026-09-30T21:00:00Z",
+      "official_status": "Scheduled",
+      "record_status": "BLOCKED_UNSUPPORTED_GAME_TYPE",
+      "official_abstract_status": "Preview",
+      "official_coded_status": "S"
+    },
+    {
+      "date": "2026-09-30",
+      "game_pk": 849848,
+      "game_type": "F",
+      "away": "BOS",
+      "home": "NYY",
+      "start_utc": "2026-10-01T00:00:00Z",
+      "official_status": "Scheduled",
+      "record_status": "BLOCKED_UNSUPPORTED_GAME_TYPE",
+      "official_abstract_status": "Preview",
+      "official_coded_status": "S"
+    },
+    {
+      "date": "2026-09-30",
+      "game_pk": 849842,
+      "game_type": "F",
+      "away": "CHC",
+      "home": "SD",
+      "start_utc": "2026-10-01T02:00:00Z",
+      "official_status": "Scheduled",
+      "record_status": "BLOCKED_UNSUPPORTED_GAME_TYPE",
+      "official_abstract_status": "Preview",
+      "official_coded_status": "S"
+    }
+  ],
+  "execution": {
+    "matching_daily_top3_totals_flow_processes_observed": 0,
+    "sep25_through_sep30_model_totals_flow_directories": "ABSENT",
+    "new_model_runs": 0,
+    "new_primary_claims": 0,
+    "new_settlements": 0,
+    "new_missing_prediction_deadlines": 1,
+    "new_near_start_warnings": 0,
+    "source_sha256_unchanged_from_previous_check": {
+      "mlb_backtest/live_sources.py": "36cec4b0039d9b175da3e3b9831fe177884c46779e3fe56ddaae7e22b63e87a1",
+      "mlb_backtest/live_features.py": "8194cd44599777baf28522c3995423c175126e81c2065504dad7544232b6bcc5",
+      "mlb_backtest/experimental_totals_sources.py": "f6fcf5c12538495db06e5549b1e9c341657ed1599b4db773d648b8f8fd6eeac9"
+    },
+    "full_history_statcast_and_market_collection": "NOT_EVALUATED_UNCHANGED_UNSUPPORTED_GAME_TYPE",
+    "sep30_d_minus_one_all_final": false
+  },
+  "preserved_settlement_receipts_sha256_verified": [
+    {
+      "path": "audit/prospective_ml_daily_flow/2026-09-24/62aa20b134c83dd19f12413f269d3614bdab22dca311104a52a0dd7f6f748c46.json",
+      "sha256": "62aa20b134c83dd19f12413f269d3614bdab22dca311104a52a0dd7f6f748c46"
+    },
+    {
+      "path": "audit/prospective_ml_daily_flow/2026-09-24/919ae756f84b2da8fe52de29e5ed72aa29fef36ce9e82ebb7fe0be13e4f7bac9.json",
+      "sha256": "919ae756f84b2da8fe52de29e5ed72aa29fef36ce9e82ebb7fe0be13e4f7bac9"
+    }
+  ],
+  "settlement_action": "No new eligible pregame receipt or newly Final saved prediction. No formal result collection or settlement attempted. Completed Sep24 receipt hashes remain unchanged; retain full status validation from operations-check-20260929T210445Z.json.",
+  "known_sep23_game_824785_failure": "PRESERVED_NOT_RETRIED",
+  "postseason_implementation": "DESIGN_ONLY_NOT_ACTIVATED",
+  "notifiable_material_change": true,
+  "notification_reason": "CHC@SD scheduled cutoff elapsed without a saved forecast (official Warmup; first pitch not inferred). All four Sep29 scheduled pregame cutoffs have now elapsed with zero saved predictions; record the new coverage gap, not a model PASS or 0% accuracy.",
+  "next_check": "Next nominal 30-minute heartbeat. Preserve Sep29 NO_PREGAME_PREDICTION without backfill; check official states, any newly saved valid receipts and Sep30 readiness/support. Keep the ongoing automation active.",
+  "source_code_modified": false,
+  "model_refit_performed": false,
+  "historical_prediction_backfill_performed": false,
+  "automation_deleted": false,
+  "schedule_state_changes": [
+    {
+      "game_pk": 849843,
+      "from": "Pre-Game",
+      "to": "Warmup",
+      "saved_pregame_prediction": false
+    }
+  ],
+  "lineup_recheck_action": "NOT_PERFORMED_AFTER_SCHEDULED_CUTOFF; no remaining game before its scheduled start in the local Sep29 slate.",
+  "last_pregame_context_record": "reports/daily_review/2026-09-29/operations-check-20260930T013446Z.json",
+  "prediction_coverage_summary": {
+    "target_date": "2026-09-29",
+    "status": "NO_PREGAME_PREDICTION",
+    "official_game_count": 4,
+    "scheduled_cutoffs_elapsed": 4,
+    "saved_pregame_predictions": 0,
+    "added_validation_samples": 0,
+    "accuracy": null,
+    "brier_score": null,
+    "log_loss": null,
+    "reason": "POSTSEASON_F_NOT_SUPPORTED",
+    "outcome_scores_collected": false,
+    "outcome_review_status": "NOT_APPLICABLE_WITHOUT_SAVED_PREDICTION",
+    "note_ko": "9월 29일 4경기 모두 경기 전 예측이 저장되지 않았습니다. 포스트시즌 F 미지원으로 미평가이며, 검증 표본 0건은 적중률 0%를 뜻하지 않습니다. 결과를 보고 예측 또는 패배 원인을 만들지 않았습니다."
+  }
+}

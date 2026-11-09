@@ -1,0 +1,141 @@
+{
+  "schema": "PROSPECTIVE_ML_DAILY_SETTLEMENT_REVIEW_V1",
+  "target_date": "2026-09-24",
+  "model_card_sha256": "9bad89b9f4896a8f8862d3c304fd605921eca2d825fc2340bf51da01f7912759",
+  "population": {
+    "primary_claims": 4,
+    "settled_final": 4,
+    "predicted_winner_hits": 1,
+    "predicted_winner_misses": 3,
+    "accuracy": 0.25,
+    "brier_score_home_probability": 0.31299085988546715,
+    "log_loss_home_probability": 0.8288982302678349,
+    "market_evaluated": false,
+    "betting_pnl_calculated": false
+  },
+  "pregame_receipts": [
+    "audit/prospective_ml_daily_flow/2026-09-24/6d8dc9b9548f6fe1e51d0314f6892c080efc041ceca17c2f0f6ed710bbdc268a.json",
+    "audit/prospective_ml_daily_flow/2026-09-24/9109030ceaff7cbd66a7e42e90c931923c178e78b2a7d43647b84a76fbe705f0.json"
+  ],
+  "postgame_receipts": [
+    "audit/prospective_ml_daily_flow/2026-09-24/62aa20b134c83dd19f12413f269d3614bdab22dca311104a52a0dd7f6f748c46.json",
+    "audit/prospective_ml_daily_flow/2026-09-24/919ae756f84b2da8fe52de29e5ed72aa29fef36ce9e82ebb7fe0be13e4f7bac9.json"
+  ],
+  "games": [
+    {
+      "game_pk": 823411,
+      "matchup": "Milwaukee Brewers at Philadelphia Phillies",
+      "claimed_at_utc": "2026-09-24T20:28:51.655593Z",
+      "predicted_winner": "Philadelphia Phillies",
+      "p_home": 0.5164834520036866,
+      "data_completeness": 0.600709477602531,
+      "actual_score": {"away": 5, "home": 1},
+      "actual_winner": "Milwaukee Brewers",
+      "outcome": "MISS",
+      "primary_claim": "audit/prospective_ml_observation/primary_claims/823411/9bad89b9f4896a8f8862d3c304fd605921eca2d825fc2340bf51da01f7912759.json",
+      "snapshot": "audit/prospective_ml_observation/candidates/2026-09-24/823411/9bad89b9f4896a8f8862d3c304fd605921eca2d825fc2340bf51da01f7912759/4dd08994c0e249c8a9ffd7320343539389583e26cac25a6e102a0935bdb4d114.json",
+      "settlement_head": "audit/prospective_ml_observation/settlement_heads/4dd08994c0e249c8a9ffd7320343539389583e26cac25a6e102a0935bdb4d114/00000001.json",
+      "official_result_receipt": "audit/experimental_daily/live_receipts/3a202a3ace6e4f018dab1c6b4d65d69e.json",
+      "result_observed_at_utc": "2026-09-29T20:33:32.722070Z",
+      "result_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-24&gamePks=823411"
+    },
+    {
+      "game_pk": 824707,
+      "matchup": "Cleveland Guardians at Boston Red Sox",
+      "claimed_at_utc": "2026-09-24T20:28:51.676086Z",
+      "predicted_winner": "Boston Red Sox",
+      "p_home": 0.5433968363134901,
+      "data_completeness": 0.43997567383588726,
+      "actual_score": {"away": 1, "home": 0},
+      "actual_winner": "Cleveland Guardians",
+      "outcome": "MISS",
+      "primary_claim": "audit/prospective_ml_observation/primary_claims/824707/9bad89b9f4896a8f8862d3c304fd605921eca2d825fc2340bf51da01f7912759.json",
+      "snapshot": "audit/prospective_ml_observation/candidates/2026-09-24/824707/9bad89b9f4896a8f8862d3c304fd605921eca2d825fc2340bf51da01f7912759/4bc41d08e51ae4eaff91f1149a8a5655bf38fdb5df9e2046d4e5f92d6766c77e.json",
+      "settlement_head": "audit/prospective_ml_observation/settlement_heads/4bc41d08e51ae4eaff91f1149a8a5655bf38fdb5df9e2046d4e5f92d6766c77e/00000001.json",
+      "official_result_receipt": "audit/experimental_daily/live_receipts/9d2e1dede6034b34a1594a0444449537.json",
+      "result_observed_at_utc": "2026-09-29T20:33:37.409241Z",
+      "result_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-24&gamePks=824707"
+    },
+    {
+      "game_pk": 824866,
+      "matchup": "Cincinnati Reds at Atlanta Braves",
+      "claimed_at_utc": "2026-09-24T20:28:51.707746Z",
+      "predicted_winner": "Atlanta Braves",
+      "p_home": 0.7154588932282524,
+      "data_completeness": 0.6125592899375513,
+      "actual_score": {"away": 7, "home": 6},
+      "actual_winner": "Cincinnati Reds",
+      "outcome": "MISS",
+      "primary_claim": "audit/prospective_ml_observation/primary_claims/824866/9bad89b9f4896a8f8862d3c304fd605921eca2d825fc2340bf51da01f7912759.json",
+      "snapshot": "audit/prospective_ml_observation/candidates/2026-09-24/824866/9bad89b9f4896a8f8862d3c304fd605921eca2d825fc2340bf51da01f7912759/2a0190fe8aaac10429dd8683da48a02cd76e12a33a6697c76071c8f791fded9f.json",
+      "settlement_head": "audit/prospective_ml_observation/settlement_heads/2a0190fe8aaac10429dd8683da48a02cd76e12a33a6697c76071c8f791fded9f/00000001.json",
+      "official_result_receipt": "audit/experimental_daily/live_receipts/dd2b5a6691aa40d8af6ab488f84a378f.json",
+      "result_observed_at_utc": "2026-09-29T20:33:38.813242Z",
+      "result_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-24&gamePks=824866"
+    },
+    {
+      "game_pk": 823493,
+      "matchup": "Tampa Bay Rays at New York Yankees",
+      "claimed_at_utc": "2026-09-24T20:39:04.869412Z",
+      "predicted_winner": "New York Yankees",
+      "p_home": 0.5780441566546113,
+      "data_completeness": 0.5907565272756166,
+      "actual_score": {"away": 4, "home": 6},
+      "actual_winner": "New York Yankees",
+      "outcome": "HIT",
+      "primary_claim": "audit/prospective_ml_observation/primary_claims/823493/9bad89b9f4896a8f8862d3c304fd605921eca2d825fc2340bf51da01f7912759.json",
+      "snapshot": "audit/prospective_ml_observation/candidates/2026-09-24/823493/9bad89b9f4896a8f8862d3c304fd605921eca2d825fc2340bf51da01f7912759/417329de1ef3d3c73bcbd2467791c2226a2649a27e9b1e27b25a2cc75a2a51fa.json",
+      "settlement_head": "audit/prospective_ml_observation/settlement_heads/417329de1ef3d3c73bcbd2467791c2226a2649a27e9b1e27b25a2cc75a2a51fa/00000001.json",
+      "official_result_receipt": "audit/experimental_daily/live_receipts/a379c87a5e594e8380862eca87318e77.json",
+      "result_observed_at_utc": "2026-09-29T20:33:47.047812Z",
+      "result_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-24&gamePks=823493"
+    }
+  ],
+  "admitted_metrics_by_postgame_report": {
+    "three_claim_report": {
+      "report": "reports/prospective_ml_observation/362f048331f16996f2a44410e3c91d728b01f499e2429b1eee9df0cc4548c59f.json",
+      "n": 3,
+      "wins": 0,
+      "losses": 3,
+      "accuracy": 0.0,
+      "brier": 0.357972,
+      "log_loss": 0.922495967813
+    },
+    "single_claim_report": {
+      "report": "reports/prospective_ml_observation/0a6515411a69c3e1a0fdbb8c834cce67201001aaec54d813d68f37a3a3343f19.json",
+      "n": 1,
+      "wins": 1,
+      "losses": 0,
+      "accuracy": 1.0,
+      "brier": 0.178047,
+      "log_loss": 0.548105017632
+    }
+  },
+  "limitations": [
+    "공식 결과 수집 및 정산은 2026-09-29 20:33:32–20:33:49 UTC에 수행됨.",
+    "4경기만 저장된 primary claim과 최종 공식 결과가 모두 있어 평가에 포함됨. 전체 일정의 대표 표본은 아니며 표본 4경기만으로 모델 품질·개선 여부를 판단하지 않음.",
+    "정식 admitted 시장 증거 및 베팅 실행 내역이 없어 betting P&L은 산출하지 않음. 별도 model-market-review/public-market-review 자료는 그대로 보존됨.",
+    "예측 입력 스냅샷의 data_completeness는 경기별 0.440–0.613. 구성 입력의 영향이나 경기 결과 원인에 대한 사후 설명은 이 자료로 식별할 수 없음.",
+    "총점 진단은 저장된 예측 7경기만의 참고 비교이며 별도 연구 지표다. 공식 O/U 정산 또는 betting P&L이 아니다."
+  ],
+  "saved_totals_diagnostic": {
+    "classification": "RESEARCH_ONLY_DIAGNOSTIC_NOT_FORMAL_OU_SETTLEMENT",
+    "forecast_report": "reports/experimental_daily_totals/2026-09-24/20260924T202827534232Z-c90c415efddaed78.json",
+    "forecast_trace": "reports/experimental_daily_totals/2026-09-24/20260924T202827534232Z-c90c415efddaed78.trace.json",
+    "metric_basis": "seven saved PROJECTED pregame totals only; no line, market, wager, or P&L evaluation",
+    "games": [
+      {"game_pk": 823411, "matchup": "Brewers at Phillies", "predicted_total": 9.095938203915246, "actual_score_away_home": [5, 1], "actual_total": 6, "absolute_error": 3.095938203915246, "saved_interval_80": [4, 15], "within_interval": true, "official_result_receipt": "audit/experimental_daily/live_receipts/3a202a3ace6e4f018dab1c6b4d65d69e.json"},
+      {"game_pk": 824707, "matchup": "Guardians at Red Sox", "predicted_total": 8.54357649425377, "actual_score_away_home": [1, 0], "actual_total": 1, "absolute_error": 7.54357649425377, "saved_interval_80": [3, 14], "within_interval": false, "official_result_receipt": "audit/experimental_daily/live_receipts/9d2e1dede6034b34a1594a0444449537.json"},
+      {"game_pk": 823493, "matchup": "Rays at Yankees", "predicted_total": 8.372912511792821, "actual_score_away_home": [4, 6], "actual_total": 10, "absolute_error": 1.6270874882071793, "saved_interval_80": [3, 14], "within_interval": true, "official_result_receipt": "audit/experimental_daily/live_receipts/a379c87a5e594e8380862eca87318e77.json"},
+      {"game_pk": 824866, "matchup": "Reds at Braves", "predicted_total": 8.962957726100672, "actual_score_away_home": [7, 6], "actual_total": 13, "absolute_error": 4.037042273899328, "saved_interval_80": [3, 15], "within_interval": true, "official_result_receipt": "audit/experimental_daily/live_receipts/dd2b5a6691aa40d8af6ab488f84a378f.json"},
+      {"game_pk": 823087, "matchup": "Angels at Mariners", "predicted_total": 8.783787462041676, "actual_score_away_home": [6, 4], "actual_total": 10, "absolute_error": 1.216212537958324, "saved_interval_80": [3, 15], "within_interval": true, "result_source": {"requested_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-24&gamePks=823087", "observed_at_utc": "2026-09-29T20:40:33.288863Z", "http_status": 200, "payload_sha256": "ea93a179061e9af2e5a48807b822e830b8d0bd3c4f7d457d239d8e3b7d5a294b", "raw_response_game": {"gamePk": 823087, "gameGuid": "3a9afc88-eefb-477a-880f-562f9e4712ea", "link": "/api/v1.1/game/823087/feed/live", "gameType": "R", "season": "2026", "gameDate": "2026-09-25T01:40:00Z", "officialDate": "2026-09-24", "status": {"abstractGameState": "Final", "codedGameState": "F", "detailedState": "Final", "statusCode": "F", "startTimeTBD": false, "abstractGameCode": "F"}, "teams": {"away": {"team": {"id": 108, "name": "Los Angeles Angels", "link": "/api/v1/teams/108"}, "score": 6, "isWinner": true}, "home": {"team": {"id": 136, "name": "Seattle Mariners", "link": "/api/v1/teams/136"}, "score": 4, "isWinner": false}}, "venue": {"id": 680, "name": "T-Mobile Park", "link": "/api/v1/venues/680"}, "isTie": false, "gameNumber": 1, "doubleHeader": "N", "recordSource": "S"}}},
+      {"game_pk": 824950, "matchup": "Astros at Athletics", "predicted_total": 9.359227808077602, "actual_score_away_home": [7, 5], "actual_total": 12, "absolute_error": 2.640772191922398, "saved_interval_80": [4, 15], "within_interval": true, "result_source": {"requested_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-24&gamePks=824950", "observed_at_utc": "2026-09-29T20:40:33.378271Z", "http_status": 200, "payload_sha256": "3ad1780cc12c5b0300ae28dcc801eace076f07999fe6040a286826fb7ff0e455", "raw_response_game": {"gamePk": 824950, "gameGuid": "03fa128a-87b1-4229-a09c-b95ec3675fe7", "link": "/api/v1.1/game/824950/feed/live", "gameType": "R", "season": "2026", "gameDate": "2026-09-25T01:40:00Z", "officialDate": "2026-09-24", "status": {"abstractGameState": "Final", "codedGameState": "F", "detailedState": "Final", "statusCode": "F", "startTimeTBD": false, "abstractGameCode": "F"}, "teams": {"away": {"team": {"id": 117, "name": "Houston Astros", "link": "/api/v1/teams/117"}, "score": 7, "isWinner": true}, "home": {"team": {"id": 133, "name": "Athletics", "link": "/api/v1/teams/133"}, "score": 5, "isWinner": false}}, "venue": {"id": 2529, "name": "Sutter Health Park", "link": "/api/v1/venues/2529"}, "isTie": false, "gameNumber": 1, "doubleHeader": "N", "recordSource": "S"}}},
+      {"game_pk": 823895, "matchup": "Padres at Dodgers", "predicted_total": 8.76963982427696, "actual_score_away_home": [4, 2], "actual_total": 6, "absolute_error": 2.76963982427696, "saved_interval_80": [3, 15], "within_interval": true, "result_source": {"requested_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-24&gamePks=823895", "observed_at_utc": "2026-09-29T20:40:33.457654Z", "http_status": 200, "payload_sha256": "5b3be33f9a89801bd5b1e87ef3f246257fc2cb6627b267fcf9062c23f28fe5cb", "raw_response_game": {"gamePk": 823895, "gameGuid": "fb0a19a6-fd31-4faf-878f-aa62bab5881a", "link": "/api/v1.1/game/823895/feed/live", "gameType": "R", "season": "2026", "gameDate": "2026-09-25T02:10:00Z", "officialDate": "2026-09-24", "status": {"abstractGameState": "Final", "codedGameState": "F", "detailedState": "Final", "statusCode": "F", "startTimeTBD": false, "abstractGameCode": "F"}, "teams": {"away": {"team": {"id": 135, "name": "San Diego Padres", "link": "/api/v1/teams/135"}, "score": 4, "isWinner": true}, "home": {"team": {"id": 119, "name": "Los Angeles Dodgers", "link": "/api/v1/teams/119"}, "score": 2, "isWinner": false}}, "venue": {"id": 22, "name": "UNIQLO Field at Dodger Stadium", "link": "/api/v1/venues/22"}, "isTie": false, "gameNumber": 1, "doubleHeader": "N", "recordSource": "S"}}}
+    ],
+    "summary": {"n": 7, "mean_absolute_error_runs": 3.2757527163476, "root_mean_squared_error_runs": 3.808997984629642, "80_interval_coverage": {"covered": 6, "n": 7}, "note": "Descriptive scores only; no formal model acceptance conclusion from seven games."}
+  },
+  "reproduction": [
+    "PYTHONDONTWRITEBYTECODE=1 /Users/taejunoh/.local/bin/python3 -B -m mlb_backtest.prospective_ml_daily_flow status --root \"$PWD\" --pregame-receipt audit/prospective_ml_daily_flow/2026-09-24/6d8dc9b9548f6fe1e51d0314f6892c080efc041ceca17c2f0f6ed710bbdc268a.json --postgame-receipt audit/prospective_ml_daily_flow/2026-09-24/62aa20b134c83dd19f12413f269d3614bdab22dca311104a52a0dd7f6f748c46.json",
+    "PYTHONDONTWRITEBYTECODE=1 /Users/taejunoh/.local/bin/python3 -B -m mlb_backtest.prospective_ml_daily_flow status --root \"$PWD\" --pregame-receipt audit/prospective_ml_daily_flow/2026-09-24/9109030ceaff7cbd66a7e42e90c931923c178e78b2a7d43647b84a76fbe705f0.json --postgame-receipt audit/prospective_ml_daily_flow/2026-09-24/919ae756f84b2da8fe52de29e5ed72aa29fef36ce9e82ebb7fe0be13e4f7bac9.json"
+  ]
+}

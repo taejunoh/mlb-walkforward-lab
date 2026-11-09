@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mlb-walkforward-lab.local/schemas/experimental_multibook_market_plays_trace.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "content_sha256", "report_relative", "report_sha256", "report_sidecar_sha256", "markdown_sha256", "evaluated_at_utc", "policy_sha256"],
+  "properties": {
+    "schema": {"const": "PROVISIONAL_MULTIBOOK_MARKET_PLAYS_TRACE_V1"},
+    "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "report_relative": {"type": "string", "minLength": 1, "pattern": "^(?!/)[^\\\\]+$"},
+    "report_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "report_sidecar_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "markdown_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "evaluated_at_utc": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"},
+    "policy_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

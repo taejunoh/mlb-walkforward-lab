@@ -1,0 +1,75 @@
+{
+  "schema": "POSTSTART_RECONSTRUCTION_INPUT_CONTRACT_BLOCKER_V1",
+  "status": "BLOCKED_PREPARATION_ONLY",
+  "preparation_status": "UNEXECUTED_NOT_PILOT_READY",
+  "target_dates": ["2026-09-25", "2026-09-26", "2026-09-27"],
+  "pilot_game_pk": 824703,
+  "pilot_identity": {
+    "target_date": "2026-09-25",
+    "game_type": "R",
+    "away_team_id": 112,
+    "home_team_id": 111,
+    "scheduled_start_utc": "2026-09-25T17:05:00Z"
+  },
+  "blocker": {
+    "code": "HISTORY_SOURCE_BINDING_CARDINALITY_MISMATCH",
+    "target_history_date": "2026-09-24",
+    "evidence_report_target_date": "2026-09-24",
+    "evidence_report_history_as_of_date": "2026-09-23",
+    "pilot_history_acquired": false,
+    "observed_binding_count": 91,
+    "observed_binding_roles": {
+      "HISTORY_ERA": 1,
+      "HISTORY_SCHEDULE": 1,
+      "HISTORY_STATCAST": 55,
+      "HISTORY_VENUE": 34
+    },
+    "required_binding_count": 4,
+    "required_unique_roles": [
+      "HISTORY_ERA",
+      "HISTORY_SCHEDULE",
+      "HISTORY_STATCAST",
+      "HISTORY_VENUE"
+    ],
+    "reason": "The authenticated Sep24 report, whose history as_of_date is Sep23, demonstrates 91 genuine history bindings. This is evidence of the collector's multi-binding contract, not an acquired Sep25 pilot history bundle or a claim that its exact count is 91. The collector preserves these per-range/per-venue bindings, while the post-start evaluator accepts exactly four records, one per role. Dropping, merging, or fabricating bindings would destroy provenance; application source has not been changed.",
+    "safe_disposition": "Stop before writing evaluator inputs or running the evaluator. Resolve the contract mismatch under separate explicit authorization; do not select, collapse, or rewrite source bindings."
+  },
+  "evidence": {
+    "authenticated_existing_report_demonstrating_collector_contract": "reports/experimental_daily/2026-09-24/20260924T203303766913Z-095c7301fcd8a3f4.json",
+    "existing_prediction_verification": "reports/daily_review/2026-09-30/existing-september-prediction-verification.json",
+    "existing_analysis_coverage": "reports/daily_review/2026-09-30/september-analysis-coverage-20260930.json",
+    "contract_locations": [
+      {
+        "path": "mlb_backtest/poststart_research_evaluation.py",
+        "lines": "309-318",
+        "fact": "source_bindings must be a list of exactly four entries, and those entries must be exactly the four unique required roles."
+      },
+      {
+        "path": "mlb_backtest/live_top3_contracts.py",
+        "lines": "188-204",
+        "fact": "LiveHistoryBundle requires the four role types and validates every binding's as_of_date, but does not constrain its total binding count to four."
+      },
+      {
+        "path": "mlb_backtest/live_history.py",
+        "lines": "2364-2377",
+        "fact": "build_live_history preserves schedule_bindings + statcast_bindings + venue_bindings + era_bindings in the returned bundle."
+      }
+    ]
+  },
+  "execution": {
+    "live_target_game_acquisitions_by_preparation_worker": 0,
+    "parent_masked_boxscore_structural_probes": 1,
+    "parent_probe_scope": "The parent fetched the score-free masked boxscore for game824703 to inspect participant/empty-container response shape. No target outcome or statistical scalar was found; it was not fed to an evaluator or admitted as a pregame snapshot.",
+    "poststart_evaluator_invocations_by_this_task": 0,
+    "new_forecasts_or_research_reports_by_this_task": 0,
+    "target_outcomes_or_scores_read_by_this_task": false,
+    "source_or_evaluator_code_changed": false,
+    "status": "No pilot or retrospective evaluator run occurred."
+  },
+  "unexecuted_preparation_scaffold": {
+    "script": "reports/daily_review/2026-09-30/reconstruction-preparation/prepare_poststart_research_inputs.py",
+    "mapping": "reports/daily_review/2026-09-30/reconstruction-preparation/input-mapping.md",
+    "warning": "Both are marked UNEXECUTED_NOT_PILOT_READY. The script is a draft and must not be invoked; in particular, its provider parser is incomplete."
+  },
+  "next_step": "Keep the analysis task blocked at preparation. Parent consolidates this blocker with existing forecast coverage and operations findings; any evaluator/source-contract redesign requires separate authorization."
+}

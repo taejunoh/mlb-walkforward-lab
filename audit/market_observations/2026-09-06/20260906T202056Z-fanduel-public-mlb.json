@@ -1,0 +1,66 @@
+{
+  "observed_at_utc": "2026-09-06T20:20:56Z",
+  "source_url": "https://sportsbook.fanduel.com/navigation/mlb",
+  "source": "FanDuel Sportsbook public MLB page",
+  "status": "AVAILABLE",
+  "page_display_timestamp": "9/6/2026, 4:20:42 PM",
+  "access_note": "Public page readable without login or wager interaction; page also displayed 'Verifying location…' while lines rendered.",
+  "excluded_live_events": true,
+  "future_event_count": 6,
+  "future_events": [
+    {
+      "event_id": "36034172",
+      "displayed_event": "Minnesota Twins B Ober at Chicago White Sox B Hudson",
+      "displayed_start": "6:21PM ET",
+      "teams": {
+        "Minnesota Twins": {"moneyline": "+124", "total": "Over 8.5 -115"},
+        "Chicago White Sox": {"moneyline": "-146", "total": "Under 8.5 -105"}
+      }
+    },
+    {
+      "event_id": "36034176",
+      "displayed_event": "Washington Nationals A Alvarez at Los Angeles Dodgers J Wrobleski",
+      "displayed_start": "10:11PM ET",
+      "teams": {
+        "Washington Nationals": {"moneyline": "+172", "total": "Over 8.5 -102"},
+        "Los Angeles Dodgers": {"moneyline": "-205", "total": "Under 8.5 -120"}
+      }
+    },
+    {
+      "event_id": "36038567",
+      "displayed_event": "Atlanta Braves TBD at Philadelphia Phillies J Luzardo",
+      "displayed_start": "MON 1:06PM ET",
+      "teams": {
+        "Atlanta Braves": {"moneyline": "+136", "total": "Over 8 -110"},
+        "Philadelphia Phillies": {"moneyline": "-162", "total": "Under 8 -110"}
+      }
+    },
+    {
+      "event_id": "36038566",
+      "displayed_event": "New York Mets J Tong at Miami Marlins E Perez",
+      "displayed_start": "MON 1:11PM ET",
+      "teams": {
+        "New York Mets": {"moneyline": "-104", "total": "Over 8 -105"},
+        "Miami Marlins": {"moneyline": "-112", "total": "Under 8 -115"}
+      }
+    },
+    {
+      "event_id": "36038571",
+      "displayed_event": "Cleveland Guardians J Cantillo at Baltimore Orioles T Rogers",
+      "displayed_start": "MON 1:36PM ET",
+      "teams": {
+        "Cleveland Guardians": {"moneyline": "+102", "total": "Over 8 -115"},
+        "Baltimore Orioles": {"moneyline": "-120", "total": "Under 8 -105"}
+      }
+    },
+    {
+      "event_id": "36038572",
+      "displayed_event": "Chicago Cubs M Boyd at Milwaukee Brewers R Gasser",
+      "displayed_start": "MON 2:11PM ET",
+      "teams": {
+        "Chicago Cubs": {"moneyline": "+106", "total": "Over 8 -118"},
+        "Milwaukee Brewers": {"moneyline": "-124", "total": "Under 8 -104"}
+      }
+    }
+  ]
+}

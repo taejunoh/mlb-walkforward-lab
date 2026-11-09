@@ -1239,6 +1239,24 @@ class FeatureEngineTest(unittest.TestCase):
         self.assertAlmostEqual(schedule["quality"], 1 / 6)
         self.assertIn("rest_unsupported", schedule["flags"])
 
+    def test_doubleheader_no_is_known_false_while_missing_marker_is_unknown(self):
+        known_false = build(
+            game(doubleheader_marker="NO"),
+            FeatureHistory(data([]), slot_weights={i: 1 / 9 for i in range(1, 10)}),
+        )
+        unknown = build(
+            game(doubleheader_marker=None),
+            FeatureHistory(data([]), slot_weights={i: 1 / 9 for i in range(1, 10)}),
+        )
+
+        known_schedule = known_false["home"]["schedule"]
+        unknown_schedule = unknown["home"]["schedule"]
+        self.assertEqual(known_schedule["value"], 50.0)
+        self.assertAlmostEqual(known_schedule["quality"], 1 / 6)
+        self.assertNotIn("doubleheader_unsupported", known_schedule["flags"])
+        self.assertAlmostEqual(unknown_schedule["quality"], 0.0)
+        self.assertIn("doubleheader_unsupported", unknown_schedule["flags"])
+
     def test_schedule_history_rejects_malformed_rows(self):
         valid = {
             "game_pk": 1,

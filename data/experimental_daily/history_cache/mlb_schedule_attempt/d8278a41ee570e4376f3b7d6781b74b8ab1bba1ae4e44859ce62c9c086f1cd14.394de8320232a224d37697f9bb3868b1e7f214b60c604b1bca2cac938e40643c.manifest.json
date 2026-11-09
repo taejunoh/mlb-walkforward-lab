@@ -1,0 +1,17 @@
+{
+  "query": {
+    "as_of_date": "2026-09-15",
+    "attempt_outcome": "D1_SCHEDULE_TERMINAL_CANDIDATE",
+    "attempt_payload_sha256": "d8278a41ee570e4376f3b7d6781b74b8ab1bba1ae4e44859ce62c9c086f1cd14",
+    "end": "2026-09-15",
+    "gameType": "R",
+    "role": "history",
+    "start": "2026-01-01",
+    "url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&gameType=R&startDate=2026-01-01&endDate=2026-09-15&hydrate=probablePitcher%2Clineups%2Cvenue%2Clinescore"
+  },
+  "retrieved_at_utc": "2026-09-16T12:40:57.595563+00:00",
+  "row_count": 1,
+  "schema_version": 1,
+  "sha256": "d8278a41ee570e4376f3b7d6781b74b8ab1bba1ae4e44859ce62c9c086f1cd14",
+  "source": "mlb_schedule_attempt"
+}

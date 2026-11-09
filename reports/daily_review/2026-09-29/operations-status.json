@@ -1,0 +1,193 @@
+{
+  "schema": "MLB_DAILY_OPERATIONS_STATUS_V1",
+  "local_date": "2026-09-29",
+  "timezone": "America/New_York",
+  "checked_at_utc": "2026-09-30T03:35:20Z",
+  "automation": {
+    "id": "mlb",
+    "name": "MLB 매일 평가·정산·오답노트",
+    "status": "ACTIVE",
+    "interval_minutes": 30,
+    "date_limited": false,
+    "configuration_verified": true,
+    "first_scheduled_run_verified": true,
+    "first_scheduled_run_trigger_at_utc": "2026-09-29T21:04:45.586Z",
+    "local_computer_and_app_must_remain_running": true
+  },
+  "last_successful_operation": {
+    "stage": "POSTGAME_SETTLEMENT_STATUS_VERIFIED",
+    "target_date": "2026-09-24",
+    "primary_claims": 4,
+    "final_settlements": 4,
+    "totals_diagnostic_games": 7,
+    "totals_diagnostic_is_formal_ou_settlement": false,
+    "errors": [],
+    "workflow_complete": true,
+    "complete_evidence": false,
+    "incomplete_evidence_reason": "Formal admitted market evidence is absent; this is not a betting ledger.",
+    "review": "reports/daily_review/2026-09-24/prospective_ml_settlement.json",
+    "postgame_receipts": [
+      "audit/prospective_ml_daily_flow/2026-09-24/62aa20b134c83dd19f12413f269d3614bdab22dca311104a52a0dd7f6f748c46.json",
+      "audit/prospective_ml_daily_flow/2026-09-24/919ae756f84b2da8fe52de29e5ed72aa29fef36ce9e82ebb7fe0be13e4f7bac9.json"
+    ]
+  },
+  "current_slate": {
+    "target_date": "2026-09-29",
+    "schedule_observed_at_utc": "2026-09-30T03:35:20Z",
+    "source_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&startDate=2026-09-29&endDate=2026-09-30&fields=dates,date,games,gamePk,gameType,gameDate,status,abstractGameState,detailedState,codedGameState,teams,away,home,team,id,name",
+    "game_count": 4,
+    "game_type": "F",
+    "at_observation": {
+      "final": 3,
+      "in_progress": 1,
+      "pregame_or_scheduled_before_start": 0
+    },
+    "pregame_deadline_elapsed_without_prediction": 4,
+    "new_deadline_elapsed_since_prior_check": [],
+    "model_run_status": "BLOCKED_UNSUPPORTED_GAME_TYPE",
+    "new_pregame_claims": 0,
+    "reason": "PHI@ATL, CWS@HOU and BOS@NYY are Final; CHC@SD is In Progress. All four absent pregame forecasts were already recorded. No newly Final saved claim is available to settle. Unsupported F source hashes, repository HEAD and Sep30 schedule are unchanged. No late forecast, duplicate model run, model PASS claim or validation sample was created.",
+    "prediction_coverage_status": "NO_PREGAME_PREDICTION"
+  },
+  "latest_operational_check": {
+    "record": "reports/daily_review/2026-09-29/operations-check-20260930T033446Z.json",
+    "stage": "SCHEDULE_RECEIPT_PROCESS_AND_COVERAGE_DELTA_CHECKED",
+    "automation_dispatch_verified": true,
+    "matching_model_process_count": 0,
+    "new_model_runs": 0,
+    "new_primary_claims": 0,
+    "new_settlements": 0,
+    "preserved_sep24_final_settlements": 4,
+    "new_settlement_errors": 0,
+    "known_sep23_failure_retried": false,
+    "postseason_implementation_status": "DESIGN_ONLY_NOT_ACTIVATED",
+    "notifiable_material_change": false,
+    "last_full_settlement_status_check": "reports/daily_review/2026-09-29/operations-check-20260929T210445Z.json"
+  },
+  "near_start_warnings_sent": [
+    {
+      "game_pk": 849851,
+      "game": "BOS@NYY",
+      "scheduled_start_utc": "2026-09-30T00:00:00Z",
+      "first_warning_check_utc": "2026-09-29T22:06:02Z",
+      "warning": "Entered the 120-minute pregame monitoring window with no saved prediction. Official batting orders contain nine unique players per side, but unchanged postseason F support blocker prevents model evaluation.",
+      "record": "reports/daily_review/2026-09-29/operations-check-20260929T220446Z.json",
+      "repeat_only_if_material_change": true
+    },
+    {
+      "game_pk": 849843,
+      "game": "CHC@SD",
+      "scheduled_start_utc": "2026-09-30T02:00:00Z",
+      "first_warning_check_utc": "2026-09-30T00:05:39Z",
+      "warning": "Entered the 120-minute pregame monitoring window with no saved prediction. Official batting orders contain nine unique players per side; unchanged unsupported F blocker prevents model evaluation.",
+      "record": "reports/daily_review/2026-09-29/operations-check-20260930T000446Z.json",
+      "repeat_only_if_material_change": true
+    }
+  ],
+  "next_day_slate": {
+    "target_date": "2026-09-30",
+    "game_count": 4,
+    "game_type": "F",
+    "scheduled_starts_edt": [
+      "14:00",
+      "17:00",
+      "20:00",
+      "22:00"
+    ],
+    "status": "BLOCKED_UNSUPPORTED_GAME_TYPE",
+    "d_minus_one_ready": false,
+    "reason": "Sep29 games are not all Final. Full history/Statcast readiness was not attempted because the target type is unsupported."
+  },
+  "known_blockers": [
+    {
+      "id": "postseason-f-not-supported",
+      "status": "OPEN",
+      "already_reported_to_user": true,
+      "evidence": [
+        "mlb_backtest/live_sources.py:504-558",
+        "mlb_backtest/live_features.py:563,596",
+        "mlb_backtest/experimental_totals_sources.py:210,220,260"
+      ],
+      "source_sha256": {
+        "mlb_backtest/live_sources.py": "36cec4b0039d9b175da3e3b9831fe177884c46779e3fe56ddaae7e22b63e87a1",
+        "mlb_backtest/live_features.py": "8194cd44599777baf28522c3995423c175126e81c2065504dad7544232b6bcc5",
+        "mlb_backtest/experimental_totals_sources.py": "f6fcf5c12538495db06e5549b1e9c341657ed1599b4db773d648b8f8fd6eeac9"
+      },
+      "action": "Do not repeatedly launch an unchanged R-only model on an F slate. A separately validated postseason-support change is required."
+    },
+    {
+      "id": "sep23-824785-multi-date-result",
+      "status": "OPEN",
+      "target_date": "2026-09-23",
+      "game_pk": 824785,
+      "already_reported_to_user": true,
+      "reason": "Official result schedule contains postponed and rescheduled date buckets; the existing strict parser rejects the shape.",
+      "review": "reports/daily_review/2026-09-23/prospective_ml_settlement.json",
+      "action": "Keep raw evidence and diagnostic outcome separate; do not alter the payload or bypass formal settlement validation."
+    }
+  ],
+  "coverage_gap_scope": "No saved pregame prediction was found for these dates. This is not proof that a scheduled game was missed; off-days must be distinguished using official schedules. No absent prediction is scored as a loss.",
+  "coverage_gaps": [
+    {
+      "date": "2026-09-25",
+      "status": "NO_PREGAME_PREDICTION",
+      "backfilled": false
+    },
+    {
+      "date": "2026-09-26",
+      "status": "NO_PREGAME_PREDICTION",
+      "backfilled": false
+    },
+    {
+      "date": "2026-09-27",
+      "status": "NO_PREGAME_PREDICTION",
+      "backfilled": false
+    },
+    {
+      "date": "2026-09-28",
+      "status": "OFF_DAY",
+      "official_game_count": 0,
+      "source_url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-28&fields=totalGames,dates,date,games,gamePk,gameType,gameDate,status,abstractGameState,detailedState",
+      "backfilled": false
+    },
+    {
+      "date": "2026-09-29",
+      "status": "NO_PREGAME_PREDICTION",
+      "official_game_count": 4,
+      "scheduled_cutoffs_elapsed": 4,
+      "saved_pregame_predictions": 0,
+      "added_validation_samples": 0,
+      "reason": "POSTSEASON_F_NOT_SUPPORTED",
+      "record": "reports/daily_review/2026-09-29/operations-check-20260930T020446Z.json",
+      "backfilled": false
+    }
+  ],
+  "next_run": {
+    "trigger": "Next app heartbeat, nominally 30 minutes after the 2026-09-30T03:34:46.522Z dispatch; exact dispatch is app-managed. Recompute America/New_York date at dispatch because the next nominal run is after local midnight.",
+    "checks": [
+      "Read this status and exact per-date pregame/postgame references before any execution.",
+      "Check official schedule and whether the game-type admission blocker has materially changed.",
+      "The postseason design document is not an implemented workflow; do not treat an automated heartbeat as approval to modify source code.",
+      "Preserve completed Sep24 settlements; do not repeat collection using stale pregame-only state.",
+      "For admitted dates, record pregame predictions before start, then reconcile only those saved claims with official Final results.",
+      "Only report material changes, new failures, missing-record warnings, or completion; do not repeat unchanged known blockers."
+    ]
+  },
+  "model_refit_performed": false,
+  "source_code_modified": false,
+  "current_day_prediction_coverage": {
+    "target_date": "2026-09-29",
+    "status": "NO_PREGAME_PREDICTION",
+    "official_game_count": 4,
+    "scheduled_cutoffs_elapsed": 4,
+    "saved_pregame_predictions": 0,
+    "added_validation_samples": 0,
+    "accuracy": null,
+    "brier_score": null,
+    "log_loss": null,
+    "reason": "POSTSEASON_F_NOT_SUPPORTED",
+    "outcome_scores_collected": false,
+    "outcome_review_status": "NOT_APPLICABLE_WITHOUT_SAVED_PREDICTION",
+    "note_ko": "9월 29일 4경기 모두 경기 전 예측이 저장되지 않았습니다. 포스트시즌 F 미지원으로 미평가이며, 검증 표본 0건은 적중률 0%를 뜻하지 않습니다. 결과를 보고 예측 또는 패배 원인을 만들지 않았습니다."
+  }
+}

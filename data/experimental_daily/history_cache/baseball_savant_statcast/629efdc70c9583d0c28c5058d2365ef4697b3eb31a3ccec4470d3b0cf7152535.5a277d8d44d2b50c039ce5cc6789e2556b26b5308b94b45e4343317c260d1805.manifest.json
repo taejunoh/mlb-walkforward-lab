@@ -1,0 +1,13 @@
+{
+  "query": {
+    "end": "2026-06-19",
+    "game_type": "R",
+    "start": "2026-06-16",
+    "url": "https://baseballsavant.mlb.com/statcast_search/csv?all=true&type=details&player_type=batter&game_date_gt=2026-06-16&game_date_lt=2026-06-19&hfGT=R%7C&group_by=name-year&sort_col=pitches&player_event_sort=api_p_release_speed&sort_order=desc&min_pitches=0"
+  },
+  "retrieved_at_utc": "2026-08-31T16:29:58.652318+00:00",
+  "row_count": 14694,
+  "schema_version": 1,
+  "sha256": "629efdc70c9583d0c28c5058d2365ef4697b3eb31a3ccec4470d3b0cf7152535",
+  "source": "baseball_savant_statcast"
+}

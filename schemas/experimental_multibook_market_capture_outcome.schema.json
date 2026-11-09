@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Multibook capture admission outcome",
+  "oneOf": [
+    {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "content_sha256", "status", "source_book", "raw_capture_relative", "raw_capture_sha256", "captured_at_utc", "event_count"],
+      "properties": {
+        "schema": {"const": "PROVISIONAL_MULTIBOOK_MARKET_CAPTURE_OUTCOME_V1"}, "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "status": {"const": "AVAILABLE"}, "source_book": {"enum": ["FANDUEL", "DRAFTKINGS", "BETMGM", "CAESARS", "FANATICS"]}, "raw_capture_relative": {"type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"}, "raw_capture_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "captured_at_utc": {"type": "string"}, "event_count": {"type": "integer", "minimum": 1}
+      }
+    },
+    {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema", "content_sha256", "status", "source_book", "recorded_at_utc", "reason", "detail"],
+      "properties": {
+        "schema": {"const": "PROVISIONAL_MULTIBOOK_MARKET_CAPTURE_OUTCOME_V1"}, "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "status": {"const": "UNAVAILABLE"}, "source_book": {"enum": ["FANDUEL", "DRAFTKINGS", "BETMGM", "CAESARS", "FANATICS"]}, "recorded_at_utc": {"type": "string"}, "reason": {"type": "string"}, "detail": {"type": "string", "minLength": 1}
+      }
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mlb-walkforward-lab.local/schemas/experimental_multibook_market_plays_report.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "content_sha256", "status_labels", "target_date", "evaluated_at_utc", "policy", "policy_sha256", "ml_trace_relative", "ml_trace_sha256", "totals_trace_relative", "totals_trace_sha256", "board_relative", "board_sha256", "moneylines", "totals", "warnings"],
+  "properties": {
+    "schema": {"const": "PROVISIONAL_MULTIBOOK_MARKET_PLAYS_V1"},
+    "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "status_labels": {"const": ["RESEARCH ONLY", "PROVISIONAL", "NOT BET-VALIDATED"]},
+    "target_date": {"type": "string", "format": "date"},
+    "evaluated_at_utc": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"},
+    "policy": {"type": "object"},
+    "policy_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "ml_trace_relative": {"type": "string", "minLength": 1, "pattern": "^(?!/)[^\\\\]+$"},
+    "ml_trace_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "totals_trace_relative": {"type": "string", "minLength": 1, "pattern": "^(?!/)[^\\\\]+$"},
+    "totals_trace_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "board_relative": {"type": "string", "minLength": 1, "pattern": "^(?!/)[^\\\\]+$"},
+    "board_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "moneylines": {"type": "array", "items": {"type": "object"}},
+    "totals": {"type": "array", "items": {"type": "object"}},
+    "warnings": {"type": "array", "items": {"type": "string"}}
+  }
+}

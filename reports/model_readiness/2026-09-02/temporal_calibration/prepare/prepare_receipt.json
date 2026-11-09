@@ -1,0 +1,140 @@
+{
+  "calibration": {
+    "alpha": 0.08502520804939874,
+    "beta": 0.5799643656381512,
+    "edge_sha256": "2d97e41ccc8f69b3743e995c57d1d26c492a4cef71df4453cb7e9ac49a26eedf",
+    "training_count": 2415,
+    "training_end": "2023-12-31",
+    "training_start": "2023-01-01",
+    "training_year": 2023
+  },
+  "candidate": {
+    "count": 1972,
+    "date_end": "2025-09-28",
+    "date_start": "2025-05-01",
+    "prediction_sha256": "f5b5297a7fb0b988089e54839a40173b141c471938501df8e56deb5cb39d8039"
+  },
+  "excluded": [
+    "2024 raw features",
+    "2024 labels",
+    "all 2025 outcomes during prepare"
+  ],
+  "label": "RETROSPECTIVE_CANDIDATE_ONLY_NOT_FOR_LIVE_USE",
+  "local_scoring_code_sha256": "053b464ce9429545dc42240a1ab7bf5391e612b7d6c0081e50284fd1e6da5921",
+  "normalization": {
+    "eligible_count": 2422,
+    "raw_count": 2430,
+    "training_year": 2022,
+    "value": {
+      "bullpen": {
+        "availability": {
+          "direction": 1,
+          "mean": 85.04556142771753,
+          "n": 4844,
+          "sd": 15.347927064191518
+        },
+        "k_minus_bb": {
+          "direction": 1,
+          "mean": 0.14431917791078067,
+          "n": 4828,
+          "sd": 0.03363886126320565
+        },
+        "last14_xwoba": {
+          "direction": -1,
+          "mean": 0.30380714950295074,
+          "n": 4828,
+          "sd": 0.03211353764334216
+        },
+        "season_xwoba": {
+          "direction": -1,
+          "mean": 0.30775510255105815,
+          "n": 4828,
+          "sd": 0.019163498145404714
+        }
+      },
+      "offense": {
+        "barrel_rate": {
+          "direction": 1,
+          "mean": 0.08081626378123428,
+          "n": 4828,
+          "sd": 0.020736675483467443
+        },
+        "bb_minus_k": {
+          "direction": 1,
+          "mean": -0.13959439279278507,
+          "n": 4828,
+          "sd": 0.035723075764275865
+        },
+        "iso": {
+          "direction": 1,
+          "mean": 0.15283780551974793,
+          "n": 4828,
+          "sd": 0.03152517832748174
+        },
+        "last14_xwoba": {
+          "direction": 1,
+          "mean": 0.31525519096943383,
+          "n": 4828,
+          "sd": 0.0294868352851731
+        },
+        "platoon_xwoba": {
+          "direction": 1,
+          "mean": 0.31830931382137656,
+          "n": 4616,
+          "sd": 0.024015187876078568
+        }
+      },
+      "starter": {
+        "expected_ip": {
+          "direction": 1,
+          "mean": 5.2873933388384255,
+          "n": 4844,
+          "sd": 0.8961972104108995
+        },
+        "fip": {
+          "direction": -1,
+          "mean": 4.018662535627088,
+          "n": 4616,
+          "sd": 1.684972684206802
+        },
+        "k_minus_bb": {
+          "direction": 1,
+          "mean": 0.1398232671875576,
+          "n": 4616,
+          "sd": 0.07503366295700488
+        },
+        "last5_xwoba": {
+          "direction": -1,
+          "mean": 0.3174690602837663,
+          "n": 4491,
+          "sd": 0.052803156201886546
+        },
+        "season_xwoba": {
+          "direction": -1,
+          "mean": 0.3164080892195055,
+          "n": 4616,
+          "sd": 0.04494150080265512
+        },
+        "velocity_change": {
+          "direction": 1,
+          "mean": 0.06315898320939983,
+          "n": 3408,
+          "sd": 0.8465781067010818
+        }
+      }
+    }
+  },
+  "promotion": "NO_PROMOTION",
+  "schema": "V51_TEMPORAL_CALIBRATION_CANDIDATE_PREPARE_V1",
+  "source_root": "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/mlb-v5-1-backtest",
+  "source_sha256": {
+    "candidate_provenance": "cdc2eeb8d58f63ea015b1bf05c77b770e18109e4285008d765c861ec2cbf3c3b",
+    "candidate_raw": "a1817d4a7e50c77f35fbd03f3f79aa8e629e4b686de88b66c8c8d3877924d4a4",
+    "evaluated": "db2b6276396a9d5f24a512bbf684ab6bafa0285e34161a434deaf5054bf2ec76",
+    "frozen_inputs": "745448ff0fee0b1dbde02a4a43ad90fb8e36515611e6070d69d00ddf13c9e7b4",
+    "locked": "bbe584cf0fe3d193b4ad13ee58bdf1a6f9026de7c1ad221ba09d06ff48069dcb",
+    "model_card": "9bad89b9f4896a8f8862d3c304fd605921eca2d825fc2340bf51da01f7912759",
+    "training_edges": "66cfe5db414c76c625de316556236a172ce0e5db71e28fefc390576438e41318",
+    "training_raw": "7869a5379e7ec951d9233bd046528603bc5d7679f37ada02ee1cae9b2fe54dfc"
+  }
+}

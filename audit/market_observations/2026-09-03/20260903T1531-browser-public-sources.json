@@ -1,0 +1,9 @@
+{
+  "observed_at_utc":"2026-09-03T15:32:28.574Z",
+  "schedule_source":"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=2026-09-03",
+  "fanduel":{"url":"https://sportsbook.fanduel.com/navigation/mlb","captured_at_utc":"2026-09-03T15:31:40.090Z","status":"AVAILABLE","event_count":9,"raw_capture":"data/experimental_multibook_market/raw/993ea2f43859f98040ca5d6bc94b4afa5ce39edbebbeb09d6d17cbb83cda7ce8.json","sf_pit_start_et":"12:35 PM"},
+  "draftkings":{"url":"https://sportsbook.draftkings.com/leagues/baseball/mlb","captured_at_utc":"2026-09-03T15:31:54.486Z","status":"AVAILABLE","event_count":9,"raw_capture":"data/experimental_multibook_market/raw/793cac4b22248a9da2bf3274432281ace537c8c1c230a08f3c9c4b852760d1fa.json","sf_pit_start_et":"12:45 PM","sf_pit_conflict":"UNRESOLVED: MLB official/FD 12:35 PM vs DK 12:45 PM; source time preserved"},
+  "betmgm":{"url":"https://www.ny.betmgm.com/en/sports/baseball-23/betting/usa-9/mlb-75","captured_at_utc":"2026-09-03T15:32:11.499Z","status":"UNAVAILABLE","reason":"COLLECTOR_REJECTED","dom_note":"9 public rows visible, but www.ny.betmgm.com is outside fixed admitted host sports.betmgm.com","observed_rows":"SFG@PIT +140/-170 O9 -102/U9 -118; TOR@CLE -110/-110 O7.5 -120/U7.5 +100; CWS@HOU +135/-165 O8.5 -110/U8.5 -110; BOS@BAL -125/+105 O8.5 -105/U8.5 -115; MIL@CHC -115/-105 O8.5 -102/U8.5 -118; MIA@KC -102/-118 O9 -110/U9 -110; TB@TEX -130/+110 O8 +100/U8 -120; ATH@SEA +180/-220 O7 -115/U7 -105; STL@LAD +230/-285 O8 -105/U8 -115"},
+  "caesars":{"url":"https://sportsbook.caesars.com/us/ny/bet/baseball","captured_at_utc":"2026-09-03T15:32:19.881Z","status":"UNAVAILABLE","reason":"COLLECTOR_REJECTED","dom_note":"Public page loaded but no genuine MLB event IDs or ML/O-U rows exposed"},
+  "fanatics":{"url":"https://sportsbook.fanatics.com/sports/baseball/mlb","captured_at_utc":"2026-09-03T15:32:28.574Z","status":"UNAVAILABLE","reason":"TRANSPORT_FAILURE","error":"net::ERR_BLOCKED_BY_CLIENT; no DOM"}
+}

@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["n", "wins", "losses", "accuracy", "brier", "log_loss", "wilson_95", "bins"],
+      "properties": {
+        "n": {"type": "integer", "minimum": 0},
+        "wins": {"type": "integer", "minimum": 0},
+        "losses": {"type": "integer", "minimum": 0},
+        "accuracy": {"type": ["string", "null"], "pattern": "^[0-9]+\\.[0-9]{6}$"},
+        "brier": {"type": ["string", "null"], "pattern": "^[0-9]+\\.[0-9]{6}$"},
+        "log_loss": {"type": ["string", "null"], "pattern": "^[0-9]+\\.[0-9]{12}$"},
+        "wilson_95": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": ["number", "null"]}},
+        "bins": {
+          "type": "array",
+          "minItems": 10,
+          "maxItems": 10,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["lower", "upper", "n", "accuracy", "wilson_95"],
+            "properties": {
+              "lower": {"type": "number", "minimum": 0, "maximum": 1},
+              "upper": {"type": "number", "minimum": 0, "maximum": 1},
+              "n": {"type": "integer", "minimum": 0},
+              "accuracy": {"type": ["number", "null"]},
+              "wilson_95": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": ["number", "null"]}}
+            }
+          }
+        }
+      }
+    },
+    "source_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relative", "sha256"],
+      "properties": {
+        "relative": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "relative": {"type": "string", "minLength": 1}
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "content_sha256", "primary_claims", "settlement_heads", "primary_claim_refs", "settlement_head_refs", "primary_count", "pending_count", "excluded_count", "metrics"],
+  "properties": {
+    "schema": {"const": "PROSPECTIVE_ML_CALIBRATION_REPORT_V1"},
+    "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "primary_claims": {"type": "array", "items": {"$ref": "#/$defs/relative"}},
+    "settlement_heads": {"type": "array", "items": {"$ref": "#/$defs/relative"}},
+    "primary_claim_refs": {"type": "array", "items": {"$ref": "#/$defs/source_ref"}},
+    "settlement_head_refs": {"type": "array", "items": {"$ref": "#/$defs/source_ref"}},
+    "primary_count": {"type": "integer", "minimum": 0},
+    "pending_count": {"type": "integer", "minimum": 0},
+    "excluded_count": {"type": "integer", "minimum": 0},
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["all_primary", "completeness_lt_0_50", "completeness_ge_0_50"],
+      "properties": {
+        "all_primary": {"$ref": "#/$defs/metric"},
+        "completeness_lt_0_50": {"$ref": "#/$defs/metric"},
+        "completeness_ge_0_50": {"$ref": "#/$defs/metric"}
+      },
+      "patternProperties": {
+        "^model:[0-9a-f]{64}(?::completeness_(?:lt|ge)_0_50)?$": {"$ref": "#/$defs/metric"}
+      }
+    }
+  }
+}

@@ -1,0 +1,356 @@
+{
+  "baseline": {
+    "L": 622,
+    "N": 1340,
+    "W": 718,
+    "accuracy": 0.5358208955223881,
+    "accuracy_wilson_95": [
+      0.5090537249375656,
+      0.5623832658506346
+    ],
+    "brier": 0.24627075738049964,
+    "fixed_bins": [
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.0, 0.1)",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      },
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.1, 0.2)",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      },
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.2, 0.3)",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      },
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.3, 0.4)",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      },
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.4, 0.5)",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      },
+      {
+        "N": 1032,
+        "W": 518,
+        "absolute_gap": 0.04301082418488267,
+        "bin": "[0.5, 0.6)",
+        "mean_probability": 0.5449488086810067,
+        "observed_wilson_95": [
+          0.4714815785982984,
+          0.5323800156840706
+        ],
+        "observed_win_rate": 0.501937984496124
+      },
+      {
+        "N": 298,
+        "W": 194,
+        "absolute_gap": 0.018413317971140986,
+        "bin": "[0.6, 0.7)",
+        "mean_probability": 0.6325933934382549,
+        "observed_wilson_95": [
+          0.5952770473121786,
+          0.7028925886823297
+        ],
+        "observed_win_rate": 0.6510067114093959
+      },
+      {
+        "N": 10,
+        "W": 6,
+        "absolute_gap": 0.10853370642000015,
+        "bin": "[0.7, 0.8)",
+        "mean_probability": 0.7085337064200001,
+        "observed_wilson_95": [
+          0.3126695474501864,
+          0.8318224187964902
+        ],
+        "observed_win_rate": 0.6
+      },
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.8, 0.9)",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      },
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.9, 1.0]",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      }
+    ],
+    "log_loss": 0.6855527297095905,
+    "mean_pick_probability": 0.5656607006474621,
+    "monthly": {
+      "2025-05": {
+        "L": 182,
+        "N": 411,
+        "W": 229,
+        "accuracy": 0.5571776155717761,
+        "accuracy_wilson_95": [
+          0.5088453452745906,
+          0.6044509104528967
+        ],
+        "brier": 0.24183726007148074,
+        "log_loss": 0.6764360770587202,
+        "mean_pick_probability": 0.5681886483338201
+      },
+      "2025-06": {
+        "L": 181,
+        "N": 397,
+        "W": 216,
+        "accuracy": 0.5440806045340051,
+        "accuracy_wilson_95": [
+          0.49489837472803916,
+          0.5924179118050952
+        ],
+        "brier": 0.2462607133979597,
+        "log_loss": 0.6855257431817937,
+        "mean_pick_probability": 0.56693803112267
+      },
+      "2025-07": {
+        "L": 178,
+        "N": 369,
+        "W": 191,
+        "accuracy": 0.5176151761517616,
+        "accuracy_wilson_95": [
+          0.4667116046129437,
+          0.5681557492445658
+        ],
+        "brier": 0.25030227736664457,
+        "log_loss": 0.6939128535529948,
+        "mean_pick_probability": 0.5611490505959347
+      },
+      "2025-08": {
+        "L": 81,
+        "N": 163,
+        "W": 82,
+        "accuracy": 0.5030674846625767,
+        "accuracy_wilson_95": [
+          0.4271275823408157,
+          0.5788661266622147
+        ],
+        "brier": 0.24834759161477926,
+        "log_loss": 0.689680166475395,
+        "mean_pick_probability": 0.5663889961766869
+      }
+    }
+  },
+  "candidate": {
+    "L": 623,
+    "N": 1340,
+    "W": 717,
+    "accuracy": 0.5350746268656716,
+    "accuracy_wilson_95": [
+      0.5083067618479474,
+      0.5616419582988318
+    ],
+    "brier": 0.2461723075976678,
+    "fixed_bins": [
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.0, 0.1)",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      },
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.1, 0.2)",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      },
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.2, 0.3)",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      },
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.3, 0.4)",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      },
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.4, 0.5)",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      },
+      {
+        "N": 1088,
+        "W": 551,
+        "absolute_gap": 0.03820569810971164,
+        "bin": "[0.5, 0.6)",
+        "mean_probability": 0.5446395216391234,
+        "observed_wilson_95": [
+          0.47675533298248235,
+          0.536067039786608
+        ],
+        "observed_win_rate": 0.5064338235294118
+      },
+      {
+        "N": 249,
+        "W": 164,
+        "absolute_gap": 0.027589030057749597,
+        "bin": "[0.6, 0.7)",
+        "mean_probability": 0.6310455080948608,
+        "observed_wilson_95": [
+          0.597727398199115,
+          0.7147211862110453
+        ],
+        "observed_win_rate": 0.6586345381526104
+      },
+      {
+        "N": 3,
+        "W": 2,
+        "absolute_gap": 0.0404084644310867,
+        "bin": "[0.7, 0.8)",
+        "mean_probability": 0.7070751310977533,
+        "observed_wilson_95": [
+          0.2076549551264879,
+          0.9385096847238394
+        ],
+        "observed_win_rate": 0.6666666666666666
+      },
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.8, 0.9)",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      },
+      {
+        "N": 0,
+        "W": 0,
+        "absolute_gap": null,
+        "bin": "[0.9, 1.0]",
+        "mean_probability": null,
+        "observed_wilson_95": null,
+        "observed_win_rate": null
+      }
+    ],
+    "log_loss": 0.6853621813783786,
+    "mean_pick_probability": 0.5610592212330444,
+    "monthly": {
+      "2025-05": {
+        "L": 180,
+        "N": 411,
+        "W": 231,
+        "accuracy": 0.5620437956204379,
+        "accuracy_wilson_95": [
+          0.5137221685099603,
+          0.6092163217475258
+        ],
+        "brier": 0.24185543810907467,
+        "log_loss": 0.6765207702351961,
+        "mean_pick_probability": 0.5638383308205211
+      },
+      "2025-06": {
+        "L": 186,
+        "N": 397,
+        "W": 211,
+        "accuracy": 0.5314861460957179,
+        "accuracy_wilson_95": [
+          0.48233207221299823,
+          0.5800367038820977
+        ],
+        "brier": 0.2460229467560666,
+        "log_loss": 0.6850430725055994,
+        "mean_pick_probability": 0.5621830179433004
+      },
+      "2025-07": {
+        "L": 176,
+        "N": 369,
+        "W": 193,
+        "accuracy": 0.5230352303523035,
+        "accuracy_wilson_95": [
+          0.47209796557336825,
+          0.5734978048556826
+        ],
+        "brier": 0.25027001415173195,
+        "log_loss": 0.6938169284683766,
+        "mean_pick_probability": 0.556445488214465
+      },
+      "2025-08": {
+        "L": 81,
+        "N": 163,
+        "W": 82,
+        "accuracy": 0.5030674846625767,
+        "accuracy_wilson_95": [
+          0.4271275823408157,
+          0.5788661266622147
+        ],
+        "brier": 0.2481445523551995,
+        "log_loss": 0.6892928839926996,
+        "mean_pick_probability": 0.5617592589596251
+      }
+    }
+  },
+  "caveats": [
+    "2025 already seen",
+    "reconstructed final lineups are not pristine/live T-45",
+    "candidate changes 2022-only normalization and 2023 calibration together; it is not an isolated alpha/beta treatment effect",
+    "Wilson intervals are descriptive only",
+    "not independently validated, profitable, or promotable"
+  ],
+  "integrity": {
+    "candidate_coverage": true,
+    "exact_locked_evaluated_keysets": true,
+    "fixed_bin_count_sums": true,
+    "fixed_population": 1340
+  },
+  "label": "RETROSPECTIVE_CANDIDATE_ONLY_NOT_FOR_LIVE_USE",
+  "prepare_receipt_sha256": "a27b0d7a1962d7590c66152bebc0ccdfb9e11c0a226735154f49339259fe93ca",
+  "promotion": "NO_PROMOTION",
+  "schema": "V51_TEMPORAL_CALIBRATION_CANDIDATE_EVALUATION_V1",
+  "scope": "fixed locked 2025 population; no reranking or threshold selection"
+}

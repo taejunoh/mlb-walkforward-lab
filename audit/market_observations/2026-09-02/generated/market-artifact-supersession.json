@@ -1,0 +1,20 @@
+{
+  "type": "PROVISIONAL_MULTIBOOK_MARKET_ARTIFACT_SUPERSESSION_V1",
+  "target_date": "2026-09-02",
+  "source_verification_relative": "audit/market_observations/2026-09-02/generated/fanduel-unit-correction.md",
+  "active_capture_outcomes": [
+    "audit/experimental_multibook_market/capture_outcomes/e3d93d63c5df7f8e5731eada1e2d66804987204090e38d4c82c8d74796d25f78.json",
+    "audit/experimental_multibook_market/capture_outcomes/99513c7d082606294cb7732f619df4f5a3abdf687925512356bceb04e55af0e8.json",
+    "audit/experimental_multibook_market/capture_outcomes/e55cb6f06789664b13b4ae4189747e3e65dcc40326e43789db337161ac9d9bbf.json",
+    "audit/experimental_multibook_market/capture_outcomes/7610aeeb6238983a6ea976953ffbb4cf258c3b92a480bbebc83981e9f2da4134.json",
+    "audit/experimental_multibook_market/capture_outcomes/456c64843ba47e26f7f466272bb44d826924d0f708ba1ee0cdd7533a9311431b.json"
+  ],
+  "do_not_use": [
+    {
+      "raw_capture_relative": "data/experimental_multibook_market/raw/54705b656259802af43206fd0ec9f512c7e3ad840acd77ba3bdaa054aa3dbbd9.json",
+      "capture_outcome_relative": "audit/experimental_multibook_market/capture_outcomes/07f7492b5f24de3e7fcf74e99c54a80fc0bccd93c1579f0f40fe4ceff23a8c63.json",
+      "reason": "SUPERSEDED_WRONG_UNITS",
+      "detail": "Totals encoded decimal-tenths instead of evaluator half-run ticks: 8.5 as 85, 8 as 80, 7.5 as 75, 9 as 90, and 6.5 as 65. Preserve as rejected evidence; do not use."
+    }
+  ]
+}

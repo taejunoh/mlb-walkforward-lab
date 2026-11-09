@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "experimental_daily_totals_overlay_policy.schema.json",
+  "title": "Provisional daily totals overlay policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "required_residual_count", "maximum_quote_age_seconds", "minimum_nonpush_support", "minimum_point_gap_runs", "minimum_support_margin"],
+  "properties": {
+    "schema": {"const": "PROVISIONAL_DAILY_TOTALS_OVERLAY_POLICY_V1"},
+    "required_residual_count": {"const": 764},
+    "maximum_quote_age_seconds": {"const": 900},
+    "minimum_nonpush_support": {"const": 0.8},
+    "minimum_point_gap_runs": {"const": 1.0},
+    "minimum_support_margin": {"const": 0.05}
+  }
+}

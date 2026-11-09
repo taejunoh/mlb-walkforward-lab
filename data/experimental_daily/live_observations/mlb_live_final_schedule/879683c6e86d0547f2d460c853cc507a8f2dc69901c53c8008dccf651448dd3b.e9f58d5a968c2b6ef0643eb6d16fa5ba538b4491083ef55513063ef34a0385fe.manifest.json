@@ -1,0 +1,13 @@
+{
+  "query": {
+    "game_pk": 824307,
+    "observation_id": "d0ccb0be5c634c22b3340cfe9c79319f",
+    "target_date": "2026-09-15",
+    "url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&gameType=R&startDate=2026-09-15&endDate=2026-09-15&hydrate=probablePitcher%2Cvenue"
+  },
+  "retrieved_at_utc": "2026-09-15T13:08:46.068816+00:00",
+  "row_count": 1,
+  "schema_version": 1,
+  "sha256": "879683c6e86d0547f2d460c853cc507a8f2dc69901c53c8008dccf651448dd3b",
+  "source": "mlb_live_final_schedule"
+}

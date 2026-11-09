@@ -1,0 +1,347 @@
+{
+  "schema": "EXISTING_SEPTEMBER_PREDICTION_VERIFICATION_V1",
+  "recorded_at_utc": "2026-09-30T15:31:00Z",
+  "root": "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix",
+  "scope_glob": "reports/experimental_daily/2026-09-*/*.trace.json",
+  "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+  "summary": {
+    "trace_count": 33,
+    "passed": 33,
+    "failed": 0,
+    "empty_passed_traces": 9,
+    "replayed_rows": 121,
+    "unique_date_game_keys": 89
+  },
+  "model_card": {
+    "relative": "audit/v5_1_bt/model_card.json",
+    "sha256": "9bad89b9f4896a8f8862d3c304fd605921eca2d825fc2340bf51da01f7912759",
+    "path_source": "Each bound report.command_inputs.model_card; all resolved to this same path"
+  },
+  "checks": [
+    "load_ml_authority(root, trace_relative) validates legacy report/trace identity, embedded content digests, row math, schedule and participant authority.",
+    "Trace and report bytes were required to equal canonical_json_bytes(parsed_json).",
+    "Trace and report .json.sha256 sidecars were explicitly probed with missing_ok=True; all 66 absent, as permitted by the legacy producer. Any present seal would require exact SHA-256 of file bytes.",
+    "Actual card bytes read via secure_fs snapshot, accepted by load_frozen_live_card_bytes, matched to report/trace/authority card hashes.",
+    "validate_trace_payload expected report content digest and card file digest, then replay_stored_row for every stored row.",
+    "Every directly-read snapshot was rebound; each MlAuthority.rebind() succeeded after replay."
+  ],
+  "execution": {
+    "python": "PYTHONDONTWRITEBYTECODE=1 python3 -B",
+    "socket_guard": "unittest.mock.patch('socket.socket', side_effect=AssertionError('network forbidden during authentication'))",
+    "artifact_writes_during_validation": 0,
+    "network_calls": 0,
+    "test_suite_runs": 0
+  },
+  "initial_probe": {
+    "status": "STRICT_SIDECAR_REQUIREMENT_NOT_APPLICABLE_TO_LEGACY_FORMAT",
+    "blocked_traces": 33,
+    "message": "The first strict-sidecar probe stopped at absent trace sidecars. Producer inspection confirmed V1 intentionally persists no trace sidecar. Final results above use existing V1 contract without fabricating seals or modifying originals."
+  },
+  "limitations": [
+    "Not a prospective-primary or settlement validation, and no primary claims were created.",
+    "PRELIMINARY_RESEARCH_ONLY status is unchanged; replay success is not betting or postseason validation.",
+    "89 unique (target_date, game_pk) rows does not establish complete September schedule coverage.",
+    "This replays stored raw features against the actual frozen card; it does not reconstruct every underlying historical feature source.",
+    "Legacy load_ml_authority authenticates its existing LIVE_SCHEDULE/LIVE_PARTICIPANTS source boundary, not the newer full postseason consumed-history closure.",
+    "The separate Sep10 blind-reconstruction report is outside this *.trace.json batch."
+  ],
+  "traces": [
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-01/20260901T133444985203Z-b3e0217fb57a0ba5.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-01/20260901T133444985203Z-b3e0217fb57a0ba5.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 0,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-01/20260901T204141244006Z-b430052946f29b06.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-01/20260901T204141244006Z-b430052946f29b06.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 9,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-02/20260902T155839204827Z-ee2d8347f3243038.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-02/20260902T155839204827Z-ee2d8347f3243038.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 3,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-02/20260902T17404356115Z-65acea021b6c4554.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-02/20260902T17404356115Z-65acea021b6c4554.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 4,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-02/20260902T18073555496Z-c39d0a281f899bbe.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-02/20260902T18073555496Z-c39d0a281f899bbe.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 4,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-02/20260902T220225593479Z-61d5695841e217dc.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-02/20260902T220225593479Z-61d5695841e217dc.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 7,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-03/20260903T134928581441Z-095bf38b299d7d28.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-03/20260903T134928581441Z-095bf38b299d7d28.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 0,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-03/20260903T153130130705Z-f3857b22b43c80f9.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-03/20260903T153130130705Z-f3857b22b43c80f9.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 3,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-05/20260905T213454805831Z-6714f5b436977514.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-05/20260905T213454805831Z-6714f5b436977514.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 9,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-06/20260906T191838274521Z-e21d8bf20fb7744f.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-06/20260906T191838274521Z-e21d8bf20fb7744f.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 3,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-07/20260907T103556200074Z-ce7e70ae6f2aecc2.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-07/20260907T103556200074Z-ce7e70ae6f2aecc2.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 0,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-08/20260908T225350836891Z-2f45c4ef4f837c36.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-08/20260908T225350836891Z-2f45c4ef4f837c36.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 10,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-10/20260910T095522360063Z-554f9b8760a2e5a2.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-10/20260910T095522360063Z-554f9b8760a2e5a2.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 0,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-10/20260910T192945937941Z-3841878c000a188d.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-10/20260910T192945937941Z-3841878c000a188d.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 1,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-12/20260912T112226021774Z-b04da4508155c003.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-12/20260912T112226021774Z-b04da4508155c003.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 0,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-12/20260912T155010766384Z-6008c558bea394d8.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-12/20260912T155010766384Z-6008c558bea394d8.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 2,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-12/20260912T164846806087Z-f742418276b51607.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-12/20260912T164846806087Z-f742418276b51607.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 5,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-13/20260913T133742607792Z-c7bb8f3aa5d08f21.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-13/20260913T133742607792Z-c7bb8f3aa5d08f21.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 0,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-15/20260915T125907047276Z-374d5c95145085ab.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-15/20260915T125907047276Z-374d5c95145085ab.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 0,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-15/20260915T215316995286Z-43740c88b46a282a.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-15/20260915T215316995286Z-43740c88b46a282a.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 12,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-16/20260916T124041358071Z-8ba9e13516de9c60.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-16/20260916T124041358071Z-8ba9e13516de9c60.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 0,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-16/20260916T16431505975Z-ad701094d6316a92.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-16/20260916T16431505975Z-ad701094d6316a92.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 4,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-23/20260923T090520832932Z-64a01fd80d5ddddc.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-23/20260923T090520832932Z-64a01fd80d5ddddc.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 0,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-23/20260923T150744118408Z-13ffae60fd6285b4.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-23/20260923T150744118408Z-13ffae60fd6285b4.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 1,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-23/20260923T160814124877Z-687dfd296a298bca.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-23/20260923T160814124877Z-687dfd296a298bca.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 2,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-23/20260923T17082110467Z-926298d3cd5e3f0a.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-23/20260923T17082110467Z-926298d3cd5e3f0a.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 2,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-23/20260923T200936739105Z-7d1f47baa01b3a1a.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-23/20260923T200936739105Z-7d1f47baa01b3a1a.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 4,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-23/20260923T211104662685Z-5093a8dfd7c83619.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-23/20260923T211104662685Z-5093a8dfd7c83619.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 9,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-23/20260923T221208997543Z-9faf07dbdd8aa05a.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-23/20260923T221208997543Z-9faf07dbdd8aa05a.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 11,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-23/20260923T231414276176Z-1d13094a22c9f22d.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-23/20260923T231414276176Z-1d13094a22c9f22d.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 6,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-23/20260924T011521211583Z-2b8314eaf70eee2a.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-23/20260924T011521211583Z-2b8314eaf70eee2a.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 3,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-24/20260924T201347463923Z-a4363ad41e70f92a.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-24/20260924T201347463923Z-a4363ad41e70f92a.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 3,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    },
+    {
+      "trace_relative": "reports/experimental_daily/2026-09-24/20260924T203303766913Z-095c7301fcd8a3f4.trace.json",
+      "report_relative": "reports/experimental_daily/2026-09-24/20260924T203303766913Z-095c7301fcd8a3f4.json",
+      "status": "PASS_LEGACY_AUTH_AND_FROZEN_REPLAY",
+      "replayed_rows": 4,
+      "trace_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "report_sidecar": "NOT_PRESENT_LEGACY_OPTIONAL",
+      "error": null
+    }
+  ]
+}

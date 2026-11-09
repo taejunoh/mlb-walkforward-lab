@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Experimental post-start reconstructed research report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "target_date", "game_pk", "scheduled_start_utc", "evaluated_at_utc",
+    "reconstructed_at_utc", "status_labels", "lineup_provenance", "starter_provenance",
+    "limitations", "input_refs", "feature_sha256", "p_home", "predicted_side",
+    "pick_probability", "component_scores", "qualities", "content_sha256"
+  ],
+  "properties": {
+    "schema": {"const": "EXPERIMENTAL_POSTSTART_RESEARCH_V1"},
+    "target_date": {"type": "string", "format": "date"},
+    "game_pk": {"type": "integer", "minimum": 1},
+    "scheduled_start_utc": {"type": "string"},
+    "evaluated_at_utc": {"type": "string"},
+    "reconstructed_at_utc": {"type": "string"},
+    "status_labels": {
+      "type": "array",
+      "const": ["POSTSTART_RECONSTRUCTED_RESEARCH", "NOT_PROSPECTIVE", "NOT_BET_VALIDATED"]
+    },
+    "lineup_provenance": {"const": "RECONSTRUCTED_FINAL_LINEUP"},
+    "starter_provenance": {"const": "RECONSTRUCTED_FINAL_STARTER"},
+    "limitations": {
+      "type": "array",
+      "const": ["RECONSTRUCTED_FINAL_LINEUP", "MODEL_ARTIFACT_TIME_UNPROVEN"]
+    },
+    "input_refs": {"type": "object", "additionalProperties": {"type": "object"}},
+    "feature_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "p_home": {"type": "number", "minimum": 0, "maximum": 1},
+    "predicted_side": {"enum": ["away", "home", "none"]},
+    "pick_probability": {"type": "number", "minimum": 0, "maximum": 1},
+    "component_scores": {"type": "object"},
+    "qualities": {"type": "object"},
+    "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

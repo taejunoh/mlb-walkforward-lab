@@ -1,0 +1,505 @@
+{
+  "surface": "report",
+  "title": "9월 2일 오답노트 — 틀린 9경기를 다음 검증으로 연결하기",
+  "generatedAt": "2026-09-03T10:00:20.137138Z",
+  "status": "reviewed",
+  "filters": [],
+  "queries": {
+    "game_results": {
+      "rows": [
+        {
+          "gamePk": 824470,
+          "game": "San Diego Padres @ Cincinnati Reds",
+          "cohort": "기존 사전경기 기록",
+          "probability": 0.6127826336630863,
+          "favored": "San Diego Padres",
+          "score": "3–7",
+          "outcome": "LOSS",
+          "state": "PRELIMINARY",
+          "forecastAt": "2026-09-02T15:58:39.204827Z"
+        },
+        {
+          "gamePk": 822686,
+          "game": "Atlanta Braves @ Washington Nationals",
+          "cohort": "기존 사전경기 기록",
+          "probability": 0.5347373282817707,
+          "favored": "Washington Nationals",
+          "score": "9–0",
+          "outcome": "LOSS",
+          "state": "PRELIMINARY",
+          "forecastAt": "2026-09-02T15:58:39.204827Z"
+        },
+        {
+          "gamePk": 822851,
+          "game": "Athletics @ Texas Rangers",
+          "cohort": "기존 사전경기 기록",
+          "probability": 0.5729535190450439,
+          "favored": "Texas Rangers",
+          "score": "9–2",
+          "outcome": "LOSS",
+          "state": "PRELIMINARY",
+          "forecastAt": "2026-09-02T18:07:35.55496Z"
+        },
+        {
+          "gamePk": 824312,
+          "game": "Baltimore Orioles @ Colorado Rockies",
+          "cohort": "기존 사전경기 기록",
+          "probability": 0.689322310398387,
+          "favored": "Baltimore Orioles",
+          "score": "5–6",
+          "outcome": "LOSS",
+          "state": "PRELIMINARY",
+          "forecastAt": "2026-09-02T18:07:35.55496Z"
+        },
+        {
+          "gamePk": 825037,
+          "game": "Philadelphia Phillies @ Arizona Diamondbacks",
+          "cohort": "기존 사전경기 기록",
+          "probability": 0.5059384056602717,
+          "favored": "Philadelphia Phillies",
+          "score": "0–1",
+          "outcome": "LOSS",
+          "state": "SCORED_NOT_TOP3",
+          "forecastAt": "2026-09-02T18:07:35.55496Z"
+        },
+        {
+          "gamePk": 824717,
+          "game": "Seattle Mariners @ Boston Red Sox",
+          "cohort": "기존 사전경기 기록",
+          "probability": 0.5255246654135401,
+          "favored": "Seattle Mariners",
+          "score": "8–3",
+          "outcome": "WIN",
+          "state": "PRELIMINARY",
+          "forecastAt": "2026-09-02T18:07:35.55496Z"
+        },
+        {
+          "gamePk": 822931,
+          "game": "New York Mets @ Tampa Bay Rays",
+          "cohort": "사전 등록",
+          "probability": 0.5230675351505469,
+          "favored": "Tampa Bay Rays",
+          "score": "10–4",
+          "outcome": "LOSS",
+          "state": "PRIMARY",
+          "forecastAt": null
+        },
+        {
+          "gamePk": 823339,
+          "game": "San Francisco Giants @ Pittsburgh Pirates",
+          "cohort": "사전 등록",
+          "probability": 0.5514672978926715,
+          "favored": "Pittsburgh Pirates",
+          "score": "5–4",
+          "outcome": "LOSS",
+          "state": "PRIMARY",
+          "forecastAt": null
+        },
+        {
+          "gamePk": 824390,
+          "game": "Toronto Blue Jays @ Cleveland Guardians",
+          "cohort": "사전 등록",
+          "probability": 0.5394328531733499,
+          "favored": "Toronto Blue Jays",
+          "score": "11–0",
+          "outcome": "WIN",
+          "state": "PRIMARY",
+          "forecastAt": null
+        },
+        {
+          "gamePk": 823660,
+          "game": "Detroit Tigers @ Minnesota Twins",
+          "cohort": "사전 등록",
+          "probability": 0.5106550577647386,
+          "favored": "Minnesota Twins",
+          "score": "11–6",
+          "outcome": "LOSS",
+          "state": "PRIMARY",
+          "forecastAt": null
+        },
+        {
+          "gamePk": 824068,
+          "game": "Miami Marlins @ Kansas City Royals",
+          "cohort": "사전 등록",
+          "probability": 0.504452257860316,
+          "favored": "Kansas City Royals",
+          "score": "9–6",
+          "outcome": "LOSS",
+          "state": "PRIMARY",
+          "forecastAt": null
+        },
+        {
+          "gamePk": 824634,
+          "game": "Milwaukee Brewers @ Chicago Cubs",
+          "cohort": "사전 등록",
+          "probability": 0.6793841102668805,
+          "favored": "Milwaukee Brewers",
+          "score": "9–5",
+          "outcome": "WIN",
+          "state": "PRIMARY",
+          "forecastAt": null
+        },
+        {
+          "gamePk": 824147,
+          "game": "Chicago White Sox @ Houston Astros",
+          "cohort": "사전 등록",
+          "probability": 0.5835602363591988,
+          "favored": "Houston Astros",
+          "score": "0–2",
+          "outcome": "WIN",
+          "state": "PRIMARY",
+          "forecastAt": null
+        },
+        {
+          "gamePk": 823983,
+          "game": "New York Yankees @ Los Angeles Angels",
+          "cohort": "미산출",
+          "probability": null,
+          "favored": null,
+          "score": "6–3",
+          "outcome": null,
+          "state": null,
+          "forecastAt": null
+        },
+        {
+          "gamePk": 823906,
+          "game": "St. Louis Cardinals @ Los Angeles Dodgers",
+          "cohort": "미산출",
+          "probability": null,
+          "favored": null,
+          "score": "8–6",
+          "outcome": null,
+          "state": null,
+          "forecastAt": null
+        }
+      ],
+      "source": {
+        "label": "9월 2일 고정 예측 및 MLB 공식 최종 결과",
+        "files": [
+          "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix/reports/experimental_all_day_ml_ledger/2026-09-02/11869f74a98db326afa5d653f71c40b66f78bfb0341cdfbde75f6da336d5be2d.json"
+        ],
+        "freshness": "마지막 결과 확인 2026-09-03 06:00 ET. 이미 Final인 6경기는 전날 확인한 증적 재사용.",
+        "filters": [
+          "2026-09-02 전 경기 15개; 예측 있는 13개만 성능 평가"
+        ],
+        "metricDefinitions": [
+          {
+            "label": "모델 우세팀",
+            "definition": "저장된 selected forecast의 우세 방향. 베팅 추천이나 실제 베팅 기록이 아니다.",
+            "componentIds": [
+              "results",
+              "results-section",
+              "summary",
+              "scope-section"
+            ]
+          },
+          {
+            "label": "추정 승률",
+            "definition": "경기 전에 고정된 모델 출력. 실측 보정 승률로 해석하지 않는다.",
+            "componentIds": [
+              "results",
+              "results-section",
+              "summary",
+              "scope-section"
+            ]
+          },
+          {
+            "label": "적중/실패",
+            "definition": "우세팀과 공식 Final 승자가 같으면 WIN, 다르면 LOSS. 미산출 2경기 제외.",
+            "componentIds": [
+              "results",
+              "results-section",
+              "summary",
+              "scope-section"
+            ]
+          }
+        ],
+        "notes": [
+          "예측/배당 원본 변경 없음.",
+          "회고에서 복원한 사전경기 기록 6개와 기존 사전 등록 7개를 분리."
+        ]
+      }
+    },
+    "mistake_notes": {
+      "rows": [
+        {
+          "gamePk": 824470,
+          "game": "San Diego Padres @ Cincinnati Reds",
+          "observed": "SD 61.3%, 3–7 패배. 저장된 선발·불펜·타격 원점수 신호는 SD 쪽. SD 타자 9명 중 1명의 특징 누락.",
+          "lesson": "모델의 여러 지표가 같은 방향이어도 입력 누락과 불확실성을 별도로 표시해야 한다. 패배 원인은 아직 미확정.",
+          "nextCheck": "누락 선수의 사전 자료 여부, 당시 예상 선발·라인업과 실제 출전 명단을 대조. 보완 전후 차이는 별도 실험으로만 기록."
+        },
+        {
+          "gamePk": 822686,
+          "game": "Atlanta Braves @ Washington Nationals",
+          "observed": "WSH 53.5%, 0–9 패배. 선발·타격은 WSH, 불펜 신호는 ATL 쪽으로 엇갈림. 타자 특징 18명 존재.",
+          "lesson": "상충하는 신호를 합산한 작은 우세를 강한 확신으로 표현하지 않는다. 9점차만으로 선발 실패를 단정하지 않는다.",
+          "nextCheck": "선발/불펜 별 실점과 이닝을 확인한 뒤, 예측 지표가 실제 구간을 설명했는지 분리 평가."
+        },
+        {
+          "gamePk": 822851,
+          "game": "Athletics @ Texas Rangers",
+          "observed": "TEX 57.3%, 2–9 패배. 불펜·타격은 TEX, 선발은 ATH 쪽. TEX 선발 quality 약 0.442, 구속 변화의 기준 표본 수 0 및 변화값 null.",
+          "lesson": "중간 수준 우세라도 선발 입력의 품질을 따로 점검해야 한다. baseline 0의 의미를 실제 구속으로 해석하면 안 된다.",
+          "nextCheck": "선발 표본 수·구속 기준값의 누락/기본값 처리를 확인하고, 저품질 선발 경기군을 별도 비교."
+        },
+        {
+          "gamePk": 824312,
+          "game": "Baltimore Orioles @ Colorado Rockies",
+          "observed": "BAL 68.9%, 5–6 패배. 선발·불펜·타격이 BAL 쪽. 타자 특징 18명, 예상 선발 불일치 표식 없음.",
+          "lesson": "한 번의 고확률 패배가 곧 확률 오류는 아니다. 반대로 지표 합의가 독립 검증된 68.9% 승률을 보장하지도 않는다.",
+          "nextCheck": "동일 확률대의 미래 표본을 누적하고, 수비·환경 누락 영향은 시간 분리 검증으로 비교. 이 경기만 보고 확률을 낮추지 않는다."
+        },
+        {
+          "gamePk": 825037,
+          "game": "Philadelphia Phillies @ Arizona Diamondbacks",
+          "observed": "PHI 50.6%, 0–1 패배. 불펜 PHI 우세와 선발·타격 ARI 우세가 상쇄. 당시 SCORED_NOT_TOP3.",
+          "lesson": "거의 동률인 관찰용 예측이며 베팅 추천으로 소급하지 않는다. 1점차 패배만으로 타격 모델 결함을 확정할 수 없다.",
+          "nextCheck": "사전 가격과 불확실성까지 함께 기록하고, 약우세 전체 경기군에서 성능을 검증."
+        },
+        {
+          "gamePk": 822931,
+          "game": "New York Mets @ Tampa Bay Rays",
+          "observed": "TB 52.3%, 4–10 패배. 사전 등록 입력 완전성 약 0.2773, NYM 선발 quality 0. 선발·일정과 불펜·타격 신호 상충.",
+          "lesson": "확인된 입력 품질 경고가 가장 구체적인 점검 대상이다. PRIMARY는 기록 자격이지 베팅 적격이나 높은 신뢰도를 뜻하지 않는다.",
+          "nextCheck": "완전성 구성항목·quality 0 사유를 추적. 저품질 입력에서 관찰 전용/추천 차단 규칙을 사전에 정의해 새 표본으로 시험."
+        },
+        {
+          "gamePk": 823339,
+          "game": "San Francisco Giants @ Pittsburgh Pirates",
+          "observed": "PIT 55.1%, 4–5 패배. 불펜·타격은 PIT, 선발은 SF 쪽. 타자 특징 18명 존재.",
+          "lesson": "작은 원점수 우세와 1점차 결과만으로 불펜 가중치를 탓할 수 없다.",
+          "nextCheck": "사전 불펜 가용성·등판 예상과 실제 투입을 대조하고, 같은 조건의 적중 경기까지 함께 비교."
+        },
+        {
+          "gamePk": 823660,
+          "game": "Detroit Tigers @ Minnesota Twins",
+          "observed": "MIN 51.1%, 6–11 패배. 타격·일정은 MIN, 선발·불펜은 DET 쪽.",
+          "lesson": "50% 근처 우세는 방향 표시일 뿐이다. 대패했다고 사후에 확률 부호를 바꾸지 않는다.",
+          "nextCheck": "입력별 상충을 설명에 노출하고, 확률-시장가격-불확실성 조건을 사전 규칙으로 분리 검증."
+        },
+        {
+          "gamePk": 824068,
+          "game": "Miami Marlins @ Kansas City Royals",
+          "observed": "KC 50.4%, 6–9 패배. 타격은 KC, 선발·불펜은 MIA 쪽.",
+          "lesson": "실질적으로 동률에 가까운 출력이다. 강한 선택 이유가 있는 것처럼 표현하지 않는다.",
+          "nextCheck": "약우세 경기 전체를 누락 없이 기록하고, 모델 자체 우세와 배당 대비 우세를 분리."
+        }
+      ],
+      "source": {
+        "label": "9경기 오답과 당시 입력/원점수 기여",
+        "files": [
+          "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix/reports/experimental_all_day_ml_ledger/2026-09-02/11869f74a98db326afa5d653f71c40b66f78bfb0341cdfbde75f6da336d5be2d.json",
+          "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix/reports/experimental_daily/2026-09-02/20260902T155839204827Z-ee2d8347f3243038.trace.json",
+          "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix/reports/experimental_daily/2026-09-02/20260902T18073555496Z-c39d0a281f899bbe.trace.json",
+          "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix/reports/experimental_daily/2026-09-02/20260902T220225593479Z-61d5695841e217dc.trace.json"
+        ],
+        "filters": [
+          "selected forecast가 LOSS인 정확히9경기"
+        ],
+        "metricDefinitions": [
+          {
+            "label": "원점수 신호",
+            "definition": "trace contributions의 홈-원정 방향. 승률에 대한 %p 기여가 아니다.",
+            "componentIds": [
+              "mistakes-section",
+              "mistake-824470",
+              "mistake-822686",
+              "mistake-822851",
+              "mistake-824312",
+              "mistake-825037",
+              "mistake-822931",
+              "mistake-823339",
+              "mistake-823660",
+              "mistake-824068"
+            ]
+          },
+          {
+            "label": "경기별 관찰",
+            "definition": "당시 입력 및 최종 결과의 대조. 선발/불펜/날씨 등 실제 패인의 인과적 귀속은 미확정.",
+            "componentIds": [
+              "mistakes-section",
+              "mistake-824470",
+              "mistake-822686",
+              "mistake-822851",
+              "mistake-824312",
+              "mistake-825037",
+              "mistake-822931",
+              "mistake-823339",
+              "mistake-823660",
+              "mistake-824068"
+            ]
+          }
+        ],
+        "notes": [
+          "라인업 관측 여부와 선수 특징 존재 여부는 다르다.",
+          "quality는 입력 품질 지표이며 실측 승률이 아니다."
+        ]
+      }
+    },
+    "followup_checks": {
+      "rows": [
+        {
+          "priority": "1",
+          "finding": "TB 경기의 입력 완전성 0.2773, 상대 선발 quality 0; SD는 타자 특징 1명 누락.",
+          "action": "당시 자료로 누락/기본값을 추적하고, 데이터 품질에 따른 관찰 전용·추천 차단 규칙을 먼저 명세.",
+          "acceptance": "입력별 원인 및 영향 기록. 규칙은 새 경기 전에 고정; 이 13개 결과에 맞춰 임계값을 최적화하지 않음."
+        },
+        {
+          "priority": "2",
+          "finding": "IN_SAMPLE_NOT_OOF: 보정은 있지만 독립 표본으로 검증되지 않음.",
+          "action": "학습/보정/평가를 시간 순서로 분리하고, 사전 등록 기록의 Brier·log loss·확률대별 빈도를 누적.",
+          "acceptance": "기존 사전경기 복원 기록과 prospective 표본을 별도 보고. 새 평가 기간은 파라미터 결정에 재사용하지 않음."
+        },
+        {
+          "priority": "3",
+          "finding": "9개 오답 모두 수비·환경은 quality 0/중립값. 실제 날씨·수비 효과 미반영.",
+          "action": "수비·환경 입력이 경기 전에 취득 가능한지 확인한 뒤, 기존 모델 대비 시간 분리 실험.",
+          "acceptance": "결측률·취득시각·성과를 함께 비교. 패배를 날씨 탓으로 분류하거나 하루 결과로 가중치 변경하지 않음."
+        },
+        {
+          "priority": "4",
+          "finding": "raw 가격 일부는 있으나 9개 오답에 admitted 시장 판단 증적이 없음.",
+          "action": "예측 시각에 맞는 검증된 양방향 가격과 추천 판정을 연결해 no-vig 시장 비교 및 이후 closing line 비교를 준비.",
+          "acceptance": "가격만으로 실제 베팅을 가정하지 않음. 실행 기록 없으면 ROI는 N/A; 미확인 closing price를 만들지 않음."
+        }
+      ],
+      "source": {
+        "label": "검증된 누락과 다음 점검 조건",
+        "files": [
+          "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix/reports/experimental_all_day_ml_ledger/2026-09-02/11869f74a98db326afa5d653f71c40b66f78bfb0341cdfbde75f6da336d5be2d.json",
+          "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix/reports/experimental_daily/2026-09-02/20260902T155839204827Z-ee2d8347f3243038.trace.json",
+          "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix/reports/experimental_daily/2026-09-02/20260902T18073555496Z-c39d0a281f899bbe.trace.json",
+          "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix/reports/experimental_daily/2026-09-02/20260902T220225593479Z-61d5695841e217dc.trace.json",
+          "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix/audit/v5_1_bt/model_card.json",
+          "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix/audit/v5_1_bt/manual_audit.md",
+          "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix/reports/v5_1_bt/diagnostic_100.md",
+          "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix/reports/v5_1_bt/diagnostic_100.json"
+        ],
+        "metricDefinitions": [
+          {
+            "label": "개선 검증",
+            "definition": "미실행 제안이다. 모델 변경이나 효과 개선 완료를 의미하지 않는다.",
+            "componentIds": [
+              "next-checks",
+              "next-checks-section"
+            ]
+          }
+        ],
+        "notes": [
+          "과거 Top1 100건 진단과 이번 전체13건은 다른 모집단으로 직접 성능 비교하지 않음."
+        ]
+      }
+    },
+    "diagnostic_summary": {
+      "rows": [
+        {
+          "cohort": "전체 13경기 (설명용 합산)",
+          "n": 13,
+          "wins": 4,
+          "losses": 9,
+          "hitRate": 0.3076923076923077,
+          "meanProbability": 0.5640983239176771,
+          "brier": 0.2713294830854042,
+          "logLoss": 0.7371987386196466
+        },
+        {
+          "cohort": "기존 사전경기 기록 6경기",
+          "n": 6,
+          "wins": 1,
+          "losses": 5,
+          "hitRate": 0.16666666666666666,
+          "meanProbability": 0.5735431437436833,
+          "brier": 0.3243313437381758,
+          "logLoss": 0.8470395245664761
+        },
+        {
+          "cohort": "사전 등록 7경기",
+          "n": 7,
+          "wins": 3,
+          "losses": 4,
+          "hitRate": 0.42857142857142855,
+          "meanProbability": 0.5560027640668145,
+          "brier": 0.22589931681159992,
+          "logLoss": 0.643049493522364
+        }
+      ],
+      "source": {
+        "label": "고정된 13개 확률과 Final의 기계적 계산",
+        "files": [
+          "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix/reports/experimental_all_day_ml_ledger/2026-09-02/11869f74a98db326afa5d653f71c40b66f78bfb0341cdfbde75f6da336d5be2d.json"
+        ],
+        "metricDefinitions": [
+          {
+            "label": "적중률",
+            "definition": "우세팀이 승리한 경기 수 / 예측 있는 경기 수",
+            "formula": "wins / n",
+            "componentIds": [
+              "diagnostics",
+              "diagnostics-section"
+            ]
+          },
+          {
+            "label": "Brier",
+            "definition": "확률과 결과의 제곱 오차 평균. 작을수록 좋다.",
+            "formula": "mean((p - y)^2), y=1(WIN) or 0(LOSS)",
+            "componentIds": [
+              "diagnostics",
+              "diagnostics-section"
+            ]
+          },
+          {
+            "label": "Log loss",
+            "definition": "자연로그 기반 확률 오차 평균. 작을수록 좋다.",
+            "formula": "mean(-y*ln(p) - (1-y)*ln(1-p))",
+            "componentIds": [
+              "diagnostics",
+              "diagnostics-section"
+            ]
+          }
+        ],
+        "notes": [
+          "모든 경기를 p=.5로 놓는 단순 참고값: Brier .25, log loss ln(2)=.693147; 실제 시장/기존모델 benchmark가 아님.",
+          "전체13은 혼합모집단 설명용, 엄격한 prospective 성능은7개만.",
+          "단하루 및 작은 표본; 통계적 우열/장기 calibration 확정 불가."
+        ]
+      }
+    },
+    "model_validation": {
+      "rows": [
+        {
+          "finding": "확률 보정은 적용되어 있으나 독립 검증은 부족",
+          "evidence": "diagnostic_100.json: leakage.statistical_as_of_safety.calibration_status=IN_SAMPLE_NOT_OOF; training_eligible_rows=7265, calibration_rows=7265",
+          "implication": "보정 자체가 없는 모델은 아니다. 같은 표본으로 맞춘 확률이 미래 경기에서도 맞는지 따로 검증해야 한다."
+        },
+        {
+          "finding": "실전 환경과 과거 진단의 차이",
+          "evidence": "manual_audit: 과거 라인업/선발은 경기 후 실제 참가자를 재구성. defense/environment는 neutral 50, quality 0.",
+          "implication": "과거 Top1 100건 성적을 오늘 전체13경기나 실제 T-45 성능과 동등하게 비교하면 안 된다."
+        }
+      ],
+      "source": {
+        "label": "고정 모델카드와 기존 독립성 감사",
+        "files": [
+          "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix/audit/v5_1_bt/model_card.json",
+          "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix/reports/v5_1_bt/diagnostic_100.json",
+          "/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix/audit/v5_1_bt/manual_audit.md"
+        ],
+        "metricDefinitions": [
+          {
+            "label": "독립성 제한",
+            "definition": "확률 보정 절차 존재와 out-of-sample 성능 검증은 별개의 사실.",
+            "componentIds": [
+              "model-validation",
+              "model-validation-section"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "id": "report:2d652242-ce10-4ec0-a7f3-068be0ad5f1c",
+  "report": {
+    "asOf": "2026-09-03"
+  }
+}

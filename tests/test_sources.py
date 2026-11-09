@@ -203,6 +203,52 @@ class SourceTest(unittest.TestCase):
             },
         )
 
+    def test_explicit_non_doubleheader_remains_unknown_for_historical_parser(self):
+        payload = json.loads(FIXTURE.read_bytes())
+        raw_game = payload["dates"][0]["games"][0]
+        raw_game["doubleHeader"] = "N"
+        raw_game["gameNumber"] = 1
+
+        games = parse_schedule(json.dumps(payload).encode())
+
+        self.assertIsNone(games[0]["doubleheader_marker"])
+
+    def test_explicit_non_doubleheader_can_be_preserved_as_closed_marker(self):
+        payload = json.loads(FIXTURE.read_bytes())
+        raw_game = payload["dates"][0]["games"][0]
+        raw_game["doubleHeader"] = "N"
+        raw_game["gameNumber"] = 1
+
+        games = parse_schedule(
+            json.dumps(payload).encode(), preserve_explicit_non_doubleheader=True
+        )
+
+        self.assertEqual(games[0]["doubleheader_marker"], "NO")
+
+    def test_missing_doubleheader_fields_remain_unknown(self):
+        payload = json.loads(FIXTURE.read_bytes())
+        raw_game = payload["dates"][0]["games"][0]
+        raw_game.pop("doubleHeader", None)
+        raw_game.pop("gameNumber", None)
+
+        games = parse_schedule(json.dumps(payload).encode())
+
+        self.assertIsNone(games[0]["doubleheader_marker"])
+
+    def test_invalid_game_number_is_rejected_for_non_doubleheader(self):
+        payload = json.loads(FIXTURE.read_bytes())
+        raw_game = payload["dates"][0]["games"][0]
+        raw_game["doubleHeader"] = "N"
+        raw_game["gameNumber"] = 0
+
+        with self.assertRaisesRegex(ValueError, "gameNumber must be positive"):
+            parse_schedule(json.dumps(payload).encode())
+
+    def test_preserve_explicit_non_doubleheader_requires_a_boolean(self):
+        for value in (None, 1, "true"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "boolean"):
+                parse_schedule(FIXTURE, preserve_explicit_non_doubleheader=value)
+
     def test_official_top_level_lineups_normalize_nine_ids_and_names(self):
         game = parse_schedule(FIXTURE)[0]
 

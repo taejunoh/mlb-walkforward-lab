@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "External multibook raw market capture",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "content_sha256", "source_book", "captured_at_utc", "source_url", "transport_metadata", "events"],
+  "properties": {
+    "schema": {"const": "PROVISIONAL_MULTIBOOK_MARKET_RAW_CAPTURE_V1"},
+    "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "source_book": {"enum": ["FANDUEL", "DRAFTKINGS", "BETMGM", "CAESARS", "FANATICS"]},
+    "captured_at_utc": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"},
+    "source_url": {"type": "string", "pattern": "^https://[^/?#]+/.+$"},
+    "transport_metadata": {"type": "object"},
+    "events": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["book_event_id", "away_team", "home_team", "scheduled_start_utc", "moneyline", "totals"],
+        "properties": {
+          "book_event_id": {"type": "string", "minLength": 1},
+          "away_team": {"type": "string", "minLength": 1},
+          "home_team": {"type": "string", "minLength": 1},
+          "scheduled_start_utc": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"},
+          "moneyline": {
+            "type": "object", "additionalProperties": false,
+            "required": ["away_american_odds", "home_american_odds"],
+            "properties": {"away_american_odds": {"type": "integer"}, "home_american_odds": {"type": "integer"}}
+          },
+          "totals": {
+            "type": "array",
+            "items": {
+              "type": "object", "additionalProperties": false,
+              "required": ["line_half_runs", "over_american_odds", "under_american_odds"],
+              "properties": {"line_half_runs": {"type": "integer", "minimum": 1}, "over_american_odds": {"type": "integer"}, "under_american_odds": {"type": "integer"}}
+            }
+          }
+        }
+      }
+    }
+  }
+}

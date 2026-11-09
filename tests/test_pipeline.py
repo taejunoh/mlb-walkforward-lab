@@ -13,6 +13,7 @@ from mlb_backtest.pipeline import (
     _load_model_card,
     _require_raw_schedule,
     _verify_candidate_provenance,
+    _validate_candidate,
     _write_jsonl_once,
     calibrate_stage,
     features_stage,
@@ -170,6 +171,14 @@ def _prepare_through_lock(root, candidates=None):
 
 
 class PipelineTest(unittest.TestCase):
+    def test_candidate_accepts_explicit_non_doubleheader_marker(self):
+        candidate = json.loads((FIXTURE / "games.json").read_text("utf-8"))[0]
+        candidate["doubleheader_marker"] = "NO"
+
+        validated = _validate_candidate(candidate)
+
+        self.assertEqual(validated["doubleheader_marker"], "NO")
+
     def test_canonical_jsonl_is_streamed_atomically_with_incremental_digest(self):
         rows = [{"b": 2, "a": 1}, {"text": "한글"}]
         expected = (

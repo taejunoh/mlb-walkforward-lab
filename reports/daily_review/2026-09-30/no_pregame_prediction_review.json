@@ -1,0 +1,113 @@
+{
+  "schema": "PROSPECTIVE_ML_DAILY_COVERAGE_REVIEW_V1",
+  "review_type": "COVERAGE_ONLY_OPERATIONAL_ERROR_NOTE",
+  "target_date": "2026-09-30",
+  "timezone": "America/New_York",
+  "status": "PARTIAL_NO_PREGAME_PREDICTION",
+  "not_formal_settlement": true,
+  "formal_settlement_performed": false,
+  "coverage": {
+    "official_game_count": 4,
+    "scheduled_cutoffs_elapsed": 1,
+    "saved_pregame_predictions": 0,
+    "primary_claims": 0,
+    "validation_samples_added": 0,
+    "remaining_scheduled_cutoffs": 3,
+    "missed_game_pks": [849841],
+    "games": [
+      {
+        "game_pk": 849841,
+        "game_type": "F",
+        "away": "PHI",
+        "home": "ATL",
+        "start_utc": "2026-09-30T18:00:00Z",
+        "official_status": "In Progress",
+        "first_pitch_time_utc": null,
+        "saved_pregame_prediction": false,
+        "coverage_status": "NEW_MISSED_PREGAME_PREDICTION"
+      },
+      {
+        "game_pk": 849846,
+        "game_type": "F",
+        "away": "CWS",
+        "home": "HOU",
+        "start_utc": "2026-09-30T21:00:00Z",
+        "official_status": "Pre-Game",
+        "saved_pregame_prediction": false
+      },
+      {
+        "game_pk": 849848,
+        "game_type": "F",
+        "away": "BOS",
+        "home": "NYY",
+        "start_utc": "2026-10-01T00:00:00Z",
+        "official_status": "Scheduled",
+        "saved_pregame_prediction": false
+      },
+      {
+        "game_pk": 849842,
+        "game_type": "F",
+        "away": "CHC",
+        "home": "SD",
+        "start_utc": "2026-10-01T02:00:00Z",
+        "official_status": "Scheduled",
+        "saved_pregame_prediction": false
+      }
+    ]
+  },
+  "cause": {
+    "code": "MISSED_PREGAME_CUTOFF_NO_PREDICTION",
+    "summary": "The scheduled 18:00 UTC cutoff elapsed with no saved pregame prediction for PHI@ATL (849841). This records a coverage gap only; it does not establish a verified first-pitch timestamp or evaluate a model prediction.",
+    "model_pass": false,
+    "lineup_issue_inferred": false
+  },
+  "outcomes": {
+    "scores_collected": false,
+    "winners_collected": false,
+    "result_review": "NOT_APPLICABLE_WITHOUT_SAVED_PREGAME_PREDICTION"
+  },
+  "metrics": {
+    "accuracy": null,
+    "brier_score": null,
+    "log_loss": null,
+    "pnl": null,
+    "totals_diagnostic": null,
+    "interpretation": "NOT_APPLICABLE_WITHOUT_SAVED_PREGAME_PREDICTION; 0 validation samples is not 0% accuracy, a loss, or a PASS."
+  },
+  "input_completeness": {
+    "reports/postseason_ml_research/2026-09-30": "ABSENT",
+    "audit/prospective_ml_postseason_research": "ABSENT",
+    "reports/experimental_poststart_research/2026-09-30": "ABSENT"
+  },
+  "actions": {
+    "retrospective_forecasts_created": false,
+    "model_refit_performed": false,
+    "source_code_modified": false,
+    "model_runs": 0,
+    "new_primary_claims": 0,
+    "new_settlements": 0
+  },
+  "sources": [
+    {
+      "kind": "official_schedule_status",
+      "url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&startDate=2026-09-29&endDate=2026-10-01&fields=totalGames,dates,date,games,gamePk,gameType,gameDate,status,abstractGameState,detailedState,codedGameState,teams,away,home,team,id,name",
+      "method": "Parent-provided read-only, score-free official schedule observation",
+      "observed_at_utc": "2026-09-30T18:20:50Z",
+      "artifact_created_at_utc": "2026-09-30T18:27:22Z",
+      "scope_note": "Only game identity, scheduled time, teams, and status are recorded; no scores or winners were requested. The schedule status was In Progress for 849841, but no actual first-pitch timestamp is known."
+    },
+    {
+      "kind": "prior_operations_check",
+      "path": "reports/daily_review/2026-09-30/operations-check-20260930T175003Z.json"
+    },
+    {
+      "kind": "receipt_inventory",
+      "existing_counts_unchanged": {
+        "2026-09-16": 4,
+        "2026-09-23": 16,
+        "2026-09-24": 4
+      }
+    }
+  ],
+  "note_ko": "9월 30일 PHI@ATL(849841)의 18:00 UTC 사전 예측 cutoff가 지났고 저장된 예측이 없습니다. 이는 커버리지 누락 기록일 뿐이며, 실제 첫 투구 시각이나 경기 결과를 확인하지 않았습니다. 검증 표본 0건은 PASS, 패배, 또는 적중률 0%를 뜻하지 않습니다. 나머지 3경기는 아직 예정/경기 전 상태입니다."
+}

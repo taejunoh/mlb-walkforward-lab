@@ -971,6 +971,43 @@ class PrepareBoundaryTest(unittest.TestCase):
                 evidence,
             )
 
+    def test_schedule_history_build_accepts_explicit_non_doubleheader_marker(self):
+        import mlb_backtest.prepare as prepare_module
+
+        game = {
+            "game_pk": 1,
+            "official_date": "2024-04-01",
+            "game_type": "R",
+            "status": "Final",
+            "away_team_code": "AWY",
+            "home_team_code": "HOM",
+            "away_team_id": 1,
+            "home_team_id": 2,
+            "venue_id": 31,
+            "venue_name": "PNC Park",
+            "scheduled_innings": None,
+            "doubleheader_marker": "NO",
+        }
+        evidence = VerifiedScheduleEvidence._from_verified(
+            prepare_module._EVIDENCE_TOKEN,
+            raw_root=Path("."),
+            manifest_path=Path("manifest.json"),
+            manifest_sha256="a" * 64,
+            payload_sha256="b" * 64,
+            query={},
+            coverage_start="2024-04-01",
+            coverage_end="2024-04-01",
+            game_pks=(1,),
+            games=(game,),
+            normalized_games_sha256="c" * 64,
+        )
+        with mock.patch.object(
+            prepare_module, "_rebind_schedule_evidence", return_value=evidence
+        ):
+            built = schedule_history_rows([game], {31: {}}, evidence)
+
+        self.assertEqual(built.rows[0]["doubleheader_marker"], "NO")
+
     def test_schedule_history_build_rejects_forged_complete_evidence(self):
         row = {
             "game_pk": 1,

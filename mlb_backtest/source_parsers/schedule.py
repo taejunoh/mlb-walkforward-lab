@@ -110,12 +110,16 @@ def _optional_exact_bool(mapping: dict, field: str, label: str) -> bool | None:
     return value
 
 
-def _doubleheader_marker(game: dict, label: str) -> str | None:
+def _doubleheader_marker(
+    game: dict, label: str, *, preserve_explicit_non_doubleheader: bool = False
+) -> str | None:
     raw = game.get("doubleHeader")
     number = game.get("gameNumber")
     if raw in (None, "N"):
         if number is not None and (type(number) is not int or number <= 0):
             raise ValueError(f"malformed schedule: {label}.gameNumber must be positive")
+        if raw == "N" and preserve_explicit_non_doubleheader:
+            return "NO"
         return None
     if raw not in {"Y", "S"} or type(number) is not int or number not in {1, 2}:
         raise ValueError(f"malformed schedule: {label} has invalid doubleheader fields")
@@ -132,11 +136,20 @@ def _neutral_site_venue_name(game: dict) -> str | None:
     return venue_name
 
 
-def _normalize_game(raw_game: Any, date_entry: dict, index: int) -> dict | None:
+def _normalize_game(
+    raw_game: Any,
+    date_entry: dict,
+    index: int,
+    *,
+    preserve_explicit_non_doubleheader: bool = False,
+    game_types: tuple[str, ...] | None = ('R',),
+) -> dict | None:
     game = _mapping(raw_game, f"game[{index}]")
     game_type = game.get("gameType")
-    if game_type != "R":
+    if game_types is not None and game_type not in game_types:
         return None
+    if not isinstance(game_type, str) or not game_type:
+        raise ValueError('malformed schedule: game type is required')
 
     official_date = game.get("officialDate", date_entry.get("date"))
     if not isinstance(official_date, str) or not official_date:
@@ -249,7 +262,7 @@ def _normalize_game(raw_game: Any, date_entry: dict, index: int) -> dict | None:
     return {
         "game_pk": _required(game, "gamePk", int, f"game[{index}]"),
         "official_date": official_date,
-        "game_type": "R",
+        "game_type": game_type,
         "scheduled_start_utc": _canonical_utc_datetime(
             game.get("gameDate"), f"game[{index}].gameDate"
         ),
@@ -282,7 +295,11 @@ def _normalize_game(raw_game: Any, date_entry: dict, index: int) -> dict | None:
         "completed_innings": completed_innings,
         "final_outs": final_outs,
         "final_inning_topbot": final_inning_topbot,
-        "doubleheader_marker": _doubleheader_marker(game, f"game[{index}]"),
+        "doubleheader_marker": _doubleheader_marker(
+            game,
+            f"game[{index}]",
+            preserve_explicit_non_doubleheader=preserve_explicit_non_doubleheader,
+        ),
         "away_lineup": _lineup(
             lineups, "awayPlayers", f"game[{index}].lineups"
         ),
@@ -315,6 +332,9 @@ def parse_schedule_occurrences(path: str | Path | bytes) -> list[dict]:
 
 def select_schedule_occurrences(
     path: str | Path | bytes,
+    *,
+    preserve_explicit_non_doubleheader: bool = False,
+    game_types: tuple[str, ...] | None = ('R',),
 ) -> list[tuple[dict, tuple[int, int, dict, dict]]]:
     """Normalize and reconcile regular games while retaining selected raw positions."""
     try:
@@ -332,7 +352,13 @@ def select_schedule_occurrences(
         date_entry = _mapping(raw_date_entry, f"dates[{date_index}]")
         raw_games = _list(date_entry.get("games"), f"dates[{date_index}].games")
         for game_position, raw_game in enumerate(raw_games):
-            game = _normalize_game(raw_game, date_entry, game_index)
+            game = _normalize_game(
+                raw_game,
+                date_entry,
+                game_index,
+                preserve_explicit_non_doubleheader=preserve_explicit_non_doubleheader,
+                game_types=game_types,
+            )
             game_index += 1
             if game is not None:
                 game_pk = game["game_pk"]
@@ -375,13 +401,27 @@ def select_schedule_occurrences(
     return [games_by_pk[game_pk] for game_pk in game_order]
 
 
-def parse_schedule(path: str | Path | bytes) -> list[dict]:
+def parse_schedule(
+    path: str | Path | bytes,
+    *,
+    preserve_explicit_non_doubleheader: bool = False,
+    game_types: tuple[str, ...] | None = ('R',),
+) -> list[dict]:
     """Read a UTF-8 MLB schedule JSON file and normalize regular-season games."""
-    return [game for game, _ in select_schedule_occurrences(path)]
+    if type(preserve_explicit_non_doubleheader) is not bool:
+        raise ValueError("preserve_explicit_non_doubleheader must be boolean")
+    return [
+        game
+        for game, _ in select_schedule_occurrences(
+            path,
+            preserve_explicit_non_doubleheader=preserve_explicit_non_doubleheader,
+            game_types=game_types,
+        )
+    ]
 
 
 def validate_schedule_query_coverage(
-    path: str | Path | bytes, start: str, end: str
+    path: str | Path | bytes, start: str, end: str, *, game_types: tuple[str, ...] | None = ('R',)
 ) -> None:
     """Require query-date coverage, allowing only result-free moved cancellations."""
     raw = path if isinstance(path, bytes) else Path(path).read_bytes()
@@ -403,7 +443,7 @@ def validate_schedule_query_coverage(
         raw_games = _list(date_entry.get("games"), f"dates[{date_index}].games")
         for game_index, raw_game in enumerate(raw_games):
             game = _mapping(raw_game, f"dates[{date_index}].games[{game_index}]")
-            if game.get("gameType") != "R":
+            if game_types is not None and game.get("gameType") not in game_types:
                 continue
             official_date = game.get("officialDate", query_date)
             if start <= official_date <= end:

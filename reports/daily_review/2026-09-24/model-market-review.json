@@ -1,0 +1,208 @@
+{
+  "schema": "MLB_DAILY_MODEL_MARKET_REVIEW_V1",
+  "target_date": "2026-09-24",
+  "timezone": "America/New_York",
+  "history_cutoff": "2026-09-23",
+  "source_reports": {
+    "ml": "reports/experimental_daily/2026-09-24/20260924T203303766913Z-095c7301fcd8a3f4.trace.json",
+    "totals": "reports/experimental_daily_totals/2026-09-24/20260924T203851237694Z-646bc8c67da1a99c.json",
+    "public_market": [
+      "reports/daily_review/2026-09-24/public-market-review-2015Z.json",
+      "reports/daily_review/2026-09-24/public-market-review-addendum-2033Z.json"
+    ]
+  },
+  "scored_ml": 4,
+  "unscored_remaining": 3,
+  "already_started_excluded": 5,
+  "betting_picks": 0,
+  "formal_market_admission": false,
+  "pregame_flow_receipts": [
+    "audit/prospective_ml_daily_flow/2026-09-24/6d8dc9b9548f6fe1e51d0314f6892c080efc041ceca17c2f0f6ed710bbdc268a.json",
+    "audit/prospective_ml_daily_flow/2026-09-24/9109030ceaff7cbd66a7e42e90c931923c178e78b2a7d43647b84a76fbe705f0.json"
+  ],
+  "primary_claims": [
+    {"game_pk":823411,"claimed_at_utc":"2026-09-24T20:28:51.655593Z"},
+    {"game_pk":824707,"claimed_at_utc":"2026-09-24T20:28:51.676086Z"},
+    {"game_pk":824866,"claimed_at_utc":"2026-09-24T20:28:51.707746Z"},
+    {"game_pk":823493,"claimed_at_utc":"2026-09-24T20:39:04.869412Z"}
+  ],
+  "notes": [
+    "All scored games were considered, including SCORED_NOT_TOP3 MIL@PHI. No forced Top3 pick quota.",
+    "Probabilities are internal research outputs, not independently validated betting probabilities.",
+    "Both ML sides were compared with public sportsbook break-even probabilities; nominal differences are not validated edges.",
+    "Public quotes were not verified in a logged-in New York account. Book-side update timestamps are unavailable.",
+    "ATL public-page recheck failed with HTTP 403; its 20:15Z observation was not treated as a fresh 20:33Z price.",
+    "TEAM_VENUE_30 totals do not incorporate confirmed lineups, starters or weather. Expected runs minus a market line is not an Over/Under win probability.",
+    "No new pregame prediction was made for the five already-started games."
+  ],
+  "games": [
+    {
+      "game_pk": 823411,
+      "game": "MIL@PHI",
+      "start_utc": "2026-09-24T22:05:00Z",
+      "model_home_probability": 0.5164834520036866,
+      "data_completeness": 0.600709477602531,
+      "away_ml": 114,
+      "home_ml": -134,
+      "away_break_even": 0.4672897196261682,
+      "home_break_even": 0.5726495726495726,
+      "away_nominal_gap": 0.016226828370145163,
+      "home_nominal_gap": -0.056166120645886,
+      "expected_total": 9.095938203915246,
+      "total_interval_80": [
+        4,
+        15
+      ],
+      "market_total": 7.5,
+      "over_odds": -120,
+      "under_odds": -102,
+      "public_quote_observed_at": "2026-09-24T20:33:00Z",
+      "source_url": "https://sportsbook.fanduel.com/teams/mlb/milwaukee-brewers/odds",
+      "decision": "PASS_RESEARCH_ONLY"
+    },
+    {
+      "game_pk": 824707,
+      "game": "CLE@BOS",
+      "start_utc": "2026-09-24T22:45:00Z",
+      "model_home_probability": 0.5433968363134901,
+      "data_completeness": 0.43997567383588726,
+      "away_ml": 108,
+      "home_ml": -126,
+      "away_break_even": 0.4807692307692308,
+      "home_break_even": 0.5575221238938053,
+      "away_nominal_gap": -0.0241660670827209,
+      "home_nominal_gap": -0.014125287580315171,
+      "expected_total": 8.54357649425377,
+      "total_interval_80": [
+        3,
+        14
+      ],
+      "market_total": 6.5,
+      "over_odds": -122,
+      "under_odds": 100,
+      "public_quote_observed_at": "2026-09-24T20:33:00Z",
+      "source_url": "https://sportsbook.fanduel.com/teams/mlb/cleveland-guardians/odds",
+      "decision": "PASS_RESEARCH_ONLY"
+    },
+    {
+      "game_pk": 823493,
+      "game": "TB@NYY",
+      "start_utc": "2026-09-24T23:05:00Z",
+      "model_home_probability": 0.5780441566546113,
+      "data_completeness": 0.5907565272756166,
+      "away_ml": 128,
+      "home_ml": -152,
+      "away_break_even": 0.43859649122807015,
+      "home_break_even": 0.6031746031746031,
+      "away_nominal_gap": -0.016640647882681436,
+      "home_nominal_gap": -0.025130446519991856,
+      "expected_total": 8.372912511792821,
+      "total_interval_80": [
+        3,
+        14
+      ],
+      "market_total": 6.5,
+      "over_odds": 114,
+      "under_odds": -140,
+      "public_quote_observed_at": "2026-09-24T20:33:00Z",
+      "source_url": "https://sportsbook.fanduel.com/teams/mlb/tampa-bay-rays/odds",
+      "decision": "PASS_RESEARCH_ONLY"
+    },
+    {
+      "game_pk": 824866,
+      "game": "CIN@ATL",
+      "start_utc": "2026-09-24T23:15:00Z",
+      "model_home_probability": 0.7154588932282524,
+      "data_completeness": 0.6125592899375513,
+      "away_ml": 184,
+      "home_ml": -220,
+      "away_break_even": 0.352112676056338,
+      "home_break_even": 0.6875,
+      "away_nominal_gap": -0.0675715692845904,
+      "home_nominal_gap": 0.0279588932282524,
+      "expected_total": 8.962957726100672,
+      "total_interval_80": [
+        3,
+        15
+      ],
+      "market_total": 7.5,
+      "over_odds": -122,
+      "under_odds": 100,
+      "public_quote_observed_at": "2026-09-24T20:15:01Z",
+      "source_url": "https://sportsbook.fanduel.com/teams/mlb/atlanta-braves/odds",
+      "decision": "PASS_RESEARCH_ONLY"
+    },
+    {
+      "game_pk": 824950,
+      "game": "HOU@ATH",
+      "start_utc": "2026-09-25T01:40:00Z",
+      "model_home_probability": null,
+      "data_completeness": null,
+      "away_ml": -162,
+      "home_ml": 136,
+      "away_break_even": 0.6183206106870229,
+      "home_break_even": 0.423728813559322,
+      "away_nominal_gap": null,
+      "home_nominal_gap": null,
+      "expected_total": 9.359227808077602,
+      "total_interval_80": [
+        4,
+        15
+      ],
+      "market_total": 10.5,
+      "over_odds": -114,
+      "under_odds": -106,
+      "public_quote_observed_at": "2026-09-24T20:15:01Z",
+      "source_url": "https://sportsbook.fanduel.com/teams/mlb/houston-astros/odds",
+      "decision": "WAIT_LINEUPS_NO_BET"
+    },
+    {
+      "game_pk": 823087,
+      "game": "LAA@SEA",
+      "start_utc": "2026-09-25T01:40:00Z",
+      "model_home_probability": null,
+      "data_completeness": null,
+      "away_ml": 190,
+      "home_ml": -230,
+      "away_break_even": 0.3448275862068966,
+      "home_break_even": 0.696969696969697,
+      "away_nominal_gap": null,
+      "home_nominal_gap": null,
+      "expected_total": 8.783787462041676,
+      "total_interval_80": [
+        3,
+        15
+      ],
+      "market_total": 6.5,
+      "over_odds": -140,
+      "under_odds": 114,
+      "public_quote_observed_at": "2026-09-24T20:15:01Z",
+      "source_url": "https://sportsbook.fanduel.com/teams/mlb/seattle-mariners/odds",
+      "decision": "WAIT_LINEUPS_NO_BET"
+    },
+    {
+      "game_pk": 823895,
+      "game": "SD@LAD",
+      "start_utc": "2026-09-25T02:10:00Z",
+      "model_home_probability": null,
+      "data_completeness": null,
+      "away_ml": 146,
+      "home_ml": -174,
+      "away_break_even": 0.4065040650406504,
+      "home_break_even": 0.635036496350365,
+      "away_nominal_gap": null,
+      "home_nominal_gap": null,
+      "expected_total": 8.76963982427696,
+      "total_interval_80": [
+        3,
+        15
+      ],
+      "market_total": 7.5,
+      "over_odds": -130,
+      "under_odds": 106,
+      "public_quote_observed_at": "2026-09-24T20:15:01Z",
+      "source_url": "https://sportsbook.fanduel.com/teams/mlb/san-diego-padres/odds",
+      "decision": "WAIT_LINEUPS_NO_BET"
+    }
+  ]
+}

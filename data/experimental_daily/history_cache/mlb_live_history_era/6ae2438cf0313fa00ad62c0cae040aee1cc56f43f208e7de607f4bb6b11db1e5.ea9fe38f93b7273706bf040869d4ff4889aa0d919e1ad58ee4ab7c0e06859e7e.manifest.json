@@ -1,0 +1,12 @@
+{
+  "query": {
+    "as_of_date": "2026-09-11",
+    "season_open": "2026-03-25",
+    "url": "https://statsapi.mlb.com/api/v1/stats?stats=byDateRange&group=pitching&sportIds=1&gameType=R&playerPool=ALL&limit=5000&startDate=2026-03-25&endDate=2026-09-11"
+  },
+  "retrieved_at_utc": "2026-09-12T11:29:37.589798+00:00",
+  "row_count": 1,
+  "schema_version": 1,
+  "sha256": "6ae2438cf0313fa00ad62c0cae040aee1cc56f43f208e7de607f4bb6b11db1e5",
+  "source": "mlb_live_history_era"
+}

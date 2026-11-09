@@ -1,0 +1,66 @@
+{
+  "schema": "POSTSEASON_LIVE_ACTIVATION_ATTEMPT_EVIDENCE_V1",
+  "target_date": "2026-09-30",
+  "competition_scope": "postseason-research-v1",
+  "classification": "RESEARCH_ONLY_ACTIVATION_ATTEMPT_FAILED_BEFORE_REPORT",
+  "run": {
+    "command": "PYTHONPATH=\"/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix\" PYTHONDONTWRITEBYTECODE=1 python3 -B -m mlb_backtest.daily_top3 --root \"/Users/taejunoh/Developer/LFG/MLB Analysis/.worktrees/live-venue-timezone-fix\" --date 2026-09-30 --competition-scope postseason-research-v1",
+    "started_at_utc": "approximately 2026-09-30T15:21Z; seconds not captured",
+    "ended_at_utc": "by approximately 2026-09-30T15:22Z; seconds not captured",
+    "exit_code": 2,
+    "stderr": "Daily Top 3 integrity failure: research schedule duplicate coverage gamePk",
+    "runtime": {
+      "python_executable": "/Users/taejunoh/.local/bin/python3",
+      "python_version": "Python 3.11.15",
+      "invocation_flags": ["PYTHONDONTWRITEBYTECODE=1", "-B"]
+    }
+  },
+  "source_diagnostic": {
+    "kind": "read_only_schedule_api_check",
+    "url": "https://statsapi.mlb.com/api/v1/schedule?sportId=1&gameType=R%2CF%2CD%2CL%2CW&startDate=2026-01-01&endDate=2026-09-29&hydrate=probablePitcher%2Cvenue%2Clinescore",
+    "duplicate_examples": [
+      {
+        "game_pk": 823042,
+        "occurrences": [
+          {"date": "2026-06-25", "status": "Postponed"},
+          {"date": "2026-07-23", "status": "Final"}
+        ]
+      },
+      {
+        "game_pk": 823062,
+        "occurrences": [
+          {"date": "2026-05-05", "status": "Postponed"},
+          {"date": "2026-07-07", "status": "Final"}
+        ]
+      },
+      {
+        "game_pk": 823357,
+        "occurrences": [
+          {"date": "2026-07-10", "status": "Postponed"},
+          {"date": "2026-07-11", "status": "Final"}
+        ]
+      },
+      {
+        "game_pk": 823471,
+        "occurrences": [
+          {"date": "2026-04-29", "status": "Postponed"},
+          {"date": "2026-04-30", "status": "Final"}
+        ]
+      }
+    ],
+    "root_cause": "The research-specific raw-payload guard in mlb_backtest/live_history.py::_research_schedule rejects every repeated gamePk before parse_schedule can apply its existing canonicalization rules. MLB schedule responses include a postponed occurrence and a rescheduled played occurrence sharing one gamePk.",
+    "existing_intended_policy": "mlb_backtest/source_parsers/schedule.py::parse_schedule canonicalizes repeated IDs after confirming consistent game/team identity: exact duplicate normalized rows collapse; a played (Final/Completed Early) occurrence supersedes an unplayed occurrence; two played occurrences must agree on normalized fields other than scheduled_start_utc or are rejected as conflicting. The postseason research history contract separately requires unique canonical game_pk identities and exact agreement between played_game_pks and full-range Statcast game IDs/dates/types.",
+    "minimal_repair_scope": "Normalize raw repeated schedule occurrences using the established schedule parser's strict canonicalization before constructing research coverage; preserve rejection of conflicting identities or conflicting played occurrences, and retain unique-ID plus Statcast date/type/population checks. Do not weaken or remove downstream identity/coverage validation. No repair was made in this evidence-only task."
+  },
+  "outputs": {
+    "successful_postseason_report": false,
+    "trace": null,
+    "prospective_pregame_receipt": null,
+    "primary_claim_writes": false,
+    "report_directory": "reports/postseason_ml_research/2026-09-30/",
+    "prospective_audit_directory": "audit/prospective_ml_postseason_research/",
+    "failed_raw_or_audit_files_found": [],
+    "notes": "The report and prospective-audit directories were absent after failure. The narrowly checked history payload/receipt namespace paths existed but contained no files; their earlier directory timestamp does not establish that this attempt created them. Target-date game outcomes/scores are intentionally not recorded."
+  },
+  "follow_up": "Activation remains incomplete. A separately authorized, narrowly scoped code repair and verification are required before another live run; do not backfill or create a pregame claim from this failed attempt."
+}
