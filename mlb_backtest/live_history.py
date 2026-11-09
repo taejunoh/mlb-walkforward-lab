@@ -182,15 +182,6 @@ def _research_schedule(raw, target):
     start = date(target.year, 1, 1).isoformat()
     types = POSTSEASON_ML_RESEARCH_V1.recent_game_types
     validate_schedule_query_coverage(raw, start, cutoff.isoformat(), game_types=types)
-    payload = json.loads(raw)
-    seen = set()
-    for entry in payload['dates']:
-        for game in entry['games']:
-            if game.get('gameType') in types:
-                pk = game.get('gamePk')
-                if pk in seen:
-                    raise ValueError('research schedule duplicate coverage gamePk')
-                seen.add(pk)
     games = tuple(parse_schedule(raw, game_types=types))
     games = tuple(game for game in games if start <= game['official_date'] <= cutoff.isoformat())
     if not games:

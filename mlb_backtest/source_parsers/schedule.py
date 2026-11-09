@@ -371,6 +371,7 @@ def select_schedule_occurrences(
                 prior_game = prior[0]
                 identity_fields = (
                     "game_pk",
+                    "game_type",
                     "away_team_id",
                     "away_team",
                     "home_team_id",

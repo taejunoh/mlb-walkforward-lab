@@ -74,21 +74,76 @@ class ResearchHistoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(ValueError, 'coverage'):
             live_history.build_live_history(Path(tmp), '2026-07-21', _card(), fetcher=fetcher(schedule, _statcast_without_game(pitches, missing)), sleeper=lambda _: None, competition_policy=policy())
 
-    def test_suspended_and_duplicate_history_fail_closed(self):
+    def test_suspended_and_contradictory_history_fail_closed(self):
         schedule, pitches = combined_data()
-        for mutation in ('Suspended', 'duplicate', 'contradictory', 'empty'):
+        for mutation in ('Suspended', 'contradictory', 'empty'):
             payload = json.loads(schedule)
             if mutation == 'Suspended':
                 payload['dates'][0]['games'][0]['status']['detailedState'] = mutation
-            elif mutation in ('duplicate','contradictory'):
+            elif mutation == 'contradictory':
                 clone = json.loads(json.dumps(payload['dates'][0]['games'][0]))
-                if mutation == 'contradictory':
-                    clone['teams']['away']['team']['id'] = 999
+                clone['teams']['away']['team']['id'] = 999
                 payload['dates'][0]['games'].append(clone)
             else:
                 payload['dates'] = []
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp, self.assertRaises(ValueError):
                 live_history.build_live_history(Path(tmp), '2026-07-21', _card(), fetcher=fetcher(json.dumps(payload).encode(), pitches), sleeper=lambda _: None, competition_policy=policy())
+
+    def test_postponed_then_rescheduled_game_pk_uses_final_identity_and_pitches(self):
+        schedule, pitches = combined_data()
+        payload = json.loads(schedule)
+        postponed = payload['dates'][0]['games'][0]
+        game_pk = postponed['gamePk']
+        rescheduled = json.loads(json.dumps(postponed))
+        postponed['status']['detailedState'] = 'Postponed'
+        postponed.pop('linescore', None)
+        for side in ('away', 'home'):
+            postponed['teams'][side].pop('score', None)
+            postponed['teams'][side].pop('isWinner', None)
+        rescheduled['officialDate'] = DAYS[1]
+        payload['dates'][1]['games'].append(rescheduled)
+
+        stream = io.StringIO(pitches.decode())
+        reader = csv.DictReader(stream)
+        rows = list(reader)
+        for row in rows:
+            if int(row['game_pk']) == game_pk:
+                row['game_date'] = DAYS[1]
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=reader.fieldnames, lineterminator='\n')
+        writer.writeheader()
+        writer.writerows(rows)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = live_history.build_live_history(
+                Path(tmp), '2026-07-21', _card(),
+                fetcher=fetcher(json.dumps(payload).encode(), output.getvalue().encode()),
+                sleeper=lambda _: None, competition_policy=policy(),
+            )
+        identities = bundle.cache_authority['coverage']['game_identities']
+        survivor = [row for row in identities if row['game_pk'] == game_pk]
+        self.assertEqual(len(survivor), 1)
+        self.assertEqual(survivor[0]['official_date'], DAYS[1])
+        self.assertEqual(survivor[0]['status'], 'Final')
+        self.assertEqual(len(bundle.cache_authority['coverage']['played_game_pks']), 30)
+        self.assertEqual({row['game_pk'] for row in bundle.feature_history.pitches}, set(bundle.cache_authority['coverage']['played_game_pks']))
+        self.assertTrue(any(row['game_pk'] == game_pk and row['game_date'] == DAYS[1] for row in bundle.feature_history.pitches))
+
+    def test_common_schedule_parser_rejects_cross_type_repeated_game_pk(self):
+        schedule, _ = combined_data()
+        payload = json.loads(schedule)
+        postponed = payload['dates'][0]['games'][0]
+        rescheduled = json.loads(json.dumps(postponed))
+        postponed['status']['detailedState'] = 'Postponed'
+        postponed.pop('linescore', None)
+        for side in ('away', 'home'):
+            postponed['teams'][side].pop('score', None)
+            postponed['teams'][side].pop('isWinner', None)
+        rescheduled['gameType'] = 'F' if postponed['gameType'] == 'R' else 'R'
+        rescheduled['officialDate'] = DAYS[1]
+        payload['dates'][1]['games'].append(rescheduled)
+        with self.assertRaisesRegex(ValueError, 'conflicting duplicate gamePk'):
+            live_history.parse_schedule(json.dumps(payload).encode(), game_types=('R', 'F'))
 
     def test_postponed_does_not_require_pitches(self):
         schedule, pitches = combined_data()
